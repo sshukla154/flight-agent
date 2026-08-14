@@ -1,0 +1,218 @@
+{
+  "_comment": "Hand-authored, clearly-synthetic AMS->DEL one-stop scenario (T10). Domain-model shape (RawOffer/Leg/Segment), NOT a provider payload -- see tests/fixtures/providers/ for those, a different concern (T3/T49). Route AMS->DXB->DEL. ams-del-valid-4h has a 240-minute (4h) layover, inside D8's closed [180,360] window -- deliberately the exact D9 boundary the spec's own sample lands on (scores +10, not 0). ams-del-too-short-90m (90min) and ams-del-too-long-400m (400min) each have a layover outside that window, for the validator to reject.",
+  "offers": [
+    {
+      "provider": "mock",
+      "provider_offer_id": "ams-del-valid-4h",
+      "legs": [
+        {
+          "segments": [
+            {
+              "segment_id": "ams-del-valid-4h-AMS-DXB",
+              "origin": "AMS",
+              "destination": "DXB",
+              "depart_utc": "2027-07-17T06:00:00Z",
+              "arrive_utc": "2027-07-17T12:30:00Z",
+              "depart_local": "2027-07-17T08:00:00+02:00",
+              "arrive_local": "2027-07-17T16:30:00+04:00",
+              "origin_tz": "Europe/Amsterdam",
+              "destination_tz": "Asia/Dubai",
+              "marketing_carrier": "EK",
+              "operating_carrier": null,
+              "flight_number": "147",
+              "operating_flight_number": null,
+              "cabin": "economy",
+              "technical_stops": 0,
+              "duration": "PT6H30M",
+              "depart_fold": 0,
+              "arrive_fold": 0
+            },
+            {
+              "segment_id": "ams-del-valid-4h-DXB-DEL",
+              "origin": "DXB",
+              "destination": "DEL",
+              "depart_utc": "2027-07-17T16:30:00Z",
+              "arrive_utc": "2027-07-17T20:00:00Z",
+              "depart_local": "2027-07-17T20:30:00+04:00",
+              "arrive_local": "2027-07-18T01:30:00+05:30",
+              "origin_tz": "Asia/Dubai",
+              "destination_tz": "Asia/Kolkata",
+              "marketing_carrier": "EK",
+              "operating_carrier": null,
+              "flight_number": "512",
+              "operating_flight_number": null,
+              "cabin": "economy",
+              "technical_stops": 0,
+              "duration": "PT3H30M",
+              "depart_fold": 0,
+              "arrive_fold": 0
+            }
+          ],
+          "layovers": [
+            {
+              "airport": "DXB",
+              "arrive_utc": "2027-07-17T12:30:00Z",
+              "depart_utc": "2027-07-17T16:30:00Z",
+              "duration": "PT4H",
+              "local_window": [
+                "2027-07-17T16:30:00+04:00",
+                "2027-07-17T20:30:00+04:00"
+              ],
+              "requires_airport_change": false,
+              "requires_terminal_change": false
+            }
+          ]
+        }
+      ],
+      "price": {
+        "amount": "812.30",
+        "currency": "EUR"
+      },
+      "offer_expires_at": null,
+      "raw_payload_ref": "mock-fixture:ams_del_onestop:ams-del-valid-4h",
+      "provider_booking_url": "https://mock-booking.example.test/ams-del-valid-4h"
+    },
+    {
+      "provider": "mock",
+      "provider_offer_id": "ams-del-too-short-90m",
+      "legs": [
+        {
+          "segments": [
+            {
+              "segment_id": "ams-del-too-short-90m-AMS-DXB",
+              "origin": "AMS",
+              "destination": "DXB",
+              "depart_utc": "2027-07-17T06:00:00Z",
+              "arrive_utc": "2027-07-17T12:30:00Z",
+              "depart_local": "2027-07-17T08:00:00+02:00",
+              "arrive_local": "2027-07-17T16:30:00+04:00",
+              "origin_tz": "Europe/Amsterdam",
+              "destination_tz": "Asia/Dubai",
+              "marketing_carrier": "EK",
+              "operating_carrier": null,
+              "flight_number": "147",
+              "operating_flight_number": null,
+              "cabin": "economy",
+              "technical_stops": 0,
+              "duration": "PT6H30M",
+              "depart_fold": 0,
+              "arrive_fold": 0
+            },
+            {
+              "segment_id": "ams-del-too-short-90m-DXB-DEL",
+              "origin": "DXB",
+              "destination": "DEL",
+              "depart_utc": "2027-07-17T14:00:00Z",
+              "arrive_utc": "2027-07-17T17:30:00Z",
+              "depart_local": "2027-07-17T18:00:00+04:00",
+              "arrive_local": "2027-07-17T23:00:00+05:30",
+              "origin_tz": "Asia/Dubai",
+              "destination_tz": "Asia/Kolkata",
+              "marketing_carrier": "EK",
+              "operating_carrier": null,
+              "flight_number": "512",
+              "operating_flight_number": null,
+              "cabin": "economy",
+              "technical_stops": 0,
+              "duration": "PT3H30M",
+              "depart_fold": 0,
+              "arrive_fold": 0
+            }
+          ],
+          "layovers": [
+            {
+              "airport": "DXB",
+              "arrive_utc": "2027-07-17T12:30:00Z",
+              "depart_utc": "2027-07-17T14:00:00Z",
+              "duration": "PT1H30M",
+              "local_window": [
+                "2027-07-17T16:30:00+04:00",
+                "2027-07-17T18:00:00+04:00"
+              ],
+              "requires_airport_change": false,
+              "requires_terminal_change": false
+            }
+          ]
+        }
+      ],
+      "price": {
+        "amount": "745.00",
+        "currency": "EUR"
+      },
+      "offer_expires_at": null,
+      "raw_payload_ref": "mock-fixture:ams_del_onestop:ams-del-too-short-90m",
+      "provider_booking_url": "https://mock-booking.example.test/ams-del-too-short-90m"
+    },
+    {
+      "provider": "mock",
+      "provider_offer_id": "ams-del-too-long-400m",
+      "legs": [
+        {
+          "segments": [
+            {
+              "segment_id": "ams-del-too-long-400m-AMS-DXB",
+              "origin": "AMS",
+              "destination": "DXB",
+              "depart_utc": "2027-07-17T06:00:00Z",
+              "arrive_utc": "2027-07-17T12:30:00Z",
+              "depart_local": "2027-07-17T08:00:00+02:00",
+              "arrive_local": "2027-07-17T16:30:00+04:00",
+              "origin_tz": "Europe/Amsterdam",
+              "destination_tz": "Asia/Dubai",
+              "marketing_carrier": "EK",
+              "operating_carrier": null,
+              "flight_number": "147",
+              "operating_flight_number": null,
+              "cabin": "economy",
+              "technical_stops": 0,
+              "duration": "PT6H30M",
+              "depart_fold": 0,
+              "arrive_fold": 0
+            },
+            {
+              "segment_id": "ams-del-too-long-400m-DXB-DEL",
+              "origin": "DXB",
+              "destination": "DEL",
+              "depart_utc": "2027-07-17T19:10:00Z",
+              "arrive_utc": "2027-07-17T22:40:00Z",
+              "depart_local": "2027-07-17T23:10:00+04:00",
+              "arrive_local": "2027-07-18T04:10:00+05:30",
+              "origin_tz": "Asia/Dubai",
+              "destination_tz": "Asia/Kolkata",
+              "marketing_carrier": "EK",
+              "operating_carrier": null,
+              "flight_number": "512",
+              "operating_flight_number": null,
+              "cabin": "economy",
+              "technical_stops": 0,
+              "duration": "PT3H30M",
+              "depart_fold": 0,
+              "arrive_fold": 0
+            }
+          ],
+          "layovers": [
+            {
+              "airport": "DXB",
+              "arrive_utc": "2027-07-17T12:30:00Z",
+              "depart_utc": "2027-07-17T19:10:00Z",
+              "duration": "PT6H40M",
+              "local_window": [
+                "2027-07-17T16:30:00+04:00",
+                "2027-07-17T23:10:00+04:00"
+              ],
+              "requires_airport_change": false,
+              "requires_terminal_change": false
+            }
+          ]
+        }
+      ],
+      "price": {
+        "amount": "699.99",
+        "currency": "EUR"
+      },
+      "offer_expires_at": null,
+      "raw_payload_ref": "mock-fixture:ams_del_onestop:ams-del-too-long-400m",
+      "provider_booking_url": "https://mock-booking.example.test/ams-del-too-long-400m"
+    }
+  ]
+}
