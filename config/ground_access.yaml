@@ -1,0 +1,202 @@
+# config/ground_access.yaml — Nieuwegein -> origin-airport ground access.
+#
+# Master plan §6 / DECISIONS.md §"Ground travel". Deliberately a SEPARATE
+# file from config/airports.yaml: this table is specific to this
+# project's home base (Nieuwegein, Utrecht, NL) and would be entirely
+# different data if the home base changed, whereas airports.yaml is
+# general reference data independent of where the traveller starts. Only
+# the 10 European ORIGIN airports have a row here — the 8 Indian
+# destinations have no ground-access entry at all, because ground travel
+# only matters at the European end of this trip.
+#
+# `minutes` is spec-sourced (Addendum 2) and must be kept exactly as
+# given — do not "correct" it against real-world drive times. Every other
+# per-row figure (distance_km, cost_eur) is this project's own ESTIMATE,
+# not a measured or fetched fare, which is why every row is stamped
+# source: estimate. distance_km is chosen to be consistent with `minutes`
+# at a plausible average speed for the stated `mode`, not looked up from
+# a routing API.
+#
+# cost_eur for car-mode/either-mode rows = distance_km * EUR 0.25/km, the
+# Dutch tax-free ("onbelaste") business-mileage allowance rate that took
+# effect for 2026 (raised from EUR 0.23, retroactive to 2026-01-01) —
+# recorded here per master plan §6's instruction to record which year's
+# rate was used. This is a fuel/wear-and-tear proxy only. cost_eur is
+# ONE-WAY ONLY (D2: the return leg is out of scope for this project).
+#
+# `mode` is a per-row editorial call (free-form field, master plan
+# domain.ground.GroundLeg docstring) about which access mode the given
+# minutes/cost figures represent, not a claim that it is the only mode
+# available. Documented per row below.
+#
+# KNOWN, DELIBERATE GAP (master plan §6, open question
+# `parking_cost_not_modelled`): car-mode long-stay parking cost is NOT
+# modelled anywhere in cost_eur. For a multi-week trip this can exceed
+# the fuel cost captured here. This is flagged explicitly, per row, rather
+# than inventing a parking number this project has no basis to estimate.
+#
+# `priority` matches DECISIONS.md/Addendum 2's exact origin search order
+# (1-10) — several later acceptance tests assert the search call log
+# follows this order, so it must never be alphabetised or re-derived.
+
+ground_access:
+  - to_airport: AMS
+    from_location: "Nieuwegein, Utrecht, NL"
+    mode: train
+    minutes: 45
+    distance_km: 50
+    cost_eur: 12.00
+    source: estimate
+    as_of: 2026-08-14
+    priority: 1
+    notes: >
+      Sneltram (SUNIJ line) Nieuwegein -> Utrecht Centraal (~15-20 min)
+      plus a direct NS intercity train Utrecht Centraal -> Schiphol
+      Airport (~30 min) is the primary access route for this pair, not a
+      fallback, hence mode=train. cost_eur is an estimated one-way
+      NS+tram fare total, not a fetched fare. Car via A2/A9 is also
+      practical; if driven instead, long-stay parking cost is NOT
+      modelled here (see file header).
+
+  - to_airport: EIN
+    from_location: "Nieuwegein, Utrecht, NL"
+    mode: car
+    minutes: 65
+    distance_km: 90
+    cost_eur: 22.50
+    source: estimate
+    as_of: 2026-08-14
+    priority: 2
+    notes: >
+      No direct rail to the airport terminal; the fastest NS+bus
+      combination requires a transfer at Eindhoven Centraal and is
+      materially slower door-to-door than driving via the A2 corridor,
+      hence mode=car. Long-stay parking cost for a multi-week trip is
+      NOT modelled in cost_eur (master plan §6) — a deliberate,
+      documented gap, not an oversight.
+
+  - to_airport: RTM
+    from_location: "Nieuwegein, Utrecht, NL"
+    mode: either
+    minutes: 60
+    distance_km: 55
+    cost_eur: 13.75
+    source: estimate
+    as_of: 2026-08-14
+    priority: 3
+    notes: >
+      Comparable door-to-door time by car (A20) or by NS intercity to
+      Rotterdam Centraal followed by RET metro line E to the airport,
+      hence mode=either. cost_eur reflects the car/fuel-equivalent
+      estimate; a metro+train ticket would be broadly similar. If driven,
+      long-stay parking cost is NOT modelled here (see file header).
+
+  - to_airport: DUS
+    from_location: "Nieuwegein, Utrecht, NL"
+    mode: car
+    minutes: 90
+    distance_km: 160
+    cost_eur: 40.00
+    source: estimate
+    as_of: 2026-08-14
+    priority: 4
+    notes: >
+      Cross-border rail (via Arnhem) requires a change and is slower
+      door-to-door than driving the A12/A3 corridor, hence mode=car.
+      Long-stay parking cost for a multi-week trip is NOT modelled in
+      cost_eur (master plan §6) and could plausibly exceed the fuel cost
+      estimated here — flagged rather than invented.
+
+  - to_airport: BRU
+    from_location: "Nieuwegein, Utrecht, NL"
+    mode: car
+    minutes: 120
+    distance_km: 180
+    cost_eur: 45.00
+    source: estimate
+    as_of: 2026-08-14
+    priority: 5
+    notes: >
+      No practical direct rail link from the Nieuwegein/Utrecht area;
+      available rail options require multiple changes and run far slower
+      than the A2/A27 corridor by car, hence mode=car. Long-stay parking
+      cost is NOT modelled in cost_eur (master plan §6).
+
+  - to_airport: NRN
+    from_location: "Nieuwegein, Utrecht, NL"
+    mode: car
+    minutes: 80
+    distance_km: 130
+    cost_eur: 32.50
+    source: estimate
+    as_of: 2026-08-14
+    priority: 6
+    notes: >
+      Weeze has no passenger rail service of its own; the only shuttle
+      buses run from Düsseldorf itself, not from the Netherlands, hence
+      mode=car is the only realistic option. Long-stay parking cost is
+      NOT modelled in cost_eur (master plan §6).
+
+  - to_airport: CGN
+    from_location: "Nieuwegein, Utrecht, NL"
+    mode: car
+    minutes: 120
+    distance_km: 200
+    cost_eur: 50.00
+    source: estimate
+    as_of: 2026-08-14
+    priority: 7
+    notes: >
+      An international ICE service (Amsterdam-Köln via Utrecht/Arnhem)
+      exists, but total door-to-door time including the Köln Hbf -> CGN
+      S-Bahn leg is slower than driving the A12/A61 corridor, hence
+      mode=car. Long-stay parking cost is NOT modelled in cost_eur
+      (master plan §6).
+
+  - to_airport: CRL
+    from_location: "Nieuwegein, Utrecht, NL"
+    mode: car
+    minutes: 140
+    distance_km: 140
+    cost_eur: 35.00
+    source: estimate
+    as_of: 2026-08-14
+    priority: 8
+    notes: >
+      No direct rail link to the airport terminal (shuttle bus from
+      Charleroi-Sud station only), far slower than driving from the
+      Netherlands, hence mode=car. Long-stay parking cost is NOT modelled
+      in cost_eur (master plan §6); this airport already has the longest
+      ground time of the ten, so an unmodelled multi-week parking bill
+      would matter most here.
+
+  - to_airport: MST
+    from_location: "Nieuwegein, Utrecht, NL"
+    mode: car
+    minutes: 120
+    distance_km: 150
+    cost_eur: 37.50
+    source: estimate
+    as_of: 2026-08-14
+    priority: 9
+    notes: >
+      Maastricht Aachen airport has no rail link of its own (the nearest
+      station, Maastricht, is itself a further ~20 min away by taxi/bus),
+      making door-to-door rail slower than driving the A2 corridor, hence
+      mode=car. Long-stay parking cost is NOT modelled in cost_eur
+      (master plan §6).
+
+  - to_airport: GRQ
+    from_location: "Nieuwegein, Utrecht, NL"
+    mode: car
+    minutes: 130
+    distance_km: 180
+    cost_eur: 45.00
+    source: estimate
+    as_of: 2026-08-14
+    priority: 10
+    notes: >
+      A rail+bus combination (NS to Groningen, then bus to Eelde) exists
+      but is comparable to or slower than driving the A28 corridor door
+      to door, hence mode=car. Long-stay parking cost is NOT modelled in
+      cost_eur (master plan §6).

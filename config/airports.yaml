@@ -1,0 +1,173 @@
+# config/airports.yaml — general airport reference data.
+#
+# Master plan §3 places this file under config/ as one of several catalogs
+# (IATA -> name, city, country, IANA tz, lat/lon). This is deliberately a
+# SEPARATE file from config/ground_access.yaml (master plan §6): this file
+# is general reference data that would be identical no matter where the
+# traveller starts from, while ground_access.yaml is specific to this
+# project's home base (Nieuwegein, NL) and would differ entirely if the
+# home base changed. Do not merge the two.
+#
+# All 18 airports this project ever searches: the 10 European origins near
+# Nieuwegein (in DECISIONS.md/Addendum 2 priority order) followed by the 8
+# Indian destinations (order matters less for destinations, but kept in
+# the order already shown to the project owner). ground_access.yaml only
+# has rows for the 10 origins — ground travel is only modelled at the
+# European end, so the 8 destinations intentionally have no counterpart
+# there.
+#
+# Coordinates are decimal degrees (WGS84), 4 decimal places. Recalled from
+# training knowledge for the major/well-known airports (AMS, DUS, BRU,
+# DEL, BOM, BLR, MAA); the smaller/less-common ones (EIN, RTM, NRN, CGN,
+# CRL, MST, GRQ, HYD, CCU, LKO, VNS) were cross-checked with a web search
+# against Wikipedia/aviation-reference sources on 2026-08-14 rather than
+# stated from memory alone — see T8's task report for the per-airport
+# source notes.
+
+airports:
+  # --- 10 European origins (priority order 1-10; see ground_access.yaml) ---
+  - iata: AMS
+    name: Amsterdam Airport Schiphol
+    city: Amsterdam
+    country: Netherlands
+    iana_tz: Europe/Amsterdam
+    lat: 52.3086
+    lon: 4.7639
+
+  - iata: EIN
+    name: Eindhoven Airport
+    city: Eindhoven
+    country: Netherlands
+    iana_tz: Europe/Amsterdam
+    lat: 51.4501
+    lon: 5.3745
+
+  - iata: RTM
+    name: Rotterdam The Hague Airport
+    city: Rotterdam
+    country: Netherlands
+    iana_tz: Europe/Amsterdam
+    lat: 51.9569
+    lon: 4.4372
+
+  - iata: DUS
+    name: Düsseldorf Airport
+    city: Düsseldorf
+    country: Germany
+    iana_tz: Europe/Berlin
+    lat: 51.2894
+    lon: 6.7667
+
+  - iata: BRU
+    name: Brussels Airport
+    city: Brussels
+    country: Belgium
+    iana_tz: Europe/Brussels
+    lat: 50.9014
+    lon: 4.4844
+
+  - iata: NRN
+    name: Weeze Airport (Düsseldorf Weeze)
+    city: Weeze
+    country: Germany
+    iana_tz: Europe/Berlin
+    lat: 51.6025
+    lon: 6.1422
+
+  - iata: CGN
+    name: Cologne Bonn Airport
+    city: Cologne
+    country: Germany
+    iana_tz: Europe/Berlin
+    lat: 50.8659
+    lon: 7.1427
+
+  - iata: CRL
+    name: Brussels South Charleroi Airport
+    city: Charleroi
+    country: Belgium
+    iana_tz: Europe/Brussels
+    lat: 50.4592
+    lon: 4.4538
+
+  - iata: MST
+    name: Maastricht Aachen Airport
+    city: Maastricht
+    country: Netherlands
+    iana_tz: Europe/Amsterdam
+    lat: 50.9111
+    lon: 5.7694
+
+  - iata: GRQ
+    name: Groningen Airport Eelde
+    city: Groningen
+    country: Netherlands
+    iana_tz: Europe/Amsterdam
+    lat: 53.1197
+    lon: 6.5794
+
+  # --- 8 Indian destinations (all Asia/Kolkata; India has one timezone
+  #     nationwide, no DST) ---
+  - iata: DEL
+    name: Indira Gandhi International Airport
+    city: Delhi
+    country: India
+    iana_tz: Asia/Kolkata
+    lat: 28.5562
+    lon: 77.1000
+
+  - iata: BOM
+    name: Chhatrapati Shivaji Maharaj International Airport
+    city: Mumbai
+    country: India
+    iana_tz: Asia/Kolkata
+    lat: 19.0896
+    lon: 72.8656
+
+  - iata: BLR
+    name: Kempegowda International Airport
+    city: Bengaluru
+    country: India
+    iana_tz: Asia/Kolkata
+    lat: 13.1986
+    lon: 77.7066
+
+  - iata: HYD
+    name: Rajiv Gandhi International Airport
+    city: Hyderabad
+    country: India
+    iana_tz: Asia/Kolkata
+    lat: 17.2403
+    lon: 78.4294
+
+  - iata: MAA
+    name: Chennai International Airport
+    city: Chennai
+    country: India
+    iana_tz: Asia/Kolkata
+    lat: 12.9941
+    lon: 80.1709
+
+  - iata: CCU
+    name: Netaji Subhas Chandra Bose International Airport
+    city: Kolkata
+    country: India
+    iana_tz: Asia/Kolkata
+    lat: 22.6547
+    lon: 88.4467
+
+  - iata: LKO
+    name: Chaudhary Charan Singh International Airport
+    city: Lucknow
+    country: India
+    iana_tz: Asia/Kolkata
+    lat: 26.7606
+    lon: 80.8903
+
+  - iata: VNS
+    name: Lal Bahadur Shastri Airport
+    city: Varanasi
+    country: India
+    iana_tz: Asia/Kolkata
+    lat: 25.4522
+    lon: 82.8594
