@@ -17,6 +17,8 @@ dev = [
     "pytest",
     "pytest-cov",
     "types-PyYAML",
+    "jsonschema",
+    "types-jsonschema",
 ]
 
 [build-system]

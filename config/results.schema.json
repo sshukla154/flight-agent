@@ -1,0 +1,143 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://flightagent.invalid/schemas/results.schema.json",
+  "title": "flight-agent results artifact (v1)",
+  "description": "Schema for out/flight_results_2027-07-17.json (D15), as produced by flightagent.reporting.json_report.build_results_document. v1 scope only (T15) -- grow this schema alongside the writer, never ahead of it. data_source is a structural top-level field per master plan S8.6.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "data_source",
+    "departure_date",
+    "generated_at",
+    "accepted_count",
+    "top_n",
+    "top_itineraries"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0"
+    },
+    "data_source": {
+      "description": "Master plan S8.6 (CRITICAL): mock output must carry this as a structural top-level field, never buried or optional.",
+      "enum": ["mock", "live"]
+    },
+    "departure_date": {
+      "type": "string",
+      "format": "date"
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "accepted_count": {
+      "description": "Full valid-itinerary count before top-N truncation (D15).",
+      "type": "integer",
+      "minimum": 0
+    },
+    "top_n": {
+      "description": "The truncation limit applied when producing top_itineraries (D15's 'global top 10'). len(top_itineraries) <= top_n.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "top_itineraries": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/rankedItinerary" }
+    }
+  },
+  "$defs": {
+    "rankedItinerary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rank_by_adjusted_score",
+        "rank_by_price",
+        "rank_by_total_journey_score",
+        "itinerary_id",
+        "provider",
+        "airline",
+        "route",
+        "origin",
+        "destination",
+        "stop_count",
+        "departure_utc",
+        "departure_local",
+        "departure_tz",
+        "arrival_utc",
+        "arrival_local",
+        "arrival_tz",
+        "layover_minutes",
+        "total_duration_minutes",
+        "price_eur",
+        "fare_as_of",
+        "booking_url",
+        "booking_url_kind",
+        "booking_url_valid",
+        "score"
+      ],
+      "properties": {
+        "rank_by_adjusted_score": { "type": "integer", "minimum": 1 },
+        "rank_by_price": { "type": "integer", "minimum": 1 },
+        "rank_by_total_journey_score": { "type": "integer", "minimum": 1 },
+        "itinerary_id": { "type": "string", "minLength": 1 },
+        "provider": { "type": "string", "minLength": 1 },
+        "airline": { "type": "string" },
+        "route": { "type": "string" },
+        "origin": { "type": "string", "pattern": "^[A-Z]{3}$" },
+        "destination": { "type": "string", "pattern": "^[A-Z]{3}$" },
+        "stop_count": { "type": "integer", "minimum": 0 },
+        "departure_utc": { "type": "string", "format": "date-time" },
+        "departure_local": { "type": "string", "format": "date-time" },
+        "departure_tz": { "type": "string", "minLength": 1 },
+        "arrival_utc": { "type": "string", "format": "date-time" },
+        "arrival_local": { "type": "string", "format": "date-time" },
+        "arrival_tz": { "type": "string", "minLength": 1 },
+        "layover_minutes": { "type": "integer", "minimum": 0 },
+        "total_duration_minutes": { "type": "integer", "minimum": 0 },
+        "price_eur": {
+          "description": "Money.amount, quantized to the cent -- always exactly two decimal places.",
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]{2}$"
+        },
+        "fare_as_of": { "type": "string", "format": "date-time" },
+        "booking_url": {
+          "description": "Raw booking_url string as it appeared on the NormalizedItinerary, or null when none was present. May be present even when booking_url_valid is false -- see booking_url_valid.",
+          "type": ["string", "null"]
+        },
+        "booking_url_kind": {
+          "enum": ["provider_native", "search_deeplink", "unavailable"]
+        },
+        "booking_url_valid": {
+          "description": "Whether booking_url passed reporting.booking_link.validate_booking_url (master plan S8.2). false means booking_url must never be rendered as a clickable link.",
+          "type": "boolean"
+        },
+        "score": { "$ref": "#/$defs/scoreComponents" }
+      }
+    },
+    "scoreComponents": {
+      "description": "domain.scoring.ScoreComponents, each field as a decimal-shaped string (never a JSON number -- finding 0.3 forbids float round-tripping of money/score values).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fare_eur",
+        "elapsed_time_component",
+        "layover_penalty",
+        "direct_bonus",
+        "score",
+        "adjusted_score"
+      ],
+      "properties": {
+        "fare_eur": { "$ref": "#/$defs/decimalString" },
+        "elapsed_time_component": { "$ref": "#/$defs/decimalString" },
+        "layover_penalty": { "$ref": "#/$defs/decimalString" },
+        "direct_bonus": { "$ref": "#/$defs/decimalString" },
+        "score": { "$ref": "#/$defs/decimalString" },
+        "adjusted_score": { "$ref": "#/$defs/decimalString" }
+      }
+    },
+    "decimalString": {
+      "type": "string",
+      "pattern": "^-?[0-9]+(\\.[0-9]+)?$"
+    }
+  }
+}
