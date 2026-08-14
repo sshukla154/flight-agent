@@ -1,0 +1,143 @@
+# config/defaults.toml — packaged configuration defaults for flightagent.
+#
+# Layer 1 of 4, lowest precedence (master plan §7, "Config layering"):
+#   packaged defaults.toml  <  ./config/config.toml ($FLIGHTAGENT_CONFIG)
+#     <  env vars (FLIGHTAGENT__SECTION__KEY)  <  CLI flags (not wired yet)
+#
+# Every key below must have a matching field in
+# src/flightagent/config/models.py. Every model there uses
+# model_config = SettingsConfigDict(extra="forbid"): an unrecognised key
+# anywhere in the layer stack — here, in ./config/config.toml, or in an
+# env var — is a hard error, never a silently-ignored no-op. That is the
+# single most important behaviour this module has to prove (master plan §7).
+#
+# Money and score-input values are typed Decimal in models.py (master plan
+# §4: "Money is Decimal ... Scores are Decimal too"), even though TOML has
+# no decimal literal — pydantic converts a TOML float via its string
+# representation (Decimal(str(v))), not the raw binary float, so 3.0 becomes
+# Decimal("3.0") cleanly rather than picking up float artifacts.
+
+[concurrency]
+# Global semaphore of concurrent logical searches (master plan §5,
+# "Concurrency: 8"). The binding constraint is provider quota, not local
+# CPU — 8 ships; config allows raising it for mock-only runs where no real
+# quota is at risk.
+max_concurrent_searches = 8
+
+[retry]
+# Retry policy for provider calls (master plan §5). 3 attempts is spec-
+# mandated; the rest of this table gives the backoff/circuit-breaker
+# numbers a config home instead of leaving them as inline constants.
+max_attempts = 3
+# Fraction of total task count the run may spend on retries in aggregate.
+# Without this cap a single broken provider can turn a 160-task run into a
+# 480-call quota fire (master plan §5).
+retry_budget_fraction = 0.25
+# Backoff = min(backoff_cap_seconds, backoff_base_seconds * 2**attempt),
+# with FULL jitter — not equal jitter. 160 tasks failing simultaneously
+# against a rate limit is exactly the thundering-herd case full jitter
+# exists for (master plan §5).
+backoff_base_seconds = 0.5
+backoff_cap_seconds = 8.0
+# Per-provider circuit breaker: this many consecutive failures opens the
+# breaker for this many seconds (master plan §5).
+circuit_breaker_failure_threshold = 10
+circuit_breaker_open_seconds = 60.0
+
+[layover]
+# Layover validity window in minutes — CLOSED interval [180, 360] (D8).
+# 180 valid, 360 valid; 179 and 361 rejected. Computed on UTC-elapsed time,
+# never on summed local segment times.
+layover_min_minutes = 180
+layover_max_minutes = 360
+
+# Penalty bands (D9): LOWER-INCLUSIVE HALF-OPEN, not the overlapping-endpoint
+# prose in the source spec. Exactly 4h (240min) scores +10, not 0. Exactly
+# 5h (300min) scores +20. The spec's own requested "4-hour layover" sample
+# lands on this exact boundary — see DECISIONS.md D9 and "Confirm before
+# Phase 5". max_minutes is EXCLUSIVE except on the final band, where 360 is
+# the closed top of the D8 validity window.
+[[layover.penalty_bands]]
+min_minutes = 180
+max_minutes = 240          # exclusive: [180, 240) -> 0
+penalty_eur = 0
+
+[[layover.penalty_bands]]
+min_minutes = 240
+max_minutes = 300          # exclusive: [240, 300) -> 10
+penalty_eur = 10
+
+[[layover.penalty_bands]]
+min_minutes = 300
+max_minutes = 360          # inclusive top of D8's [180, 360] window
+penalty_eur = 20
+
+[scoring]
+# score = price + time_value_eur_per_hour * duration_hours + layover_penalty
+#         + direct_bonus
+# The €/hour weight is configurable (finding 0.8) precisely because the
+# spec's "3" is dimensionally ambiguous unless read as EUR/hour; 3.0 is the
+# spec-compliant default.
+time_value_eur_per_hour = 3.0
+# Direct-flight bonus. Negative because it SUBTRACTS from score (lower
+# score wins). This diverges from the 150€/20% direct-tier rule in
+# [direct_tier] above a stop fare of roughly €755 — that divergence is
+# intentional and NOT reconciled (finding 0.1): adjusted_score governs the
+# ranked list; the tier ladder governs the per-destination narrative.
+direct_bonus_eur = -120.0
+# "fixed" applies direct_bonus_eur as a flat amount; "proportional" would
+# scale it to the fare instead. "fixed" is the spec-compliant default
+# (finding 0.1).
+direct_bonus_mode = "fixed"
+
+[ground_travel]
+# Hard filter, evaluated per origin before any task for that origin is
+# planned (D7) — NOT a scoring input. An origin whose ground access to
+# Nieuwegein exceeds this many minutes is dropped from the plan entirely.
+max_ground_travel_minutes = 150
+# Weights for the PARALLEL total_journey_score metric (D7, master plan §6):
+#   ground_cost_component = ground_cost_weight * ground_leg.cost_eur
+#   ground_time_component = ground_time_weight * ground_leg.duration_hours
+#   total_journey_score   = adjusted_score + ground_cost_component
+#                            + ground_time_component
+# adjusted_score itself is never modified by these weights.
+ground_cost_weight = 1.0
+ground_time_weight = 8.0
+
+[early_stop]
+# Off by default (D12) — a default run always produces the full 160-cell
+# comparison. When off, the rule still runs post-hoc over the complete
+# result set and is reported as an annotation ("early stop would have
+# triggered at ..."), never as a control-flow decision, unless a future
+# --search-mode=sequential-priority flag is used.
+enabled = false
+# Per-destination trigger: an origin's cheapest valid fare to a destination
+# must be at least this many EUR below the cheapest valid fare to that same
+# destination across all previously-completed origins (raw price_eur, not
+# adjusted score) — D12.
+threshold_eur = 250.0
+
+[cache]
+# SQLite two-layer cache TTL, tiered by days-to-departure (master plan §5).
+# 2027-07-17 seen from ~2026-08-14 is ~338 days out, which sits in the
+# >180-day tier below — right, because schedules that far out barely move.
+ttl_minutes_over_180_days = 1440   # 24h
+ttl_minutes_30_to_180_days = 360   # 6h
+ttl_minutes_7_to_30_days = 60      # 1h
+ttl_minutes_under_7_days = 15      # 15min
+# Pagination cap per provider task (master plan §5) — a 160-task run that
+# pages deeply on every task exhausts quota for no ranking benefit.
+max_pages_per_task = 3
+
+[output]
+# Exact filenames (D15) — spec-literal. Do not template the date without
+# re-reading D15 first; the date is fixed to the one search date this
+# project targets, not "today".
+report_path = "out/flight_report_2027-07-17.md"
+results_path = "out/flight_results_2027-07-17.json"
+# Global top-N in the main ranking, and top-N per destination additionally
+# carried in the JSON (D15). Truncation applies to the main ranking's
+# PRESENTATION only — every other section (Direct Flight Analysis, origin
+# comparison) reads the full set, never the truncated one.
+top_n_global = 10
+top_n_per_destination = 3
