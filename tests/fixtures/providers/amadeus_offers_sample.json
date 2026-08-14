@@ -1,0 +1,744 @@
+{
+  "_fixture_note": "HAND-AUTHORED FIXTURE. This file was written by hand from Amadeus's published Flight Offers Search v2 schema documentation (OpenAPI spec + API reference). It is NOT a live capture: no Amadeus credentials existed in the environment where it was produced and no request was ever sent. Field names, nesting and types follow the documented schema; the values (prices, flight numbers, times, seat counts, fare bases, dictionary entries) are plausible inventions, not quoted fares. Do not treat any price here as real. See tests/fixtures/providers/README.md for the doc URLs used and the list of fields that still need verification against a real response. Scenario: AMS -> DEL, 2027-07-17, ECONOMY, 1 adult, max 1 stop.",
+  "meta": {
+    "count": 5,
+    "links": {
+      "self": "https://test.api.amadeus.com/v2/shopping/flight-offers?originLocationCode=AMS&destinationLocationCode=DEL&departureDate=2027-07-17&adults=1&travelClass=ECONOMY&currencyCode=EUR&max=5",
+      "next": "https://test.api.amadeus.com/v2/shopping/flight-offers?originLocationCode=AMS&destinationLocationCode=DEL&departureDate=2027-07-17&adults=1&travelClass=ECONOMY&currencyCode=EUR&max=5&page%5Boffset%5D=5",
+      "last": "https://test.api.amadeus.com/v2/shopping/flight-offers?originLocationCode=AMS&destinationLocationCode=DEL&departureDate=2027-07-17&adults=1&travelClass=ECONOMY&currencyCode=EUR&max=5&page%5Boffset%5D=20"
+    }
+  },
+  "data": [
+    {
+      "type": "flight-offer",
+      "id": "1",
+      "source": "GDS",
+      "instantTicketingRequired": false,
+      "nonHomogeneous": false,
+      "oneWay": false,
+      "isUpsellOffer": false,
+      "lastTicketingDate": "2027-07-10",
+      "lastTicketingDateTime": "2027-07-10",
+      "numberOfBookableSeats": 4,
+      "itineraries": [
+        {
+          "duration": "PT13H55M",
+          "segments": [
+            {
+              "departure": {
+                "iataCode": "AMS",
+                "terminal": "3",
+                "at": "2027-07-17T14:55:00"
+              },
+              "arrival": {
+                "iataCode": "DXB",
+                "terminal": "3",
+                "at": "2027-07-17T23:20:00"
+              },
+              "carrierCode": "EK",
+              "number": "148",
+              "aircraft": {
+                "code": "77W"
+              },
+              "operating": {
+                "carrierCode": "EK"
+              },
+              "duration": "PT6H25M",
+              "id": "1",
+              "numberOfStops": 0,
+              "blacklistedInEU": false
+            },
+            {
+              "departure": {
+                "iataCode": "DXB",
+                "terminal": "3",
+                "at": "2027-07-18T03:30:00"
+              },
+              "arrival": {
+                "iataCode": "DEL",
+                "terminal": "3",
+                "at": "2027-07-18T08:20:00"
+              },
+              "carrierCode": "EK",
+              "number": "512",
+              "aircraft": {
+                "code": "388"
+              },
+              "operating": {
+                "carrierCode": "EK"
+              },
+              "duration": "PT3H20M",
+              "id": "2",
+              "numberOfStops": 0,
+              "blacklistedInEU": false
+            }
+          ]
+        }
+      ],
+      "price": {
+        "currency": "EUR",
+        "total": "684.31",
+        "base": "402.00",
+        "fees": [
+          {
+            "amount": "0.00",
+            "type": "SUPPLIER"
+          },
+          {
+            "amount": "0.00",
+            "type": "TICKETING"
+          }
+        ],
+        "grandTotal": "684.31"
+      },
+      "pricingOptions": {
+        "fareType": [
+          "PUBLISHED"
+        ],
+        "includedCheckedBagsOnly": true,
+        "refundableFare": false,
+        "noRestrictionFare": false,
+        "noPenaltyFare": false
+      },
+      "validatingAirlineCodes": [
+        "EK"
+      ],
+      "travelerPricings": [
+        {
+          "travelerId": "1",
+          "fareOption": "STANDARD",
+          "travelerType": "ADULT",
+          "price": {
+            "currency": "EUR",
+            "total": "684.31",
+            "base": "402.00"
+          },
+          "fareDetailsBySegment": [
+            {
+              "segmentId": "1",
+              "cabin": "ECONOMY",
+              "fareBasis": "QLRCEU1",
+              "brandedFare": "ECOSAVER",
+              "brandedFareLabel": "ECONOMY SAVER",
+              "class": "Q",
+              "includedCheckedBags": {
+                "quantity": 1
+              },
+              "includedCabinBags": {
+                "quantity": 1
+              },
+              "amenities": [
+                {
+                  "description": "CHECKED BAG FIRST",
+                  "isChargeable": false,
+                  "amenityType": "BAGGAGE",
+                  "amenityProvider": {
+                    "name": "BrandedFare"
+                  }
+                },
+                {
+                  "description": "SEAT SELECTION",
+                  "isChargeable": true,
+                  "amenityType": "PRE_RESERVED_SEAT",
+                  "amenityProvider": {
+                    "name": "BrandedFare"
+                  }
+                }
+              ]
+            },
+            {
+              "segmentId": "2",
+              "cabin": "ECONOMY",
+              "fareBasis": "QLRCEU1",
+              "brandedFare": "ECOSAVER",
+              "brandedFareLabel": "ECONOMY SAVER",
+              "class": "Q",
+              "includedCheckedBags": {
+                "quantity": 1
+              },
+              "includedCabinBags": {
+                "quantity": 1
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "flight-offer",
+      "id": "2",
+      "source": "GDS",
+      "instantTicketingRequired": false,
+      "nonHomogeneous": false,
+      "oneWay": false,
+      "isUpsellOffer": false,
+      "lastTicketingDate": "2027-07-10",
+      "lastTicketingDateTime": "2027-07-10",
+      "numberOfBookableSeats": 4,
+      "itineraries": [
+        {
+          "duration": "PT13H55M",
+          "segments": [
+            {
+              "departure": {
+                "iataCode": "AMS",
+                "terminal": "3",
+                "at": "2027-07-17T14:55:00"
+              },
+              "arrival": {
+                "iataCode": "DXB",
+                "terminal": "3",
+                "at": "2027-07-17T23:20:00"
+              },
+              "carrierCode": "QF",
+              "number": "8148",
+              "aircraft": {
+                "code": "77W"
+              },
+              "operating": {
+                "carrierCode": "EK"
+              },
+              "duration": "PT6H25M",
+              "id": "3",
+              "numberOfStops": 0,
+              "blacklistedInEU": false
+            },
+            {
+              "departure": {
+                "iataCode": "DXB",
+                "terminal": "3",
+                "at": "2027-07-18T03:30:00"
+              },
+              "arrival": {
+                "iataCode": "DEL",
+                "terminal": "3",
+                "at": "2027-07-18T08:20:00"
+              },
+              "carrierCode": "QF",
+              "number": "8512",
+              "aircraft": {
+                "code": "388"
+              },
+              "operating": {
+                "carrierCode": "EK"
+              },
+              "duration": "PT3H20M",
+              "id": "4",
+              "numberOfStops": 0,
+              "blacklistedInEU": false
+            }
+          ]
+        }
+      ],
+      "price": {
+        "currency": "EUR",
+        "total": "702.87",
+        "base": "418.00",
+        "fees": [
+          {
+            "amount": "0.00",
+            "type": "SUPPLIER"
+          },
+          {
+            "amount": "0.00",
+            "type": "TICKETING"
+          }
+        ],
+        "grandTotal": "702.87"
+      },
+      "pricingOptions": {
+        "fareType": [
+          "PUBLISHED"
+        ],
+        "includedCheckedBagsOnly": true,
+        "refundableFare": false,
+        "noRestrictionFare": false,
+        "noPenaltyFare": false
+      },
+      "validatingAirlineCodes": [
+        "QF"
+      ],
+      "travelerPricings": [
+        {
+          "travelerId": "1",
+          "fareOption": "STANDARD",
+          "travelerType": "ADULT",
+          "price": {
+            "currency": "EUR",
+            "total": "702.87",
+            "base": "418.00"
+          },
+          "fareDetailsBySegment": [
+            {
+              "segmentId": "3",
+              "cabin": "ECONOMY",
+              "fareBasis": "NLSS0QF",
+              "class": "N",
+              "includedCheckedBags": {
+                "quantity": 1
+              }
+            },
+            {
+              "segmentId": "4",
+              "cabin": "ECONOMY",
+              "fareBasis": "NLSS0QF",
+              "class": "N",
+              "includedCheckedBags": {
+                "quantity": 1
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "flight-offer",
+      "id": "3",
+      "source": "GDS",
+      "instantTicketingRequired": false,
+      "nonHomogeneous": false,
+      "oneWay": false,
+      "isUpsellOffer": false,
+      "lastTicketingDate": "2027-07-12",
+      "lastTicketingDateTime": "2027-07-12",
+      "numberOfBookableSeats": 9,
+      "itineraries": [
+        {
+          "duration": "PT15H25M",
+          "segments": [
+            {
+              "departure": {
+                "iataCode": "AMS",
+                "terminal": "1",
+                "at": "2027-07-17T10:20:00"
+              },
+              "arrival": {
+                "iataCode": "IST",
+                "at": "2027-07-17T15:15:00"
+              },
+              "carrierCode": "TK",
+              "number": "1954",
+              "aircraft": {
+                "code": "321"
+              },
+              "operating": {
+                "carrierCode": "TK"
+              },
+              "duration": "PT3H55M",
+              "id": "5",
+              "numberOfStops": 0,
+              "blacklistedInEU": false
+            },
+            {
+              "departure": {
+                "iataCode": "IST",
+                "at": "2027-07-17T19:55:00"
+              },
+              "arrival": {
+                "iataCode": "DEL",
+                "terminal": "3",
+                "at": "2027-07-18T05:15:00"
+              },
+              "carrierCode": "TK",
+              "number": "716",
+              "aircraft": {
+                "code": "789"
+              },
+              "operating": {
+                "carrierCode": "TK"
+              },
+              "duration": "PT6H50M",
+              "id": "6",
+              "numberOfStops": 0,
+              "blacklistedInEU": false
+            }
+          ]
+        }
+      ],
+      "price": {
+        "currency": "EUR",
+        "total": "612.44",
+        "base": "351.00",
+        "fees": [
+          {
+            "amount": "0.00",
+            "type": "SUPPLIER"
+          },
+          {
+            "amount": "0.00",
+            "type": "TICKETING"
+          }
+        ],
+        "grandTotal": "612.44"
+      },
+      "pricingOptions": {
+        "fareType": [
+          "PUBLISHED"
+        ],
+        "includedCheckedBagsOnly": true,
+        "refundableFare": false,
+        "noRestrictionFare": false,
+        "noPenaltyFare": false
+      },
+      "validatingAirlineCodes": [
+        "TK"
+      ],
+      "travelerPricings": [
+        {
+          "travelerId": "1",
+          "fareOption": "STANDARD",
+          "travelerType": "ADULT",
+          "price": {
+            "currency": "EUR",
+            "total": "612.44",
+            "base": "351.00"
+          },
+          "fareDetailsBySegment": [
+            {
+              "segmentId": "5",
+              "cabin": "ECONOMY",
+              "fareBasis": "TLXPRO",
+              "brandedFare": "ECOFLY",
+              "brandedFareLabel": "ECOFLY",
+              "class": "T",
+              "includedCheckedBags": {
+                "weight": 30,
+                "weightUnit": "KG"
+              }
+            },
+            {
+              "segmentId": "6",
+              "cabin": "ECONOMY",
+              "fareBasis": "TLXPRO",
+              "brandedFare": "ECOFLY",
+              "brandedFareLabel": "ECOFLY",
+              "class": "T",
+              "includedCheckedBags": {
+                "weight": 30,
+                "weightUnit": "KG"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "flight-offer",
+      "id": "4",
+      "source": "GDS",
+      "instantTicketingRequired": false,
+      "nonHomogeneous": false,
+      "oneWay": false,
+      "isUpsellOffer": false,
+      "lastTicketingDate": "2027-07-11",
+      "lastTicketingDateTime": "2027-07-11",
+      "numberOfBookableSeats": 2,
+      "itineraries": [
+        {
+          "duration": "PT17H0M",
+          "segments": [
+            {
+              "departure": {
+                "iataCode": "AMS",
+                "terminal": "1",
+                "at": "2027-07-17T21:10:00"
+              },
+              "arrival": {
+                "iataCode": "DOH",
+                "at": "2027-07-18T07:45:00"
+              },
+              "carrierCode": "QR",
+              "number": "274",
+              "aircraft": {
+                "code": "77W"
+              },
+              "operating": {
+                "carrierCode": "QR"
+              },
+              "duration": "PT9H35M",
+              "id": "7",
+              "numberOfStops": 1,
+              "stops": [
+                {
+                  "iataCode": "BUD",
+                  "duration": "PT1H15M",
+                  "arrivalAt": "2027-07-17T23:00:00",
+                  "departureAt": "2027-07-18T00:15:00"
+                }
+              ],
+              "blacklistedInEU": false
+            },
+            {
+              "departure": {
+                "iataCode": "DOH",
+                "at": "2027-07-18T11:20:00"
+              },
+              "arrival": {
+                "iataCode": "DEL",
+                "terminal": "3",
+                "at": "2027-07-18T17:40:00"
+              },
+              "carrierCode": "QR",
+              "number": "578",
+              "aircraft": {
+                "code": "320"
+              },
+              "operating": {
+                "carrierCode": "QR"
+              },
+              "duration": "PT3H50M",
+              "id": "8",
+              "numberOfStops": 0,
+              "blacklistedInEU": false
+            }
+          ]
+        }
+      ],
+      "price": {
+        "currency": "EUR",
+        "total": "731.90",
+        "base": "455.00",
+        "fees": [
+          {
+            "amount": "0.00",
+            "type": "SUPPLIER"
+          },
+          {
+            "amount": "0.00",
+            "type": "TICKETING"
+          }
+        ],
+        "grandTotal": "731.90"
+      },
+      "pricingOptions": {
+        "fareType": [
+          "PUBLISHED"
+        ],
+        "includedCheckedBagsOnly": true,
+        "refundableFare": false,
+        "noRestrictionFare": false,
+        "noPenaltyFare": false
+      },
+      "validatingAirlineCodes": [
+        "QR"
+      ],
+      "travelerPricings": [
+        {
+          "travelerId": "1",
+          "fareOption": "STANDARD",
+          "travelerType": "ADULT",
+          "price": {
+            "currency": "EUR",
+            "total": "731.90",
+            "base": "455.00"
+          },
+          "fareDetailsBySegment": [
+            {
+              "segmentId": "7",
+              "cabin": "ECONOMY",
+              "fareBasis": "LLRTEU",
+              "brandedFare": "ECOCLASSIC",
+              "brandedFareLabel": "ECONOMY CLASSIC",
+              "class": "L",
+              "includedCheckedBags": {
+                "quantity": 2
+              }
+            },
+            {
+              "segmentId": "8",
+              "cabin": "ECONOMY",
+              "fareBasis": "LLRTEU",
+              "brandedFare": "ECOCLASSIC",
+              "brandedFareLabel": "ECONOMY CLASSIC",
+              "class": "L",
+              "includedCheckedBags": {
+                "quantity": 2
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "flight-offer",
+      "id": "5",
+      "source": "GDS",
+      "instantTicketingRequired": false,
+      "nonHomogeneous": false,
+      "oneWay": false,
+      "isUpsellOffer": true,
+      "lastTicketingDate": "2027-07-16",
+      "lastTicketingDateTime": "2027-07-16",
+      "numberOfBookableSeats": 9,
+      "itineraries": [
+        {
+          "duration": "PT13H55M",
+          "segments": [
+            {
+              "departure": {
+                "iataCode": "AMS",
+                "terminal": "3",
+                "at": "2027-07-17T14:55:00"
+              },
+              "arrival": {
+                "iataCode": "DXB",
+                "terminal": "3",
+                "at": "2027-07-17T23:20:00"
+              },
+              "carrierCode": "EK",
+              "number": "148",
+              "aircraft": {
+                "code": "77W"
+              },
+              "operating": {
+                "carrierCode": "EK"
+              },
+              "duration": "PT6H25M",
+              "id": "9",
+              "numberOfStops": 0,
+              "blacklistedInEU": false
+            },
+            {
+              "departure": {
+                "iataCode": "DXB",
+                "terminal": "3",
+                "at": "2027-07-18T03:30:00"
+              },
+              "arrival": {
+                "iataCode": "DEL",
+                "terminal": "3",
+                "at": "2027-07-18T08:20:00"
+              },
+              "carrierCode": "EK",
+              "number": "512",
+              "aircraft": {
+                "code": "388"
+              },
+              "operating": {
+                "carrierCode": "EK"
+              },
+              "duration": "PT3H20M",
+              "id": "10",
+              "numberOfStops": 0,
+              "blacklistedInEU": false
+            }
+          ]
+        }
+      ],
+      "price": {
+        "currency": "EUR",
+        "total": "1038.60",
+        "base": "742.00",
+        "fees": [
+          {
+            "amount": "0.00",
+            "type": "SUPPLIER"
+          },
+          {
+            "amount": "0.00",
+            "type": "TICKETING"
+          }
+        ],
+        "grandTotal": "1038.60"
+      },
+      "pricingOptions": {
+        "fareType": [
+          "PUBLISHED"
+        ],
+        "includedCheckedBagsOnly": true,
+        "refundableFare": true,
+        "noRestrictionFare": false,
+        "noPenaltyFare": false
+      },
+      "validatingAirlineCodes": [
+        "EK"
+      ],
+      "travelerPricings": [
+        {
+          "travelerId": "1",
+          "fareOption": "STANDARD",
+          "travelerType": "ADULT",
+          "price": {
+            "currency": "EUR",
+            "total": "1038.60",
+            "base": "742.00"
+          },
+          "fareDetailsBySegment": [
+            {
+              "segmentId": "9",
+              "cabin": "ECONOMY",
+              "fareBasis": "YRCFEU",
+              "brandedFare": "ECOFLEX",
+              "brandedFareLabel": "ECONOMY FLEX",
+              "class": "Y",
+              "includedCheckedBags": {
+                "quantity": 2
+              },
+              "includedCabinBags": {
+                "quantity": 1
+              }
+            },
+            {
+              "segmentId": "10",
+              "cabin": "ECONOMY",
+              "fareBasis": "YRCFEU",
+              "brandedFare": "ECOFLEX",
+              "brandedFareLabel": "ECONOMY FLEX",
+              "class": "Y",
+              "includedCheckedBags": {
+                "quantity": 2
+              },
+              "includedCabinBags": {
+                "quantity": 1
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "dictionaries": {
+    "locations": {
+      "AMS": {
+        "cityCode": "AMS",
+        "countryCode": "NL"
+      },
+      "BUD": {
+        "cityCode": "BUD",
+        "countryCode": "HU"
+      },
+      "DEL": {
+        "cityCode": "DEL",
+        "countryCode": "IN"
+      },
+      "DOH": {
+        "cityCode": "DOH",
+        "countryCode": "QA"
+      },
+      "DXB": {
+        "cityCode": "DXB",
+        "countryCode": "AE"
+      },
+      "IST": {
+        "cityCode": "IST",
+        "countryCode": "TR"
+      }
+    },
+    "aircraft": {
+      "320": "AIRBUS A320",
+      "321": "AIRBUS A321",
+      "388": "AIRBUS A380-800",
+      "77W": "BOEING 777-300ER",
+      "789": "BOEING 787-9"
+    },
+    "currencies": {
+      "EUR": "EURO"
+    },
+    "carriers": {
+      "EK": "EMIRATES",
+      "QF": "QANTAS AIRWAYS",
+      "QR": "QATAR AIRWAYS",
+      "TK": "TURKISH AIRLINES"
+    }
+  }
+}
