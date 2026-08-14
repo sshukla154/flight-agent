@@ -1,0 +1,323 @@
+"""Unit tests for flightagent.scoring (T13, scorer v1).
+
+Master plan finding 0.8 / DECISIONS.md D9: the layover penalty bands are
+LOWER-INCLUSIVE HALF-OPEN, and the spec's own worked example (a 4-hour =
+240-minute layover) lands exactly on the first boundary. The two tests
+named explicitly in this task's brief —
+``test_exactly_240_minutes_scores_10_not_0`` and
+``test_exactly_300_minutes_scores_20_not_10`` — exist to catch an
+off-by-one band read before it reaches a golden file.
+
+Finding 0.3: every score component must be ``Decimal``, never ``float`` —
+``TestAllComponentsAreDecimalNeverFloat`` checks the type directly, not
+just the value, because a value that happens to compare equal to a float
+would still hide the nondeterminism finding 0.3 is about.
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
+from zoneinfo import ZoneInfo
+
+import pytest
+
+from flightagent.config.loader import load_config
+from flightagent.domain.enums import CabinClass
+from flightagent.domain.itinerary import Leg, NormalizedItinerary
+from flightagent.domain.money import Money
+from flightagent.domain.segment import Layover, Segment
+from flightagent.scoring.components import layover_penalty_for_minutes
+from flightagent.scoring.score import score_itinerary
+
+_SETTINGS = load_config(env={})
+_BANDS = _SETTINGS.layover.penalty_bands
+
+
+def _segment(
+    *,
+    origin: str,
+    destination: str,
+    depart_utc: datetime,
+    arrive_utc: datetime,
+    flight_number: str,
+) -> Segment:
+    """UTC-zoned on both ends so depart_local/arrive_local trivially match
+    depart_utc/arrive_utc — DST/fold correctness is covered elsewhere
+    (test_domain_smoke.py); this file only cares about score arithmetic."""
+    zone = ZoneInfo("UTC")
+    return Segment(
+        segment_id=f"{origin}-{destination}-{flight_number}",
+        origin=origin,
+        destination=destination,
+        depart_utc=depart_utc,
+        arrive_utc=arrive_utc,
+        depart_local=depart_utc.astimezone(zone),
+        arrive_local=arrive_utc.astimezone(zone),
+        origin_tz="UTC",
+        destination_tz="UTC",
+        marketing_carrier="KL",
+        flight_number=flight_number,
+        cabin=CabinClass.ECONOMY,
+        duration=arrive_utc - depart_utc,
+    )
+
+
+def _layover(*, airport: str, arrive_utc: datetime, depart_utc: datetime) -> Layover:
+    zone = ZoneInfo("UTC")
+    return Layover(
+        airport=airport,
+        arrive_utc=arrive_utc,
+        depart_utc=depart_utc,
+        duration=depart_utc - arrive_utc,
+        local_window=(arrive_utc.astimezone(zone), depart_utc.astimezone(zone)),
+        requires_airport_change=False,
+        requires_terminal_change=False,
+    )
+
+
+def _itinerary(
+    *,
+    legs: tuple[Leg, ...],
+    price_eur: Decimal,
+    itinerary_id: str = "itin_test_0001",
+) -> NormalizedItinerary:
+    price = Money(amount=price_eur, currency="EUR")
+    return NormalizedItinerary(
+        itinerary_id=itinerary_id,
+        provider="mock",
+        legs=legs,
+        price_original=price,
+        price_eur=price,
+        booking_url_kind="unavailable",
+        shape_key=f"shape-{itinerary_id}",
+        fare_as_of=datetime(2027, 1, 1, tzinfo=UTC),
+    )
+
+
+def _worked_example_itinerary() -> NormalizedItinerary:
+    """Master plan's / DECISIONS.md's own worked case: price 620, total
+    duration 13h30m, one layover of 3h30m (210 min, band [180,240) -> 0).
+
+    AMS(08:00Z) -> DXB(14:00Z) [6h] -- 210min layover at DXB -- DXB(17:30Z)
+    -> DEL(21:30Z) [4h]. Endpoints total = 21:30 - 08:00 = 13h30m, matching
+    segments(6h+4h=10h) + layover(3h30m) exactly, per Leg's own invariant.
+    """
+    seg1 = _segment(
+        origin="AMS",
+        destination="DXB",
+        depart_utc=datetime(2027, 7, 17, 8, 0, tzinfo=UTC),
+        arrive_utc=datetime(2027, 7, 17, 14, 0, tzinfo=UTC),
+        flight_number="431",
+    )
+    layover = _layover(
+        airport="DXB",
+        arrive_utc=datetime(2027, 7, 17, 14, 0, tzinfo=UTC),
+        depart_utc=datetime(2027, 7, 17, 17, 30, tzinfo=UTC),
+    )
+    seg2 = _segment(
+        origin="DXB",
+        destination="DEL",
+        depart_utc=datetime(2027, 7, 17, 17, 30, tzinfo=UTC),
+        arrive_utc=datetime(2027, 7, 17, 21, 30, tzinfo=UTC),
+        flight_number="512",
+    )
+    leg = Leg(segments=(seg1, seg2), layovers=(layover,))
+    return _itinerary(legs=(leg,), price_eur=Decimal("620.00"))
+
+
+def _direct_itinerary() -> NormalizedItinerary:
+    """A single-segment, zero-layover itinerary — stop_count == 0."""
+    seg = _segment(
+        origin="AMS",
+        destination="DEL",
+        depart_utc=datetime(2027, 7, 17, 8, 0, tzinfo=UTC),
+        arrive_utc=datetime(2027, 7, 17, 16, 0, tzinfo=UTC),
+        flight_number="872",
+    )
+    leg = Leg(segments=(seg,), layovers=())
+    assert leg.connection_count == 0
+    return _itinerary(legs=(leg,), price_eur=Decimal("900.00"), itinerary_id="itin_direct_0001")
+
+
+def _two_layover_itinerary() -> NormalizedItinerary:
+    """Three segments / two layovers on ONE leg, to prove the sum is over
+    however many layovers exist rather than hardcoded to "exactly one".
+
+    AMS(00:00Z)->FRA(02:00Z)[2h] -- 200min layover (band 0) --
+    FRA(05:20Z)->IST(07:20Z)[2h] -- 250min layover (band 10) --
+    IST(11:30Z)->DEL(13:30Z)[2h]. Expected total layover_penalty = 0+10=10.
+    """
+    seg_a = _segment(
+        origin="AMS",
+        destination="FRA",
+        depart_utc=datetime(2027, 7, 17, 0, 0, tzinfo=UTC),
+        arrive_utc=datetime(2027, 7, 17, 2, 0, tzinfo=UTC),
+        flight_number="101",
+    )
+    layover_1 = _layover(
+        airport="FRA",
+        arrive_utc=datetime(2027, 7, 17, 2, 0, tzinfo=UTC),
+        depart_utc=datetime(2027, 7, 17, 5, 20, tzinfo=UTC),
+    )
+    seg_b = _segment(
+        origin="FRA",
+        destination="IST",
+        depart_utc=datetime(2027, 7, 17, 5, 20, tzinfo=UTC),
+        arrive_utc=datetime(2027, 7, 17, 7, 20, tzinfo=UTC),
+        flight_number="202",
+    )
+    layover_2 = _layover(
+        airport="IST",
+        arrive_utc=datetime(2027, 7, 17, 7, 20, tzinfo=UTC),
+        depart_utc=datetime(2027, 7, 17, 11, 30, tzinfo=UTC),
+    )
+    seg_c = _segment(
+        origin="IST",
+        destination="DEL",
+        depart_utc=datetime(2027, 7, 17, 11, 30, tzinfo=UTC),
+        arrive_utc=datetime(2027, 7, 17, 13, 30, tzinfo=UTC),
+        flight_number="303",
+    )
+    leg = Leg(segments=(seg_a, seg_b, seg_c), layovers=(layover_1, layover_2))
+    return _itinerary(
+        legs=(leg,), price_eur=Decimal("700.00"), itinerary_id="itin_two_layover_0001"
+    )
+
+
+class TestLayoverPenaltyBandBoundaries:
+    """D9's lower-inclusive half-open bands, parameterized across every
+    boundary named in the task brief."""
+
+    @pytest.mark.parametrize("minutes", [180, 200, 239])
+    def test_below_240_scores_0(self, minutes: int) -> None:
+        assert layover_penalty_for_minutes(minutes, _BANDS) == Decimal("0")
+
+    def test_exactly_240_minutes_scores_10_not_0(self) -> None:
+        """The named risk: the spec's own 4-hour sample lands here. Under
+        D9's lower-inclusive half-open reading this is +10, NOT 0."""
+        assert layover_penalty_for_minutes(240, _BANDS) == Decimal("10")
+
+    @pytest.mark.parametrize("minutes", [241, 299])
+    def test_241_to_299_scores_10(self, minutes: int) -> None:
+        assert layover_penalty_for_minutes(minutes, _BANDS) == Decimal("10")
+
+    def test_exactly_300_minutes_scores_20_not_10(self) -> None:
+        """The second named boundary risk: exactly 300 minutes is +20, not
+        the +10 of the band immediately below it."""
+        assert layover_penalty_for_minutes(300, _BANDS) == Decimal("20")
+
+    @pytest.mark.parametrize("minutes", [301, 360])
+    def test_301_to_360_scores_20(self, minutes: int) -> None:
+        assert layover_penalty_for_minutes(minutes, _BANDS) == Decimal("20")
+
+
+class TestDirectItineraryLayoverPenalty:
+    def test_direct_itinerary_has_zero_layover_penalty(self) -> None:
+        components = score_itinerary(
+            _direct_itinerary(),
+            scoring_settings=_SETTINGS.scoring,
+            layover_settings=_SETTINGS.layover,
+        )
+        assert components.layover_penalty == Decimal("0")
+
+
+class TestMultipleLayoversSum:
+    def test_two_layovers_sum_their_individual_band_penalties(self) -> None:
+        components = score_itinerary(
+            _two_layover_itinerary(),
+            scoring_settings=_SETTINGS.scoring,
+            layover_settings=_SETTINGS.layover,
+        )
+        # 200min -> band [180,240) -> 0 ; 250min -> band [240,300) -> 10.
+        assert components.layover_penalty == Decimal("10")
+
+
+class TestWorkedFullFormulaExample:
+    """DECISIONS.md's / master plan's own worked case, computed by hand:
+
+    score = price + (duration_hours * time_value_eur_per_hour) + layover_penalty
+          = 620 + (13.5 * 3.0) + 0
+          = 620 + 40.5 + 0
+          = 660.5
+    """
+
+    def test_worked_example_matches_hand_computed_score(self) -> None:
+        itinerary = _worked_example_itinerary()
+        assert itinerary.total_duration == timedelta(hours=13, minutes=30)
+
+        components = score_itinerary(
+            itinerary,
+            scoring_settings=_SETTINGS.scoring,
+            layover_settings=_SETTINGS.layover,
+        )
+
+        assert components.fare_eur == Decimal("620.00")
+        assert components.elapsed_time_component == Decimal("40.5")
+        assert components.layover_penalty == Decimal("0")
+        assert components.direct_bonus == Decimal("0")
+        assert components.score == Decimal("660.5")
+        assert components.adjusted_score == Decimal("660.5")
+
+
+class TestDirectBonusAlwaysZeroInPhase2:
+    """Proves the T30/Phase-5 scope boundary is respected: direct_bonus is
+    ALWAYS exactly Decimal("0") out of this scorer, never a nonzero value
+    silently sneaking in (e.g. from ``scoring.direct_bonus_eur`` in
+    config, which is -120.0 and must NOT leak into v1's output)."""
+
+    def test_direct_bonus_is_always_exactly_decimal_zero(self) -> None:
+        for itinerary in (
+            _worked_example_itinerary(),
+            _direct_itinerary(),
+            _two_layover_itinerary(),
+        ):
+            components = score_itinerary(
+                itinerary,
+                scoring_settings=_SETTINGS.scoring,
+                layover_settings=_SETTINGS.layover,
+            )
+            assert components.direct_bonus == Decimal("0")
+            # Not just numerically equal to 0 — must not have picked up
+            # config's -120.0 direct_bonus_eur by accident.
+            assert components.direct_bonus != _SETTINGS.scoring.direct_bonus_eur
+
+
+class TestAllComponentsAreDecimalNeverFloat:
+    """Finding 0.3: a type check, not just a value check — float addition
+    is not associative, so a component that happens to equal the right
+    number as a float would still be the wrong type to build a
+    reproducible score from."""
+
+    def test_every_component_and_computed_score_is_decimal(self) -> None:
+        components = score_itinerary(
+            _worked_example_itinerary(),
+            scoring_settings=_SETTINGS.scoring,
+            layover_settings=_SETTINGS.layover,
+        )
+
+        for value in (
+            components.fare_eur,
+            components.elapsed_time_component,
+            components.layover_penalty,
+            components.direct_bonus,
+            components.score,
+            components.adjusted_score,
+        ):
+            assert isinstance(value, Decimal)
+            assert not isinstance(value, float)
+
+    def test_layover_penalty_lookup_returns_decimal(self) -> None:
+        penalty = layover_penalty_for_minutes(240, _BANDS)
+        assert isinstance(penalty, Decimal)
+        assert not isinstance(penalty, float)
+
+
+class TestLayoverPenaltyForMinutesRejectsOutOfBandInput:
+    def test_no_bands_raises(self) -> None:
+        with pytest.raises(ValueError, match="no penalty bands configured"):
+            layover_penalty_for_minutes(240, [])
+
+    def test_minutes_outside_every_band_raises(self) -> None:
+        with pytest.raises(ValueError, match="does not fall within any configured penalty band"):
+            layover_penalty_for_minutes(9999, _BANDS)
