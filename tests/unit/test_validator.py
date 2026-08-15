@@ -37,26 +37,48 @@ ever exercised ``depart_local`` -- these exercise ``arrive_local`` too),
 one more method on ``TestEngineAccumulatesAllRejections`` proving the
 no-short-circuit contract holds with a T18 rule mixed in, not just
 Phase 2's original four.
+
+Phase 3 exit-criterion cleanup: ``TestSummarizeValidationResults`` and
+``TestValidateCompletedWiredIntoCli`` (T19's rejection-counter aggregator
+and its real-CLI wiring proof) are merged in here from the former
+``test_validation_counters.py``, which is deleted -- "the validator test
+suite" is one file, matching what this phase's exit criterion actually
+names, rather than an ever-growing list of test files in the coverage
+command. ``TestValidateCompletedWiredIntoCli`` no longer hand-configures
+``setup_logging`` with its own captured stream before invoking the CLI:
+now that ``setup_logging`` is wired into ``cli.py``'s own
+``@app.callback()`` (the Phase 3 fix for the gap both verification passes
+found -- the CLI never called it, so every ``log_event`` line was
+silently dropped), that callback re-runs on every ``CliRunner.invoke()``
+and would immediately clobber a hand-supplied stream with its own
+``sys.stderr``-pointed handler. The tests instead read ``result.stderr``
+off the ``CliRunner`` invocation, which is exactly what a real terminal
+invocation's structured-log stream looks like.
 """
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 from typing import Literal
 from zoneinfo import ZoneInfo
 
 import pytest
+from typer.testing import CliRunner
 
 from flightagent.airports.registry import UnknownAirportError
+from flightagent.cli import app
 from flightagent.domain.enums import CabinClass, RejectionCode
 from flightagent.domain.itinerary import Leg, NormalizedItinerary, RawOffer
 from flightagent.domain.money import Money
 from flightagent.domain.run import SearchRequest
 from flightagent.domain.segment import Layover, Segment
+from flightagent.domain.validation import Rejection, ValidationResult
 from flightagent.normalize.builder import build_normalized_itinerary
 from flightagent.normalize.timezones import zone_for
-from flightagent.validation.engine import validate
+from flightagent.validation.engine import summarize_validation_results, validate
 
 _FARE_AS_OF = datetime(2027, 7, 1, 12, 0, tzinfo=UTC)
 _DEFAULT_LAYOVER_MIN = timedelta(minutes=180)
@@ -1128,3 +1150,238 @@ class TestStopCountDerivedFromSegments:
         assert not result.is_valid
         codes = {rejection.code for rejection in result.rejections}
         assert codes == {RejectionCode.TOO_MANY_STOPS}
+
+
+def _rejection_for_counter_tests(code: RejectionCode, *, rule_id: str = "rule") -> Rejection:
+    return Rejection(
+        code=code,
+        message=f"{code.value} failed",
+        observed="observed",
+        expected="expected",
+        rule_id=rule_id,
+    )
+
+
+def _valid_result(itinerary_id: str) -> ValidationResult:
+    return ValidationResult(itinerary_id=itinerary_id, rejections=())
+
+
+def _invalid_result(itinerary_id: str, *codes: RejectionCode) -> ValidationResult:
+    return ValidationResult(
+        itinerary_id=itinerary_id,
+        rejections=tuple(_rejection_for_counter_tests(code) for code in codes),
+    )
+
+
+class TestSummarizeValidationResults:
+    """T19: ``validation.engine.summarize_validation_results`` -- the
+    rejection-counter aggregator behind ``EventName.VALIDATE_COMPLETED``'s
+    ``accepted_count``/``rejection_counts`` fields (master plan S7).
+    Exercises the aggregator directly against hand-built
+    ``ValidationResult``/``Rejection`` objects -- it only ever looks at
+    ``ValidationResult.is_valid`` and ``.rejections``, so no full
+    ``NormalizedItinerary``/provider/mock machinery is needed here.
+    """
+
+    def test_accepted_count_matches_exact_number_of_valid_results_in_a_mixed_batch(self) -> None:
+        results = [
+            _valid_result("v1"),
+            _invalid_result("r1", RejectionCode.TOO_MANY_STOPS),
+            _valid_result("v2"),
+            _invalid_result("r2", RejectionCode.LAYOVER_TOO_SHORT),
+            _valid_result("v3"),
+        ]
+
+        accepted_count, rejection_counts = summarize_validation_results(results)
+
+        assert accepted_count == 3
+        assert rejection_counts == {
+            RejectionCode.TOO_MANY_STOPS.value: 1,
+            RejectionCode.LAYOVER_TOO_SHORT.value: 1,
+        }
+
+    def test_rejection_counts_tallies_multiple_itineraries_failing_the_same_code(self) -> None:
+        """Two DIFFERENT itineraries both failing LAYOVER_TOO_LONG must
+        tally to 2 against that one counter, not 1 -- the aggregator must
+        not treat "this code already appeared" as done."""
+        results = [
+            _invalid_result("r1", RejectionCode.LAYOVER_TOO_LONG),
+            _invalid_result("r2", RejectionCode.LAYOVER_TOO_LONG),
+            _valid_result("v1"),
+        ]
+
+        accepted_count, rejection_counts = summarize_validation_results(results)
+
+        assert accepted_count == 1
+        assert rejection_counts == {RejectionCode.LAYOVER_TOO_LONG.value: 2}
+
+    def test_rejection_counts_tallies_different_codes_independently(self) -> None:
+        results = [
+            _invalid_result("r1", RejectionCode.ORIGIN_MISMATCH),
+            _invalid_result("r2", RejectionCode.DESTINATION_MISMATCH),
+            _invalid_result("r3", RejectionCode.DATE_MISMATCH),
+        ]
+
+        accepted_count, rejection_counts = summarize_validation_results(results)
+
+        assert accepted_count == 0
+        assert rejection_counts == {
+            RejectionCode.ORIGIN_MISMATCH.value: 1,
+            RejectionCode.DESTINATION_MISMATCH.value: 1,
+            RejectionCode.DATE_MISMATCH.value: 1,
+        }
+
+    def test_single_itinerary_with_multiple_simultaneous_rejections_increments_each_counter(
+        self,
+    ) -> None:
+        """One itinerary failing three rules at once (the engine's own
+        no-short-circuit contract -- ``TestEngineAccumulatesAllRejections``
+        above) must contribute one increment to EACH of the three
+        counters, proving this aggregator counts individual
+        ``Rejection``s, not "one rejection reason per itinerary". A second
+        itinerary shares exactly one of those three codes with the first,
+        plus a fourth of its own -- proving cross-itinerary tallying and
+        per-itinerary multi-rejection tallying both hold at the same time,
+        not just in isolation from each other.
+        """
+        multiply_rejected = _invalid_result(
+            "multi",
+            RejectionCode.TOO_MANY_STOPS,
+            RejectionCode.LAYOVER_TOO_SHORT,
+            RejectionCode.ORIGIN_MISMATCH,
+        )
+        also_rejected = _invalid_result(
+            "other",
+            RejectionCode.TOO_MANY_STOPS,
+            RejectionCode.CABIN_MISMATCH,
+        )
+
+        accepted_count, rejection_counts = summarize_validation_results(
+            [multiply_rejected, also_rejected]
+        )
+
+        assert accepted_count == 0
+        assert rejection_counts == {
+            RejectionCode.TOO_MANY_STOPS.value: 2,
+            RejectionCode.LAYOVER_TOO_SHORT.value: 1,
+            RejectionCode.ORIGIN_MISMATCH.value: 1,
+            RejectionCode.CABIN_MISMATCH.value: 1,
+        }
+        # And the multiply-rejected itinerary really did keep all three of
+        # its own rejections -- not collapsed down to one.
+        assert len(multiply_rejected.rejections) == 3
+        assert not multiply_rejected.is_valid
+
+    def test_empty_batch_returns_zero_accepted_and_empty_rejection_counts(self) -> None:
+        accepted_count, rejection_counts = summarize_validation_results([])
+
+        assert accepted_count == 0
+        assert rejection_counts == {}
+
+    def test_all_valid_batch_has_empty_rejection_counts(self) -> None:
+        accepted_count, rejection_counts = summarize_validation_results(
+            [_valid_result("v1"), _valid_result("v2")]
+        )
+
+        assert accepted_count == 2
+        assert rejection_counts == {}
+
+
+_CLI_RUNNER = CliRunner()
+
+_CLI_RUN_ARGS = [
+    "run",
+    "--origin",
+    "AMS",
+    "--dest",
+    "DEL",
+    "--date",
+    "2027-07-17",
+    "--max-stops",
+    "1",
+    "--provider",
+    "mock",
+]
+
+
+def _parse_json_log_lines(stream_text: str) -> list[dict[str, object]]:
+    """Parse every JSON-object line out of ``stream_text``, skipping any
+    plain-text lines interleaved with it -- e.g. the CLI's own
+    ``err=True`` rejection-breakdown message on the zero-valid path, which
+    lands on the same ``stderr`` stream as the structured JSON log lines
+    since the Phase 3 fix points ``setup_logging`` at ``sys.stderr``.
+    Skipping a non-JSON line can never hide a real bug here: every caller
+    still asserts an exact count of matching structured events afterward,
+    so a genuinely missing/malformed log line still fails loudly via that
+    count, it just fails with a clear "0 found" rather than a
+    ``JSONDecodeError`` on an unrelated line.
+    """
+    parsed: list[dict[str, object]] = []
+    for line in stream_text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            parsed.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return parsed
+
+
+class TestValidateCompletedWiredIntoCli:
+    """The end-to-end proof T19's task brief demands: a REAL ``flightagent
+    run`` invocation (via ``CliRunner``, the exact Phase 2 target command)
+    must emit a real ``validate.completed`` structured log line carrying
+    real ``accepted_count``/``rejection_counts`` values -- not just a unit
+    test of ``summarize_validation_results`` in isolation. This also now
+    exercises the Phase 3 fix (``setup_logging`` wired into ``cli.py``'s
+    own ``@app.callback()``): unlike before, nothing in this test manually
+    configures logging -- if the CLI ever stopped calling
+    ``setup_logging`` on its own, ``result.stderr`` would be empty and
+    every test below would fail.
+    """
+
+    def test_cli_run_emits_validate_completed_log_line_with_real_counts(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+
+        result = _CLI_RUNNER.invoke(app, _CLI_RUN_ARGS)
+
+        assert result.exit_code == 0, result.output
+
+        log_lines = _parse_json_log_lines(result.stderr)
+        validate_events = [
+            line for line in log_lines if line.get("event") == "validate.completed"
+        ]
+        assert len(validate_events) == 1, log_lines
+
+        (event,) = validate_events
+        assert isinstance(event["accepted_count"], int)
+        assert event["accepted_count"] >= 1  # the target invocation always validates >=1 offer
+        assert isinstance(event["rejection_counts"], dict)
+        # Every value in the rejection histogram is a real positive count,
+        # never a placeholder/zero entry the aggregator forgot to prune.
+        assert all(isinstance(v, int) and v > 0 for v in event["rejection_counts"].values())
+
+    def test_cli_zero_valid_itineraries_still_emits_validate_completed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """T19's wiring runs unconditionally -- even the zero-valid exit
+        path (which writes no report artifacts at all) must still have
+        logged the histogram, per the ``cli.py`` docstring's own claim.
+        """
+        monkeypatch.setattr(
+            "flightagent.providers.mock.provider.generate_offers", lambda request: ()
+        )
+        monkeypatch.chdir(tmp_path)
+
+        result = _CLI_RUNNER.invoke(app, _CLI_RUN_ARGS)
+
+        assert result.exit_code != 0
+        log_lines = _parse_json_log_lines(result.stderr)
+        validate_events = [
+            line for line in log_lines if line.get("event") == "validate.completed"
+        ]
+        assert len(validate_events) == 1
+        assert validate_events[0]["accepted_count"] == 0
+        assert validate_events[0]["rejection_counts"] == {}

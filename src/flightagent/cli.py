@@ -64,6 +64,7 @@ rejection breakdown is queryable from logs even on the zero-valid exit path.
 from __future__ import annotations
 
 import asyncio
+import sys
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from typing import Annotated
@@ -79,7 +80,7 @@ from flightagent.domain.validation import ValidationResult
 from flightagent.normalize.builder import build_normalized_itinerary
 from flightagent.normalize.dedup import deduplicate
 from flightagent.observability.events import EventName
-from flightagent.observability.logging import log_event
+from flightagent.observability.logging import log_event, setup_logging
 from flightagent.providers.base import CallBudget, FlightProvider
 from flightagent.providers.errors import ProviderNotConfigured
 from flightagent.providers.mock.generator import compute_seed
@@ -120,14 +121,28 @@ _DEFAULT_CURRENCY = "EUR"
 def _callback() -> None:
     """Autonomous flight-search agent (Nieuwegein-area -> India, Phase 2: mock provider only).
 
-    An explicit (empty) Typer callback -- with only one subcommand
-    registered (``run``), Typer would otherwise collapse this app so that
-    subcommand's name is optional (``flightagent --origin ...`` would work
-    without ``run``). Registering ANY callback forces Typer to keep
-    ``run`` as a required, named subcommand, matching the exact target
-    invocation shape (``flightagent run --origin ...``) this phase's exit
-    criterion specifies verbatim.
+    An explicit Typer callback -- with only one subcommand registered
+    (``run``), Typer would otherwise collapse this app so that subcommand's
+    name is optional (``flightagent --origin ...`` would work without
+    ``run``). Registering ANY callback forces Typer to keep ``run`` as a
+    required, named subcommand, matching the exact target invocation shape
+    (``flightagent run --origin ...``) this phase's exit criterion
+    specifies verbatim.
+
+    It also wires up structured logging (T19/Phase 3 gap fix): this
+    callback runs exactly once before any subcommand, so it is the natural
+    place to call ``setup_logging`` for the real CLI -- previously only
+    test code and ``scripts/logging_smoke.py`` ever called it, which meant
+    every ``log_event`` call in this module and in
+    ``normalize.dedup.deduplicate`` logged into a ``"flightagent"`` logger
+    with no attached handler and was silently dropped. Structured JSON
+    lines go to stderr, following ``scripts/logging_smoke.py``'s own
+    precedent of calling ``setup_logging`` with no destination override in
+    a context where stdout is otherwise free -- here stdout is NOT free
+    (the ``run`` command's own plain-text summary line goes there), so
+    stderr is the explicit destination, keeping the two streams separate.
     """
+    setup_logging(stream=sys.stderr)
 
 
 def _to_stop_mode(value: int) -> StopMode:
