@@ -53,12 +53,17 @@ while filtering (``ValidationResult.rejections``) is not discarded in that
 path; it is summarized (a rejection-code histogram) into the error message
 this command prints, so a human immediately sees *why* nothing validated
 instead of just *that* nothing did.
+
+T19: that same histogram (plus the accepted count) is also emitted as one
+``EventName.VALIDATE_COMPLETED`` structured log line right after the
+normalize+validate step, via ``validation.engine.summarize_validation_results``
+-- unconditionally, whether or not any itinerary ended up valid, so the
+rejection breakdown is queryable from logs even on the zero-valid exit path.
 """
 
 from __future__ import annotations
 
 import asyncio
-from collections import Counter
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from typing import Annotated
@@ -66,12 +71,15 @@ from typing import Annotated
 import typer
 
 from flightagent.config.loader import load_config
-from flightagent.domain.enums import CabinClass, RejectionCode, StopMode
+from flightagent.domain.enums import CabinClass, StopMode
 from flightagent.domain.itinerary import NormalizedItinerary, RawOffer
 from flightagent.domain.run import SearchRequest
 from flightagent.domain.scoring import ScoredItinerary
+from flightagent.domain.validation import ValidationResult
 from flightagent.normalize.builder import build_normalized_itinerary
 from flightagent.normalize.dedup import deduplicate
+from flightagent.observability.events import EventName
+from flightagent.observability.logging import log_event
 from flightagent.providers.base import CallBudget, FlightProvider
 from flightagent.providers.errors import ProviderNotConfigured
 from flightagent.providers.mock.generator import compute_seed
@@ -81,7 +89,7 @@ from flightagent.reporting.markdown import render_markdown_report
 from flightagent.reporting.writer import write_report_artifacts
 from flightagent.scoring.ranking import rank_itineraries
 from flightagent.scoring.score import score_itinerary
-from flightagent.validation.engine import validate
+from flightagent.validation.engine import summarize_validation_results, validate
 
 app = typer.Typer(
     name="flightagent",
@@ -213,15 +221,18 @@ def _normalize_and_validate(
     raw_offers: tuple[RawOffer, ...],
     *,
     as_of: datetime,
-) -> tuple[list[NormalizedItinerary], Counter[RejectionCode]]:
+) -> tuple[list[NormalizedItinerary], list[ValidationResult]]:
     """Run every ``RawOffer`` through T11 (normalize) then T12 (validate).
 
-    Returns ``(valid_itineraries, rejection_counts)`` -- the rejection
-    histogram is never discarded even when it ends up empty, so the
-    caller can always explain a zero-valid outcome.
+    Returns ``(valid_itineraries, validation_results)`` -- every
+    ``ValidationResult`` produced is kept, valid AND invalid alike, so the
+    caller can derive both the zero-valid error breakdown and the
+    ``EventName.VALIDATE_COMPLETED`` accepted_count/rejection_counts pair
+    (T19, ``validation.engine.summarize_validation_results``) from one
+    shared pass instead of validating the batch twice.
     """
     valid_itineraries: list[NormalizedItinerary] = []
-    rejection_counts: Counter[RejectionCode] = Counter()
+    validation_results: list[ValidationResult] = []
     for raw_offer in raw_offers:
         itinerary = build_normalized_itinerary(
             raw_offer,
@@ -230,11 +241,10 @@ def _normalize_and_validate(
             fare_as_of=as_of,
         )
         validation_result = validate(itinerary, request)
+        validation_results.append(validation_result)
         if validation_result.is_valid:
             valid_itineraries.append(itinerary)
-        else:
-            rejection_counts.update(rejection.code for rejection in validation_result.rejections)
-    return valid_itineraries, rejection_counts
+    return valid_itineraries, validation_results
 
 
 @app.command()
@@ -299,17 +309,21 @@ def run(
     search_result = asyncio.run(provider_instance.search(request, CallBudget()))
     total_offers = len(search_result.offers)
 
-    valid_itineraries, rejection_counts = _normalize_and_validate(
+    valid_itineraries, validation_results = _normalize_and_validate(
         request, search_result.offers, as_of=as_of
+    )
+
+    validate_accepted_count, rejection_counts = summarize_validation_results(validation_results)
+    log_event(
+        EventName.VALIDATE_COMPLETED,
+        accepted_count=validate_accepted_count,
+        rejection_counts=rejection_counts,
     )
 
     if not valid_itineraries:
         if rejection_counts:
             breakdown = ", ".join(
-                f"{code.value}={count}"
-                for code, count in sorted(
-                    rejection_counts.items(), key=lambda item: item[0].value
-                )
+                f"{code}={count}" for code, count in sorted(rejection_counts.items())
             )
         else:
             breakdown = "provider returned no offers"
