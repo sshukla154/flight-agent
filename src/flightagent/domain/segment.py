@@ -190,6 +190,15 @@ class Layover(BaseModel):
     only, never used in any arithmetic."""
     requires_airport_change: bool
     requires_terminal_change: bool
+    is_self_transfer: bool = False
+    """True when this connection is a self-transfer / separate-ticket
+    layover rather than one protected itinerary (D5). Defaults to
+    ``False`` so every Phase 1/2 ``Layover(...)`` call site (which predates
+    D5) keeps constructing an ordinary, protected connection unchanged.
+    Phase 3's ``check_self_transfer`` (validation/rules.py) rejects any
+    itinerary carrying a layover with this set, regardless of how
+    generous its duration looks (domain/segment.py, Layover.duration
+    alone cannot tell protected and self-transfer connections apart)."""
 
     @model_validator(mode="after")
     def _validate_consistency(self) -> Self:

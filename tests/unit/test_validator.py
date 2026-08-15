@@ -16,6 +16,15 @@ every boundary asserted here:
 
 Also proves the engine's core contract: it never short-circuits on the
 first failing rule (``TestEngineAccumulatesAllRejections``).
+
+T18 (Phase 3) extends this file, in place, with one confirming test per
+rule it added: ``TestDestinationMismatchRule`` (the missing counterpart
+to origin match), ``TestLocalTimeValidityRule`` (DST-ambiguous/nonexistent
+local times, using real confirmed 2027 EU DST transition instants),
+``TestSelfTransferRule`` (D5), and ``TestMissingTimezoneUnreachable``
+(the investigation conclusion that ``RejectionCode.MISSING_TIMEZONE`` has
+no reachable path at this layer, proven rather than assumed). The
+exhaustive boundary suite for all of these is T21's job, not this file's.
 """
 
 from __future__ import annotations
@@ -27,12 +36,14 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from flightagent.airports.registry import UnknownAirportError
 from flightagent.domain.enums import CabinClass, RejectionCode
 from flightagent.domain.itinerary import Leg, NormalizedItinerary, RawOffer
 from flightagent.domain.money import Money
 from flightagent.domain.run import SearchRequest
 from flightagent.domain.segment import Layover, Segment
 from flightagent.normalize.builder import build_normalized_itinerary
+from flightagent.normalize.timezones import zone_for
 from flightagent.validation.engine import validate
 
 _FARE_AS_OF = datetime(2027, 7, 1, 12, 0, tzinfo=UTC)
@@ -131,6 +142,100 @@ def _one_stop_leg(*, layover_minutes: int) -> Leg:
         requires_terminal_change=False,
     )
     return Leg(segments=(inbound, outbound), layovers=(layover,))
+
+
+def _one_stop_leg_with_self_transfer(*, layover_minutes: int = 240) -> Leg:
+    """Same shape as ``_one_stop_leg`` (AMS -> DXB -> DEL), but the DXB
+    layover is flagged ``is_self_transfer=True`` -- the D5 fixture
+    ``check_self_transfer`` exists to catch. ``layover_minutes`` defaults
+    inside the ordinary [180, 360] window on purpose, so a rejection here
+    can only be attributed to D5, never to ``check_layover_window``.
+    """
+    depart_utc = datetime(2027, 7, 17, 10, 0, tzinfo=UTC)
+    inbound_arrive = depart_utc + timedelta(hours=4)
+    outbound_depart = inbound_arrive + timedelta(minutes=layover_minutes)
+    outbound_arrive = outbound_depart + timedelta(hours=3)
+
+    inbound = _segment(
+        segment_id="ams-dxb",
+        origin="AMS",
+        destination="DXB",
+        depart_utc=depart_utc,
+        arrive_utc=inbound_arrive,
+        origin_tz="Europe/Amsterdam",
+        destination_tz="Asia/Dubai",
+    )
+    outbound = _segment(
+        segment_id="dxb-del",
+        origin="DXB",
+        destination="DEL",
+        depart_utc=outbound_depart,
+        arrive_utc=outbound_arrive,
+        origin_tz="Asia/Dubai",
+        destination_tz="Asia/Kolkata",
+    )
+    layover = Layover(
+        airport="DXB",
+        arrive_utc=inbound_arrive,
+        depart_utc=outbound_depart,
+        duration=outbound_depart - inbound_arrive,
+        local_window=(inbound.arrive_local, outbound.depart_local),
+        requires_airport_change=False,
+        requires_terminal_change=False,
+        is_self_transfer=True,
+    )
+    return Leg(segments=(inbound, outbound), layovers=(layover,))
+
+
+def _direct_leg_with_local_time(
+    *,
+    depart_naive_local: datetime,
+    depart_fold: int,
+    origin: str = "AMS",
+    origin_tz: str = "Europe/Amsterdam",
+    destination: str = "DEL",
+    destination_tz: str = "Asia/Kolkata",
+    duration: timedelta = timedelta(hours=8),
+) -> Leg:
+    """A direct leg whose DEPARTURE local time is deliberately an
+    ambiguous (DST fall-back) or nonexistent (DST spring-forward) wall
+    clock reading, per an explicit ``(depart_naive_local, depart_fold)``
+    pair -- ``check_local_time_validity`` exists to catch this.
+
+    Unlike ``_segment``, this does NOT derive ``depart_local`` via
+    ``depart_utc.astimezone(zone)`` -- that always produces a "normal"
+    reading (it is, by construction, the ONE actual instant in time), so
+    it can never exercise this rule. Instead ``depart_local`` is built
+    directly from the naive local reading plus an explicit fold, exactly
+    as ``Segment._resolve_utc`` (domain/segment.py) does internally, and
+    ``depart_utc`` is derived FROM that (not the other way around) so the
+    two stay mutually consistent per ``Segment``'s own construction-time
+    invariant. ``arrive_local`` is computed the ordinary
+    (always-"normal") way, so exactly one field is the one under test.
+    """
+    origin_zone = ZoneInfo(origin_tz)
+    destination_zone = ZoneInfo(destination_tz)
+    depart_local = depart_naive_local.replace(tzinfo=origin_zone, fold=depart_fold)
+    depart_utc = depart_local.astimezone(UTC)
+    arrive_utc = depart_utc + duration
+    arrive_local = arrive_utc.astimezone(destination_zone)
+    segment = Segment(
+        segment_id="direct",
+        origin=origin,
+        destination=destination,
+        depart_utc=depart_utc,
+        arrive_utc=arrive_utc,
+        depart_local=depart_local,
+        arrive_local=arrive_local,
+        origin_tz=origin_tz,
+        destination_tz=destination_tz,
+        marketing_carrier="EK",
+        flight_number="1",
+        cabin=CabinClass.ECONOMY,
+        duration=duration,
+        depart_fold=depart_fold,
+    )
+    return Leg(segments=(segment,), layovers=())
 
 
 def _itinerary_from_leg(leg: Leg, *, provider_offer_id: str = "offer-1") -> NormalizedItinerary:
@@ -339,3 +444,187 @@ class TestEngineAccumulatesAllRejections:
         # Exactly one rejection per failing rule -- if the engine had
         # stopped after the first hit (stop count), this would be 1, not 3.
         assert len(result.rejections) == 3
+
+
+class TestDestinationMismatchRule:
+    """T18 gap 1: ``check_destination_match`` is ``check_origin_match``'s
+    missing counterpart -- only the departure end was checked before."""
+
+    def test_destination_mismatch_is_rejected(self) -> None:
+        depart_utc = datetime(2027, 7, 17, 10, 0, tzinfo=UTC)
+        itinerary = _itinerary_from_leg(
+            _direct_leg(origin="AMS", destination="DEL", depart_utc=depart_utc)
+        )
+        request = _request(destination="BOM", max_stops=1)
+
+        result = validate(itinerary, request)
+
+        assert not result.is_valid
+        codes = {rejection.code for rejection in result.rejections}
+        assert codes == {RejectionCode.DESTINATION_MISMATCH}
+        (rejection,) = result.rejections
+        assert rejection.observed == "DEL"
+        assert rejection.expected == "BOM"
+
+    def test_destination_match_is_accepted(self) -> None:
+        depart_utc = datetime(2027, 7, 17, 10, 0, tzinfo=UTC)
+        itinerary = _itinerary_from_leg(
+            _direct_leg(origin="AMS", destination="DEL", depart_utc=depart_utc)
+        )
+        request = _request(destination="DEL", max_stops=1)
+
+        result = validate(itinerary, request)
+
+        assert result.is_valid
+        assert result.rejections == ()
+
+
+class TestSelfTransferRule:
+    """T18 gap 3 (D5): self-transfer / separate-ticket itineraries are
+    EXCLUDED from the valid ranked set, regardless of how generous the
+    layover looks -- a 3h layover on separate tickets is not a real 3h
+    layover."""
+
+    def test_self_transfer_layover_is_rejected_even_within_layover_window(self) -> None:
+        # 240 minutes sits comfortably inside the default [180, 360]
+        # window -- the ONLY reason this itinerary can be rejected is D5,
+        # never LAYOVER_TOO_SHORT/LAYOVER_TOO_LONG.
+        itinerary = _itinerary_from_leg(_one_stop_leg_with_self_transfer(layover_minutes=240))
+        request = _request(max_stops=1)
+
+        result = validate(itinerary, request)
+
+        assert not result.is_valid
+        codes = {rejection.code for rejection in result.rejections}
+        assert codes == {RejectionCode.SELF_TRANSFER}
+
+    def test_layover_defaults_to_not_self_transfer(self) -> None:
+        """The default MUST be ``False`` -- every Phase 1/2 ``Layover(...)``
+        call site predates D5 and constructs without this field at all;
+        if the default were ever anything but ``False`` every one of
+        those 206 existing tests would start failing this new rule."""
+        itinerary = _itinerary_from_leg(_one_stop_leg(layover_minutes=240))
+        request = _request(max_stops=1)
+
+        result = validate(itinerary, request)
+
+        assert result.is_valid
+        assert result.rejections == ()
+
+
+class TestLocalTimeValidityRule:
+    """T18 gap 2: ``Segment.ambiguous_local_time`` was computed but never
+    acted on. ``check_local_time_validity`` reuses ``classify_local_time``
+    (domain/segment.py) to pick between ``AMBIGUOUS_LOCAL_TIME`` (DST
+    fall-back, the reading occurs twice) and ``NONEXISTENT_LOCAL_TIME``
+    (DST spring-forward, the reading never occurs) -- both real,
+    confirmed 2027 EU DST transitions (Europe/Amsterdam), not
+    hypothetical dates.
+    """
+
+    def test_ambiguous_local_time_is_rejected(self) -> None:
+        # 2027-10-31 02:30 Europe/Amsterdam: EU DST ends (fall back from
+        # CEST to CET), so this wall-clock reading occurs twice. fold=0
+        # picks the first (CEST) occurrence.
+        leg = _direct_leg_with_local_time(
+            depart_naive_local=datetime(2027, 10, 31, 2, 30),
+            depart_fold=0,
+        )
+        itinerary = _itinerary_from_leg(leg)
+        request = _request(departure_date=date(2027, 10, 31), max_stops=1)
+
+        result = validate(itinerary, request)
+
+        assert not result.is_valid
+        codes = {rejection.code for rejection in result.rejections}
+        assert codes == {RejectionCode.AMBIGUOUS_LOCAL_TIME}
+        (rejection,) = result.rejections
+        assert rejection.observed == "ambiguous"
+        assert rejection.expected == "normal"
+
+    def test_nonexistent_local_time_is_rejected(self) -> None:
+        # 2027-03-28 02:30 Europe/Amsterdam: EU DST starts (spring forward
+        # from CET to CEST, clocks jump 02:00 -> 03:00), so this
+        # wall-clock reading never occurs at all.
+        leg = _direct_leg_with_local_time(
+            depart_naive_local=datetime(2027, 3, 28, 2, 30),
+            depart_fold=0,
+        )
+        itinerary = _itinerary_from_leg(leg)
+        request = _request(departure_date=date(2027, 3, 28), max_stops=1)
+
+        result = validate(itinerary, request)
+
+        assert not result.is_valid
+        codes = {rejection.code for rejection in result.rejections}
+        assert codes == {RejectionCode.NONEXISTENT_LOCAL_TIME}
+        (rejection,) = result.rejections
+        assert rejection.observed == "imaginary"
+        assert rejection.expected == "normal"
+
+    def test_normal_local_time_is_accepted(self) -> None:
+        """A depart_utc converted the ordinary way (``.astimezone(zone)``)
+        always lands on a genuine, single-occurrence instant -- this is
+        the every-day case the rule must NOT flag."""
+        depart_utc = datetime(2027, 7, 17, 10, 0, tzinfo=UTC)
+        itinerary = _itinerary_from_leg(_direct_leg(depart_utc=depart_utc))
+        request = _request(max_stops=1)
+
+        result = validate(itinerary, request)
+
+        assert result.is_valid
+        assert result.rejections == ()
+
+
+class TestMissingTimezoneUnreachable:
+    """Investigation conclusion (T18 gap 4): ``RejectionCode.MISSING_TIMEZONE``
+    is NOT reachable at the validator layer, so no rule was written to
+    produce it. Two independent, already-existing upstream guarantees
+    close this off before an itinerary can ever reach ``validate()``:
+
+    1. ``Segment.origin_tz``/``destination_tz`` are required, non-optional
+       ``str`` fields (domain/segment.py) -- there is no way to construct
+       a ``Segment`` that OMITS them, so "missing" in the sense of
+       "absent" cannot occur at all; pydantic itself refuses construction.
+    2. Even a syntactically-present but WRONG zone key cannot survive
+       construction either: ``Segment._validate_consistency`` calls
+       ``_resolve_zone`` unconditionally on both zone strings, which
+       raises ``ValueError`` for anything ``zoneinfo`` cannot resolve --
+       so a ``Segment`` with a bad zone key never exists as a value the
+       validator could inspect in the first place
+       (``test_segment_construction_rejects_unresolvable_zone_key`` below).
+
+    And one level upstream of THAT: ``flightagent.normalize.timezones.zone_for``
+    -- the module any future provider mapper is documented to resolve a
+    zone through -- raises ``UnknownAirportError`` for an unrecognised
+    IATA code before a zone key is even produced, per its own
+    ``registry.get`` (``test_zone_for_raises_on_unknown_iata`` below). No
+    validator rule was invented just to exercise the otherwise-dead
+    ``MISSING_TIMEZONE`` enum member -- these two tests verify the
+    conclusion instead of merely asserting it.
+    """
+
+    def test_zone_for_raises_on_unknown_iata(self) -> None:
+        with pytest.raises(UnknownAirportError):
+            zone_for("ZZZ")
+
+    def test_segment_construction_rejects_unresolvable_zone_key(self) -> None:
+        depart_utc = datetime(2027, 7, 17, 10, 0, tzinfo=UTC)
+        arrive_utc = depart_utc + timedelta(hours=8)
+
+        with pytest.raises(ValueError, match="unknown IANA zone"):
+            Segment(
+                segment_id="bad-zone",
+                origin="AMS",
+                destination="DEL",
+                depart_utc=depart_utc,
+                arrive_utc=arrive_utc,
+                depart_local=depart_utc.astimezone(ZoneInfo("UTC")),
+                arrive_local=arrive_utc.astimezone(ZoneInfo("UTC")),
+                origin_tz="Not/AZone",
+                destination_tz="Asia/Kolkata",
+                marketing_carrier="EK",
+                flight_number="1",
+                cabin=CabinClass.ECONOMY,
+                duration=arrive_utc - depart_utc,
+            )

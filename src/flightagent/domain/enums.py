@@ -54,18 +54,30 @@ class RejectionCode(StrEnum):
     specified cannot represent a DST fall-back (ambiguous) or
     spring-forward (nonexistent) local wall-clock reading, and this is not
     a rare edge case at 10 European origins.
+
+    DESTINATION_MISMATCH (Phase 3, T18) is ORIGIN_MISMATCH's missing
+    counterpart: the same "is this the airport the traveller actually
+    asked for" check, applied to the arrival end instead of the departure
+    end.
+
+    SELF_TRANSFER (Phase 3, T18, D5) marks a self-transfer /
+    separate-ticket connection: D5 excludes these from the valid ranked
+    set entirely, because nothing protects the traveller if the first
+    ticket runs late, however generous the layover looks on paper.
     """
 
     TOO_MANY_STOPS = "too_many_stops"
     LAYOVER_TOO_SHORT = "layover_too_short"
     LAYOVER_TOO_LONG = "layover_too_long"
     ORIGIN_MISMATCH = "origin_mismatch"
+    DESTINATION_MISMATCH = "destination_mismatch"
     DATE_MISMATCH = "date_mismatch"
     CABIN_MISMATCH = "cabin_mismatch"
     GROUND_TRAVEL_EXCEEDED = "ground_travel_exceeded"
     MISSING_TIMEZONE = "missing_timezone"
     AMBIGUOUS_LOCAL_TIME = "ambiguous_local_time"
     NONEXISTENT_LOCAL_TIME = "nonexistent_local_time"
+    SELF_TRANSFER = "self_transfer"
     INVARIANT_VIOLATION = "invariant_violation"
 
 
