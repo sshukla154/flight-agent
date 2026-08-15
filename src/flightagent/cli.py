@@ -3,8 +3,17 @@
 This is the literal Phase 2 exit criterion: a single ``flightagent run``
 invocation that builds a ``SearchRequest`` from CLI flags, calls
 ``MockProvider.search()`` (T10), normalizes every returned ``RawOffer``
-(T11), validates each ``NormalizedItinerary`` (T12), scores the valid ones
+(T11), validates each ``NormalizedItinerary`` (T12), deduplicates the valid
+ones by itinerary shape key (T20, finding 0.2), scores the survivors
 (T13), ranks them (T14), and writes both v1 report artifacts (T15).
+
+Master plan S1.4's canonical loop order is "validate -> dedup -> score ->
+rank" -- T20 inserts the dedup step here, between the existing validate and
+score steps, operating only on the itineraries that already passed
+validation. Deduping before scoring means a scored/ranked itinerary's
+``duplicate_count``/``also_offered_by``/``fare_options`` are already final
+by the time scoring sees it, and a codeshare quartet is never scored (and
+never occupies four ranked-list slots) as four separate entries.
 
 **Determinism, not wall-clock, for every timestamp this command emits.**
 ``normalize.builder.build_normalized_itinerary`` requires a caller-supplied
@@ -62,6 +71,7 @@ from flightagent.domain.itinerary import NormalizedItinerary, RawOffer
 from flightagent.domain.run import SearchRequest
 from flightagent.domain.scoring import ScoredItinerary
 from flightagent.normalize.builder import build_normalized_itinerary
+from flightagent.normalize.dedup import deduplicate
 from flightagent.providers.base import CallBudget, FlightProvider
 from flightagent.providers.errors import ProviderNotConfigured
 from flightagent.providers.mock.generator import compute_seed
@@ -252,15 +262,17 @@ def run(
         typer.Option("--provider", help="Provider to search. Only 'mock' works in Phase 2."),
     ] = "mock",
 ) -> None:
-    """Search, validate, score, rank, and report one origin/destination pair.
+    """Search, validate, dedup, score, rank, and report one origin/destination pair.
 
     Pipeline (in order): build a ``SearchRequest`` -> ``MockProvider.search()``
     (T10) -> normalize every offer (T11) -> validate every itinerary,
-    keeping only the valid ones (T12) -> score (T13) -> rank (T14) -> write
-    both artifacts (T15). Exits ``0`` only if at least one itinerary
-    validated and both artifacts were written; exits
-    ``NO_VALID_ITINERARIES_EXIT_CODE`` if zero itineraries validated,
-    writing nothing to ``out/``.
+    keeping only the valid ones (T12) -> deduplicate by itinerary shape key
+    (T20) -> score (T13) -> rank (T14) -> write both artifacts (T15). Exits
+    ``0`` only if at least one itinerary validated and both artifacts were
+    written; exits ``NO_VALID_ITINERARIES_EXIT_CODE`` if zero itineraries
+    validated, writing nothing to ``out/``. Dedup runs on the
+    already-valid set and can only ever reduce or preserve its size, never
+    turn a zero-valid outcome into a non-zero one or vice versa.
     """
     # Resolve the provider FIRST -- a bad --provider value must fail before
     # any config is loaded or any (deterministic, harmless) mock work runs.
@@ -309,6 +321,8 @@ def run(
         )
         raise typer.Exit(code=NO_VALID_ITINERARIES_EXIT_CODE)
 
+    deduplicated_itineraries = deduplicate(valid_itineraries)
+
     scored_itineraries = [
         ScoredItinerary(
             itinerary=itinerary,
@@ -319,7 +333,7 @@ def run(
             rank_by_total_journey_score=1,
             rank_by_price=1,
         )
-        for itinerary in valid_itineraries
+        for itinerary in deduplicated_itineraries
     ]
 
     ranked = rank_itineraries(scored_itineraries, top_n=settings.output.top_n_global)
