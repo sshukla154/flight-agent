@@ -30,9 +30,10 @@ from zoneinfo import ZoneInfo
 import jsonschema
 import pytest
 
-from flightagent.domain.enums import CabinClass
+from flightagent.domain.enums import CabinClass, TaskState
 from flightagent.domain.itinerary import Leg, NormalizedItinerary
 from flightagent.domain.money import Money
+from flightagent.domain.run import TaskOutcome
 from flightagent.domain.scoring import ScoreComponents, ScoredItinerary
 from flightagent.domain.segment import Layover, Segment
 from flightagent.reporting.booking_link import BookingUrlRejected, validate_booking_url
@@ -217,6 +218,50 @@ def _ranked_pair() -> list[ScoredItinerary]:
         layover_penalty=Decimal("0"),
     )
     return [top, second]
+
+
+def _task_outcome(
+    *,
+    task_id: str,
+    state: TaskState,
+    error_type: str | None = None,
+    error_detail: str | None = None,
+    offer_count: int = 0,
+    accepted_count: int = 0,
+) -> TaskOutcome:
+    return TaskOutcome(
+        task_id=task_id,
+        state=state,
+        attempts=1,
+        duration_ms=100,
+        offer_count=offer_count,
+        accepted_count=accepted_count,
+        cache="miss",
+        error_type=error_type,
+        error_detail=error_detail,
+    )
+
+
+def _ok_outcome(task_id: str = "AMS-DEL-s1") -> TaskOutcome:
+    return _task_outcome(task_id=task_id, state=TaskState.OK, offer_count=2, accepted_count=2)
+
+
+def _provider_error_outcome(task_id: str = "AMS-BOM-s1") -> TaskOutcome:
+    return _task_outcome(
+        task_id=task_id,
+        state=TaskState.PROVIDER_ERROR,
+        error_type="circuit_open",
+        error_detail="Provider returned 503 for 10 consecutive attempts.",
+    )
+
+
+def _rate_limited_outcome(task_id: str = "AMS-BLR-s1") -> TaskOutcome:
+    return _task_outcome(
+        task_id=task_id,
+        state=TaskState.RATE_LIMITED,
+        error_type="rate_limited",
+        error_detail="Retry-After exceeded the per-task retry budget.",
+    )
 
 
 class TestSyntheticDataBanner:
@@ -513,6 +558,160 @@ class TestJsonArtifactContent:
         # Preserved (JSON is not a clickable rendering surface) but flagged.
         assert entry["booking_url"] == _INSECURE_BOOKING_URL
         assert entry["booking_url_valid"] is False
+
+
+class TestFailedSearchesMarkdown:
+    """Phase 4, T26: the "## Failed Searches" section."""
+
+    def test_mixed_success_and_failure_renders_section_with_right_fields(self) -> None:
+        rendered = render_markdown_report(
+            _ranked_pair(),
+            departure_date=_DEPARTURE_DATE,
+            accepted_count=2,
+            generated_at=_GENERATED_AT,
+            task_outcomes=[
+                _ok_outcome(),
+                _provider_error_outcome(),
+                _rate_limited_outcome(),
+            ],
+        )
+
+        assert "## Failed Searches" in rendered
+        section = rendered[rendered.index("## Failed Searches") :]
+
+        assert "| BOM | circuit_open | Provider returned 503 for 10 consecutive attempts. |" in (
+            section
+        )
+        assert (
+            "| BLR | rate_limited | Retry-After exceeded the per-task retry budget. |" in section
+        )
+        # The OK outcome's destination must never appear as a failure row.
+        assert "| DEL |" not in section
+
+    def test_nothing_failed_renders_no_failed_searches_heading_at_all(self) -> None:
+        rendered = render_markdown_report(
+            _ranked_pair(),
+            departure_date=_DEPARTURE_DATE,
+            accepted_count=2,
+            generated_at=_GENERATED_AT,
+            task_outcomes=[_ok_outcome()],
+        )
+
+        assert "## Failed Searches" not in rendered
+        assert "Failed Searches" not in rendered
+
+    def test_default_task_outcomes_also_renders_no_failed_searches_heading(self) -> None:
+        # No task_outcomes argument at all -- the pre-Phase-4 call shape.
+        rendered = render_markdown_report(
+            _ranked_pair(),
+            departure_date=_DEPARTURE_DATE,
+            accepted_count=2,
+            generated_at=_GENERATED_AT,
+        )
+
+        assert "## Failed Searches" not in rendered
+
+    def test_failed_searches_section_appears_after_other_good_options(self) -> None:
+        rendered = render_markdown_report(
+            _ranked_pair(),
+            departure_date=_DEPARTURE_DATE,
+            accepted_count=2,
+            generated_at=_GENERATED_AT,
+            task_outcomes=[_provider_error_outcome()],
+        )
+
+        other_options_index = rendered.index("## Other Good Options")
+        failed_index = rendered.index("## Failed Searches")
+        summary_index = rendered.index("**Summary:**")
+
+        assert other_options_index < failed_index < summary_index
+
+
+class TestFailedSearchesJson:
+    """Phase 4, T26: the top-level ``failed_searches`` array."""
+
+    def test_mixed_success_and_failure_produces_exactly_the_error_state_entries(self) -> None:
+        doc = build_results_document(
+            _ranked_pair(),
+            departure_date=_DEPARTURE_DATE,
+            accepted_count=2,
+            top_n=10,
+            generated_at=_GENERATED_AT,
+            task_outcomes=[
+                _ok_outcome(),
+                _provider_error_outcome(),
+                _rate_limited_outcome(),
+            ],
+        )
+
+        failed = doc["failed_searches"]
+        assert len(failed) == 2  # not more, not fewer than the 2 error-state outcomes
+
+        by_destination = {entry["destination"]: entry for entry in failed}
+        assert set(by_destination) == {"BOM", "BLR"}
+
+        assert by_destination["BOM"]["error_type"] == "circuit_open"
+        assert by_destination["BOM"]["error_detail"] == (
+            "Provider returned 503 for 10 consecutive attempts."
+        )
+        assert by_destination["BLR"]["error_type"] == "rate_limited"
+        assert by_destination["BLR"]["error_detail"] == (
+            "Retry-After exceeded the per-task retry budget."
+        )
+
+    def test_nothing_failed_yields_present_but_empty_array(self) -> None:
+        doc = build_results_document(
+            _ranked_pair(),
+            departure_date=_DEPARTURE_DATE,
+            accepted_count=2,
+            top_n=10,
+            generated_at=_GENERATED_AT,
+            task_outcomes=[_ok_outcome()],
+        )
+
+        assert doc["failed_searches"] == []
+
+    def test_default_task_outcomes_also_yields_present_but_empty_array(self) -> None:
+        doc = build_results_document(
+            _ranked_pair(),
+            departure_date=_DEPARTURE_DATE,
+            accepted_count=2,
+            top_n=10,
+            generated_at=_GENERATED_AT,
+        )
+
+        assert "failed_searches" in doc
+        assert doc["failed_searches"] == []
+
+    def test_non_error_terminal_states_never_appear_as_failures(self) -> None:
+        # NO_OFFERS and ALL_REJECTED are legitimate empty results, not
+        # failures (master plan 0.5) -- neither belongs in failed_searches.
+        no_offers = _task_outcome(task_id="AMS-MST-s1", state=TaskState.NO_OFFERS)
+        all_rejected = _task_outcome(task_id="AMS-GRQ-s1", state=TaskState.ALL_REJECTED)
+
+        doc = build_results_document(
+            _ranked_pair(),
+            departure_date=_DEPARTURE_DATE,
+            accepted_count=2,
+            top_n=10,
+            generated_at=_GENERATED_AT,
+            task_outcomes=[no_offers, all_rejected, _provider_error_outcome()],
+        )
+
+        assert len(doc["failed_searches"]) == 1
+        assert doc["failed_searches"][0]["destination"] == "BOM"
+
+    def test_document_with_failed_searches_still_validates_against_schema(self) -> None:
+        doc = build_results_document(
+            _ranked_pair(),
+            departure_date=_DEPARTURE_DATE,
+            accepted_count=2,
+            top_n=10,
+            generated_at=_GENERATED_AT,
+            task_outcomes=[_ok_outcome(), _provider_error_outcome()],
+        )
+        schema = json.loads(_SCHEMA_PATH.read_text(encoding="utf-8"))
+        jsonschema.validate(instance=doc, schema=schema)
 
 
 class TestAtomicWriter:

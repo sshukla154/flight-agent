@@ -9,13 +9,18 @@ in this task's brief -- not an invented format:
   Route | Layover | Price.
 
 Scope note (v1, per this task's brief): the "Direct Flight Analysis"
-section (Phase 5, T33), the "Origin Comparison" table (Phase 6, T41), and
-the "Failed Searches" section (Phase 4, T26/T27) are deliberately NOT
-built here -- their underlying data (the direct-vs-stop policy,
-multi-origin fan-out, partial-failure handling) doesn't exist until those
-phases. ``render_markdown_report`` therefore requires at least one ranked
-itinerary; the empty/no-results report path (finding 0.5's NO_RESULTS/
-FAILED ``RunStatus`` values) is Phase 4 scope.
+section (Phase 5, T33) and the "Origin Comparison" table (Phase 6, T41)
+are deliberately NOT built here -- their underlying data (the
+direct-vs-stop policy, multi-origin fan-out) doesn't exist until those
+phases. ``render_markdown_report`` therefore still requires at least one
+ranked itinerary; the empty/no-results report path (finding 0.5's
+NO_RESULTS/FAILED ``RunStatus`` values) remains out of this function's
+scope.
+
+Phase 4 (T26) adds the "Failed Searches" section: rendered only when at
+least one ``TaskOutcome`` in the run's ledger is in an error state
+(PROVIDER_ERROR / RATE_LIMITED / TIMEOUT, ``domain.run``'s
+``_ERROR_STATES``) -- never an empty heading when every task succeeded.
 
 Assembly is plain f-string/helper functions, not a templating engine --
 the report is small enough (one block, one table, one summary line) that
@@ -35,6 +40,7 @@ from collections.abc import Sequence
 from datetime import date, datetime
 
 from flightagent.domain.itinerary import NormalizedItinerary
+from flightagent.domain.run import TaskOutcome
 from flightagent.domain.scoring import ScoredItinerary
 from flightagent.reporting.booking_link import (
     BookingUrlRejected,
@@ -44,6 +50,8 @@ from flightagent.reporting.booking_link import (
 )
 from flightagent.reporting.view import (
     airline_string,
+    destination_from_task_id,
+    failed_task_outcomes,
     first_segment,
     format_layover,
     format_price_eur,
@@ -127,6 +135,36 @@ def _other_good_options_table(items: Sequence[ScoredItinerary]) -> str:
     return "\n".join(lines)
 
 
+def _escape_table_cell(text: str) -> str:
+    """Neutralize characters that would otherwise corrupt a Markdown table
+    row -- a literal ``|`` splits into a phantom extra column, and an
+    embedded newline breaks the row onto multiple lines. ``error_detail``
+    is free-form text from a provider error message (S1), not a value this
+    codebase controls the shape of, so this is not a hypothetical input.
+    """
+    return text.replace("|", "\\|").replace("\n", " ")
+
+
+def _failed_searches_table(failed: Sequence[TaskOutcome]) -> str:
+    lines = [
+        "## Failed Searches",
+        "",
+        "| Destination | Error Type | Detail |",
+        "|---|---|---|",
+    ]
+    for outcome in failed:
+        destination = destination_from_task_id(outcome.task_id)
+        error_type = outcome.error_type if outcome.error_type is not None else "unknown"
+        error_detail = (
+            outcome.error_detail if outcome.error_detail is not None else "(no detail)"
+        )
+        lines.append(
+            f"| {_escape_table_cell(destination)} | {_escape_table_cell(error_type)} | "
+            f"{_escape_table_cell(error_detail)} |"
+        )
+    return "\n".join(lines)
+
+
 def render_markdown_report(
     ranked: Sequence[ScoredItinerary],
     *,
@@ -134,6 +172,7 @@ def render_markdown_report(
     accepted_count: int,
     generated_at: datetime,
     data_source: DataSource = "mock",
+    task_outcomes: Sequence[TaskOutcome] = (),
 ) -> str:
     """Render the full v1 Markdown report.
 
@@ -144,6 +183,15 @@ def render_markdown_report(
     full valid-itinerary count *before* truncation, passed in separately
     per D15 ("truncation... applies to presentation only") -- this
     function never infers it from ``len(ranked)``.
+
+    ``task_outcomes`` is the run's full task ledger (T26, Phase 4) --
+    every ``TaskOutcome``, successful or not. This function filters it down
+    to the error-state subset itself (``reporting.view.failed_task_outcomes``)
+    and renders a "## Failed Searches" section listing each one's
+    destination, error type, and detail -- but only when that subset is
+    non-empty. Passing nothing (the default) renders no such section at
+    all, matching the ``ranked``-only call sites this function already had
+    before Phase 4.
 
     Raises ``ValueError`` if ``ranked`` is empty: the empty/no-results
     report path is Phase 4 scope, not this task's (see module docstring).
@@ -156,6 +204,7 @@ def render_markdown_report(
         )
 
     top, others = ranked[0], ranked[1:]
+    failed = failed_task_outcomes(task_outcomes)
 
     sections = [
         SYNTHETIC_DATA_BANNER,
@@ -170,6 +219,10 @@ def render_markdown_report(
     ]
     if others:
         sections.append(_other_good_options_table(others))
+        sections.append("")
+
+    if failed:
+        sections.append(_failed_searches_table(failed))
         sections.append("")
 
     sections.append(
