@@ -13,13 +13,13 @@
 | `CONFIRMED` | The project owner has explicitly signed this off. |
 | `DEFAULT (unconfirmed)` | A recommended default that work proceeds on so implementation is not blocked. The owner has **not** signed it off. It can change. |
 
-As of 2026-08-14 exactly three decisions are `CONFIRMED`: **D16, D17, D18**. Every other decision in this register, D1 through D15, is `DEFAULT (unconfirmed)`. That distinction is the whole point of the register — do not quietly promote a default to a confirmation because code now depends on it.
+As of 2026-08-14 exactly three decisions are `CONFIRMED`: **D16, D17, D18**. Every other decision in this register — D1 through D15, and D19 (added 2026-08-16, scoping Phase 4) — is `DEFAULT (unconfirmed)`. That distinction is the whole point of the register — do not quietly promote a default to a confirmation because code now depends on it.
 
 ---
 
 ## Table of contents
 
-- [Decisions D1–D18](#decisions-d1d18)
+- [Decisions D1–D19](#decisions-d1d19)
   - [D1 — Multi-origin request schema](#d1--multi-origin-request-schema)
   - [D2 — One-way or return](#d2--one-way-or-return)
   - [D3 — Passenger count](#d3--passenger-count)
@@ -38,6 +38,7 @@ As of 2026-08-14 exactly three decisions are `CONFIRMED`: **D16, D17, D18**. Eve
   - [D16 — User-facing sort / filter](#d16--user-facing-sort--filter)
   - [D17 — Fare matrix visual: surface](#d17--fare-matrix-visual-surface)
   - [D18 — Fare matrix visual: colour scale](#d18--fare-matrix-visual-colour-scale)
+  - [D19 — dominant_rejection_code: how a NO_RESULTS run says why](#d19--dominant_rejection_code-how-a-no_results-run-says-why)
 - [Confirm before Phase 5](#confirm-before-phase-5)
 - [Restated acceptance criteria](#restated-acceptance-criteria)
 - [Open questions carried into every report](#open-questions-carried-into-every-report)
@@ -45,9 +46,9 @@ As of 2026-08-14 exactly three decisions are `CONFIRMED`: **D16, D17, D18**. Eve
 
 ---
 
-## Decisions D1–D18
+## Decisions D1–D19
 
-Blast radius entries are task IDs from the full DAG (`agent-outputs/02-execution-plan-pass.md` §2) and are reproduced from the master plan's §2 table unchanged.
+Blast radius entries are task IDs from the full DAG (`agent-outputs/02-execution-plan-pass.md` §2) and are reproduced from the master plan's §2 table unchanged. D19 is not in that original DAG — it was found scoping Phase 4's actual code, not planned in advance, so its blast radius is stated directly against real Phase 4 task names instead.
 
 ---
 
@@ -351,6 +352,20 @@ Two template constraints that look cosmetic in review and are not: **never drop 
 **Blast radius.** matrix template, golden file.
 
 **Reversal cost.** **Cheap.** Template-local, one golden file.
+
+---
+
+### D19 — `dominant_rejection_code`: how a NO_RESULTS run says why
+
+**Decision.** Compute `dominant_rejection_code` as a value derived at the CLI/reporting layer from a batch of `TaskOutcome.rejection_counts` (the single most frequent `RejectionCode` across all tasks in the run), **not** as a stored field on `RunEnvelope` itself. `RunEnvelope`'s own `RunStatus` validator (COMPLETE/PARTIAL/NO_RESULTS/FAILED) needs only the task ledger's terminal states to be internally consistent — it does not need to know *why* NO_RESULTS happened to validate that the status is correct. The spec's exact hardcoded string, `"No itinerary satisfied the 3–6 hour layover rule."`, is used **only** when the run status is `NO_RESULTS` **and** the dominant code is `LAYOVER_TOO_SHORT` or `LAYOVER_TOO_LONG`; any other dominant code (or `FAILED`, where there is no valid dominant rejection at all — every task errored, not merely every itinerary failed a rule) gets an accurate message naming the real cause instead.
+
+**Status.** `DEFAULT (unconfirmed)` — found scoping Phase 4, not yet reviewed by the project owner.
+
+**Rationale.** Finding 0.5's whole point is that the spec's single hardcoded `no_results` string conflates "nothing matched the layover rule" with "the provider was down" — two situations calling for opposite user reactions (loosen a preference vs. just retry). A `RunEnvelope` field would force every constructor of an envelope to compute this even when the status is COMPLETE or PARTIAL, where it is meaningless; keeping it a derived, on-demand value at the point where the message is actually written avoids a field that is `None` or unused on 3 of 4 status values.
+
+**Blast radius.** Phase 4's CLI wiring (T27, the `no_results` contract task), the reporting layer's summary line, Phase 4's integration test asserting the exact spec JSON.
+
+**Reversal cost.** **Cheap.** A pure function over already-modeled data (`TaskOutcome.rejection_counts`); promoting it to a stored field later, if ever needed, is additive.
 
 ---
 
