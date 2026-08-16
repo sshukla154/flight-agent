@@ -1212,6 +1212,188 @@ class TestDirectFlightAnalysisCrossArtifactConsistency:
             assert f"**{destination}:**" in section
 
 
+def _final_summary_line(rendered: str) -> str:
+    """The "**Final Summary:** ..." paragraph -- the report's very last
+    line (T34), or raises if it is absent (callers that expect it missing
+    check ``"**Final Summary:**" not in rendered`` directly instead)."""
+    marker = "**Final Summary:**"
+    start = rendered.index(marker)
+    return rendered[start:].strip()
+
+
+class TestFinalSummarySentence:
+    """Phase 5, T34: the closing "Final Summary" line, A1-8's restated
+    acceptance criterion -- one of two templates, with a EUR delta and (for
+    the direct-recommending template) an hours-saved figure that both equal
+    the values actually computed from the underlying ``DestinationAnalysis``,
+    never the spec's own example numbers (EUR90/7 hours, EUR300)."""
+
+    def test_recommended_tier_produces_direct_sentence_with_exact_eur_and_hours(self) -> None:
+        # _ranked_pair()'s top itinerary's destination is DEL (hardcoded in
+        # _one_stop_itinerary); _eight_destination_analyses()'s DEL entry is
+        # RECOMMENDED, price_difference=90.00, time_saved=5h -- exactly the
+        # "primary result" this report is about (T15/T33's own `top`).
+        rendered = render_markdown_report(
+            _ranked_pair(),
+            departure_date=_DEPARTURE_DATE,
+            accepted_count=2,
+            generated_at=_GENERATED_AT,
+            destination_analyses=_eight_destination_analyses(),
+        )
+        line = _final_summary_line(rendered)
+
+        assert "The direct AMS to DEL flight is only" in line
+        assert "€90.00" in line
+        assert "5 hours" in line
+        assert "I recommend choosing the direct flight." in line
+        # Never the spec's own worked-example numbers.
+        assert "€300.00" not in line
+
+    def test_good_value_tier_also_uses_the_direct_sentence_template(self) -> None:
+        bom_top = _direct_itinerary(
+            itinerary_id="itin_bom_top",
+            price_eur=Decimal("690.00"),
+            carrier="AI",
+            destination="BOM",
+            destination_tz="Asia/Kolkata",
+        )
+        top_scored = _scored(bom_top, rank=1, fare_component=Decimal("690.00"))
+        rendered = render_markdown_report(
+            [top_scored],
+            departure_date=_DEPARTURE_DATE,
+            accepted_count=1,
+            generated_at=_GENERATED_AT,
+            destination_analyses=_eight_destination_analyses(),
+        )
+        line = _final_summary_line(rendered)
+
+        assert "€110.00" in line
+        assert "4 hours" in line
+        assert "I recommend choosing the direct flight." in line
+
+    def test_not_recommended_tier_produces_one_stop_sentence_with_exact_eur(self) -> None:
+        blr_top = _direct_itinerary(
+            itinerary_id="itin_blr_top",
+            price_eur=Decimal("860.00"),
+            carrier="6E",
+            destination="BLR",
+            destination_tz="Asia/Kolkata",
+        )
+        top_scored = _scored(blr_top, rank=1, fare_component=Decimal("860.00"))
+        rendered = render_markdown_report(
+            [top_scored],
+            departure_date=_DEPARTURE_DATE,
+            accepted_count=1,
+            generated_at=_GENERATED_AT,
+            destination_analyses=_eight_destination_analyses(),
+        )
+        line = _final_summary_line(rendered)
+
+        assert "€300.00" in line
+        assert "significantly better value" in line
+        # Must not be confusable with the direct-recommending template.
+        assert "I recommend choosing the direct flight" not in line
+        assert "saves approximately" not in line
+
+    def test_hours_saved_is_computed_from_total_duration_difference_not_hardcoded(self) -> None:
+        del_direct = _direct_itinerary(
+            itinerary_id="itin_del_direct_variant",
+            price_eur=Decimal("710.00"),
+            carrier="KL",
+            destination="DEL",
+            destination_tz="Asia/Kolkata",
+        )
+
+        def _rendered_for(time_saved: timedelta) -> str:
+            analysis = _destination_analysis(
+                destination="DEL",
+                tier=DirectTier.RECOMMENDED,
+                cheapest_direct=del_direct,
+                cheapest_valid_stop=_second_itinerary(),
+                price_difference=Decimal("50.00"),
+                relative_difference=Decimal("0.05"),
+                time_saved=time_saved,
+            )
+            return render_markdown_report(
+                _ranked_pair(),
+                departure_date=_DEPARTURE_DATE,
+                accepted_count=2,
+                generated_at=_GENERATED_AT,
+                destination_analyses=[analysis],
+            )
+
+        line_short = _final_summary_line(_rendered_for(timedelta(hours=3)))
+        line_long = _final_summary_line(_rendered_for(timedelta(hours=9)))
+
+        assert "3 hours" in line_short
+        assert "9 hours" not in line_short
+        assert "9 hours" in line_long
+        assert "3 hours" not in line_long
+
+    def test_summary_omits_hours_saved_clause_when_direct_is_slower(self) -> None:
+        del_direct = _direct_itinerary(
+            itinerary_id="itin_del_direct_slower",
+            price_eur=Decimal("710.00"),
+            carrier="KL",
+            destination="DEL",
+            destination_tz="Asia/Kolkata",
+        )
+        analysis = _destination_analysis(
+            destination="DEL",
+            tier=DirectTier.RECOMMENDED,
+            cheapest_direct=del_direct,
+            cheapest_valid_stop=_second_itinerary(),
+            price_difference=Decimal("50.00"),
+            relative_difference=Decimal("0.05"),
+            time_saved=timedelta(hours=-3),  # direct is SLOWER (T32)
+        )
+        rendered = render_markdown_report(
+            _ranked_pair(),
+            departure_date=_DEPARTURE_DATE,
+            accepted_count=2,
+            generated_at=_GENERATED_AT,
+            destination_analyses=[analysis],
+        )
+        line = _final_summary_line(rendered)
+
+        # The recommendation itself still stands (RECOMMENDED tier)...
+        assert "€50.00" in line
+        assert "I recommend choosing the direct flight." in line
+        # ...but no false claim about a time saving.
+        assert "saves approximately" not in line
+        assert "hours of travel time" not in line
+        assert "-3 hours" not in line
+
+    def test_no_final_summary_when_destination_analyses_not_supplied(self) -> None:
+        rendered = render_markdown_report(
+            _ranked_pair(),
+            departure_date=_DEPARTURE_DATE,
+            accepted_count=2,
+            generated_at=_GENERATED_AT,
+        )
+        assert "**Final Summary:**" not in rendered
+
+    def test_no_final_summary_when_primary_destination_has_no_priced_comparison(self) -> None:
+        # CCU: direct exists, no valid one-stop alternative -- price_difference
+        # is None (T31's degenerate case), so no template's claim would be true.
+        ccu_top = _direct_itinerary(
+            itinerary_id="itin_ccu_top",
+            price_eur=Decimal("900.00"),
+            carrier="AI",
+            destination="CCU",
+            destination_tz="Asia/Kolkata",
+        )
+        top_scored = _scored(ccu_top, rank=1, fare_component=Decimal("900.00"))
+        rendered = render_markdown_report(
+            [top_scored],
+            departure_date=_DEPARTURE_DATE,
+            accepted_count=1,
+            generated_at=_GENERATED_AT,
+            destination_analyses=_eight_destination_analyses(),
+        )
+        assert "**Final Summary:**" not in rendered
+
+
 class TestAtomicWriter:
     def test_write_report_artifacts_creates_both_files_with_full_content(
         self, tmp_path: Path
