@@ -531,3 +531,210 @@ class TestConfigDrivenTierThresholds:
             direct_tier_settings=strict_settings.direct_tier,
         )
         assert strict_analysis.tier == DirectTier.NOT_RECOMMENDED
+
+
+class TestAbsoluteThresholdBoundaryAtStop600:
+    """T35: the ``good_value_max_diff_eur`` (150) boundary in isolation, held
+    at a fixed ``cheapest_valid_stop`` price (EUR600) chosen so the relative
+    arm (150/600 == 0.25 at the pivot) fails throughout -- only the absolute
+    arm can decide GOOD_VALUE vs NOT_RECOMMENDED here. DECISIONS.md D10's own
+    wording is "diff <= 150" for GOOD_VALUE -- inclusive, so 150 itself must
+    still pass."""
+
+    def test_149_below_threshold_is_good_value(self) -> None:
+        direct = _direct_itinerary(Decimal("749.00"), itinerary_id="itin_abs600_149d")
+        stop = _one_stop_itinerary(
+            Decimal("600.00"),
+            itinerary_id="itin_abs600_149s",
+            first_leg=_WORKED_STOP_FIRST_LEG,
+            layover_duration=_WORKED_STOP_LAYOVER,
+            second_leg=_WORKED_STOP_SECOND_LEG,
+        )
+        analysis = _analyze(direct_pool=(direct,), one_stop_pool=(stop,))
+
+        assert analysis.price_difference is not None
+        assert analysis.price_difference.amount == Decimal("149.00")
+        assert analysis.tier == DirectTier.GOOD_VALUE
+        assert "absolute-difference rule fired" in analysis.tier_reason
+
+    def test_exactly_150_is_inclusive_still_good_value(self) -> None:
+        direct = _direct_itinerary(Decimal("750.00"), itinerary_id="itin_abs600_150d")
+        stop = _one_stop_itinerary(
+            Decimal("600.00"),
+            itinerary_id="itin_abs600_150s",
+            first_leg=_WORKED_STOP_FIRST_LEG,
+            layover_duration=_WORKED_STOP_LAYOVER,
+            second_leg=_WORKED_STOP_SECOND_LEG,
+        )
+        analysis = _analyze(direct_pool=(direct,), one_stop_pool=(stop,))
+
+        assert analysis.price_difference is not None
+        assert analysis.price_difference.amount == Decimal("150.00")
+        assert analysis.tier == DirectTier.GOOD_VALUE
+        assert "absolute-difference rule fired" in analysis.tier_reason
+
+    def test_151_above_threshold_and_relative_arm_also_fails_is_not_recommended(self) -> None:
+        # rel = 151/600 = 0.25166... > good_value_max_relative (0.20), so
+        # neither arm fires and the overall tier is NOT_RECOMMENDED, not a
+        # near-miss that the relative arm happens to rescue.
+        direct = _direct_itinerary(Decimal("751.00"), itinerary_id="itin_abs600_151d")
+        stop = _one_stop_itinerary(
+            Decimal("600.00"),
+            itinerary_id="itin_abs600_151s",
+            first_leg=_WORKED_STOP_FIRST_LEG,
+            layover_duration=_WORKED_STOP_LAYOVER,
+            second_leg=_WORKED_STOP_SECOND_LEG,
+        )
+        analysis = _analyze(direct_pool=(direct,), one_stop_pool=(stop,))
+
+        assert analysis.price_difference is not None
+        assert analysis.price_difference.amount == Decimal("151.00")
+        assert analysis.relative_difference is not None
+        assert analysis.relative_difference > Decimal("0.20")
+        assert analysis.tier == DirectTier.NOT_RECOMMENDED
+        assert "neither rule fired" in analysis.tier_reason
+
+
+class TestRelativeThresholdBoundaryAtStop1000:
+    """T35: the ``good_value_max_relative`` (0.20) boundary in isolation, at
+    a round ``cheapest_valid_stop`` price (EUR1000) chosen so the absolute
+    arm (200 and 201 EUR diff, both > good_value_max_diff_eur=150) fails
+    throughout -- only the relative arm can decide here."""
+
+    def test_exactly_0_20_is_inclusive_good_value(self) -> None:
+        direct = _direct_itinerary(Decimal("1200.00"), itinerary_id="itin_rel1000_200d")
+        stop = _one_stop_itinerary(
+            Decimal("1000.00"),
+            itinerary_id="itin_rel1000_200s",
+            first_leg=_WORKED_STOP_FIRST_LEG,
+            layover_duration=_WORKED_STOP_LAYOVER,
+            second_leg=_WORKED_STOP_SECOND_LEG,
+        )
+        analysis = _analyze(direct_pool=(direct,), one_stop_pool=(stop,))
+
+        assert analysis.relative_difference == Decimal("0.20")
+        assert analysis.tier == DirectTier.GOOD_VALUE
+        assert "relative-difference rule fired" in analysis.tier_reason
+
+    def test_0_201_just_above_threshold_is_not_recommended(self) -> None:
+        direct = _direct_itinerary(Decimal("1201.00"), itinerary_id="itin_rel1000_201d")
+        stop = _one_stop_itinerary(
+            Decimal("1000.00"),
+            itinerary_id="itin_rel1000_201s",
+            first_leg=_WORKED_STOP_FIRST_LEG,
+            layover_duration=_WORKED_STOP_LAYOVER,
+            second_leg=_WORKED_STOP_SECOND_LEG,
+        )
+        analysis = _analyze(direct_pool=(direct,), one_stop_pool=(stop,))
+
+        assert analysis.relative_difference == Decimal("0.201")
+        assert analysis.tier == DirectTier.NOT_RECOMMENDED
+        assert "neither rule fired" in analysis.tier_reason
+
+
+class TestTierReasonNamesActualNumbers:
+    """T35: ``tier_reason`` must name the actual numbers involved, not a
+    generic "a threshold fired" message -- assert on the literal string, not
+    merely its non-emptiness. Uses a pair where BOTH arms of RECOMMENDED
+    pass simultaneously (diff=40<=100 AND rel=0.08<=0.10), a branch no
+    existing T31/T32 test inspects the ``tier_reason`` text of."""
+
+    def test_both_rules_fired_names_both_thresholds_and_both_actual_values(self) -> None:
+        direct = _direct_itinerary(Decimal("540.00"), itinerary_id="itin_reason_both_d")
+        stop = _one_stop_itinerary(
+            Decimal("500.00"),
+            itinerary_id="itin_reason_both_s",
+            first_leg=_WORKED_STOP_FIRST_LEG,
+            layover_duration=_WORKED_STOP_LAYOVER,
+            second_leg=_WORKED_STOP_SECOND_LEG,
+        )
+        analysis = _analyze(direct_pool=(direct,), one_stop_pool=(stop,))
+
+        assert analysis.tier == DirectTier.RECOMMENDED
+        assert analysis.price_difference is not None
+        assert analysis.price_difference.amount == Decimal("40.00")
+        assert analysis.relative_difference == Decimal("0.08")
+        assert analysis.tier_reason == (
+            "RECOMMENDED: both rules fired -- price difference EUR40.00 <= "
+            "recommended_max_diff_eur EUR100 AND relative difference 0.08 <= "
+            "recommended_max_relative 0.1"
+        )
+
+    def test_good_value_absolute_only_names_good_value_threshold_not_recommended_one(
+        self,
+    ) -> None:
+        # diff=149<=150 (good_value passes) but diff=149>100 (recommended
+        # absolute fails) and rel=149/600=0.2483..>0.20 (both relative arms
+        # fail too) -- tier_reason must cite good_value's own threshold
+        # number (150), never the inner recommended one (100).
+        direct = _direct_itinerary(Decimal("749.00"), itinerary_id="itin_reason_gv_d")
+        stop = _one_stop_itinerary(
+            Decimal("600.00"),
+            itinerary_id="itin_reason_gv_s",
+            first_leg=_WORKED_STOP_FIRST_LEG,
+            layover_duration=_WORKED_STOP_LAYOVER,
+            second_leg=_WORKED_STOP_SECOND_LEG,
+        )
+        analysis = _analyze(direct_pool=(direct,), one_stop_pool=(stop,))
+
+        assert analysis.tier == DirectTier.GOOD_VALUE
+        assert analysis.tier_reason == (
+            "GOOD_VALUE: absolute-difference rule fired -- price difference EUR149.00 <= "
+            "good_value_max_diff_eur EUR150"
+        )
+
+
+class TestDirectEqualPriceIsRecommended:
+    """T35: ``price_difference`` of exactly zero (direct costs the same as
+    the cheapest one-stop) is a free upgrade to no connection -- must land
+    RECOMMENDED, not merely "not NOT_RECOMMENDED"."""
+
+    def test_direct_equal_price_chooses_direct(self) -> None:
+        direct = _direct_itinerary(Decimal("500.00"), itinerary_id="itin_equal_d")
+        stop = _one_stop_itinerary(
+            Decimal("500.00"),
+            itinerary_id="itin_equal_s",
+            first_leg=_WORKED_STOP_FIRST_LEG,
+            layover_duration=_WORKED_STOP_LAYOVER,
+            second_leg=_WORKED_STOP_SECOND_LEG,
+        )
+        analysis = _analyze(direct_pool=(direct,), one_stop_pool=(stop,))
+
+        assert analysis.price_difference is not None
+        assert analysis.price_difference.amount == Decimal("0.00")
+        assert analysis.relative_difference == Decimal("0.00")
+        assert analysis.tier == DirectTier.RECOMMENDED
+        assert "both rules fired" in analysis.tier_reason
+
+
+class TestDecimalNotFloatAtBoundary:
+    """T35: an adversarial Decimal pair chosen so IEEE-754 double subtraction
+    of the same two numbers overshoots the 150 boundary by a
+    float-rounding artifact (confirmed by hand: ``256.47 - 106.47 ==
+    150.00000000000003`` in binary float64), while exact Decimal
+    subtraction lands precisely on ``150.00``. If ``analyze_destination``
+    ever regressed to comparing prices as ``float`` instead of ``Decimal``,
+    this pair would misclassify as NOT_RECOMMENDED instead of the correct
+    GOOD_VALUE."""
+
+    def test_prices_compared_as_decimal_not_float(self) -> None:
+        direct_price = Decimal("256.47")
+        stop_price = Decimal("106.47")
+        # Sanity check the adversarial premise itself: float subtraction of
+        # these exact two numbers does NOT land on 150.0.
+        assert float(direct_price) - float(stop_price) != 150.0
+
+        direct = _direct_itinerary(direct_price, itinerary_id="itin_decimal_adversarial_d")
+        stop = _one_stop_itinerary(
+            stop_price,
+            itinerary_id="itin_decimal_adversarial_s",
+            first_leg=_WORKED_STOP_FIRST_LEG,
+            layover_duration=_WORKED_STOP_LAYOVER,
+            second_leg=_WORKED_STOP_SECOND_LEG,
+        )
+        analysis = _analyze(direct_pool=(direct,), one_stop_pool=(stop,))
+
+        assert analysis.price_difference is not None
+        assert analysis.price_difference.amount == Decimal("150.00")
+        assert analysis.tier == DirectTier.GOOD_VALUE
+        assert "absolute-difference rule fired" in analysis.tier_reason
