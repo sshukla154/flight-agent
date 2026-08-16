@@ -15,6 +15,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from datetime import timedelta
 
+from flightagent.domain.enums import DirectTier
 from flightagent.domain.itinerary import NormalizedItinerary
 from flightagent.domain.money import Money
 from flightagent.domain.run import _ERROR_STATES as _TASK_ERROR_STATES
@@ -22,6 +23,16 @@ from flightagent.domain.run import TaskOutcome
 from flightagent.domain.segment import Segment
 
 _ONE_MINUTE = timedelta(minutes=1)
+
+_DIRECT_TIER_RECOMMENDATION_LABELS: dict[DirectTier, str] = {
+    DirectTier.RECOMMENDED: "Recommended",
+    DirectTier.GOOD_VALUE: "Recommended (good value)",
+    DirectTier.NOT_RECOMMENDED: "Optional",
+    DirectTier.NOT_AVAILABLE: "Not available",
+}
+"""Addendum 1's exact Recommendation-column text, per D10 tier (T33). The
+``NOT_AVAILABLE`` -> ``"Not available"`` mapping is an explicit acceptance
+criterion (at least one destination must show this exact string)."""
 
 
 def first_segment(itinerary: NormalizedItinerary) -> Segment:
@@ -116,6 +127,17 @@ def destination_from_task_id(task_id: str) -> str:
             "domain.ids.compute_task_id"
         )
     return parts[1]
+
+
+def direct_tier_recommendation_label(tier: DirectTier) -> str:
+    """Addendum 1's exact Recommendation-column text for one ``DirectTier``
+    (D10, T33) -- shared by ``reporting.markdown`` (which additionally
+    prefixes a star marker for ``RECOMMENDED``, a display-only decoration)
+    and ``reporting.json_report`` (which emits this text verbatim), so the
+    two artifacts' Recommendation values can never quietly drift apart the
+    way two independently-maintained string literals eventually would.
+    """
+    return _DIRECT_TIER_RECOMMENDATION_LABELS[tier]
 
 
 def failed_task_outcomes(task_outcomes: Sequence[TaskOutcome]) -> list[TaskOutcome]:

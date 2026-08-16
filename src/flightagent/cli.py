@@ -81,6 +81,7 @@ from flightagent.config.models import FlightAgentSettings
 from flightagent.domain.enums import CabinClass, RejectionCode, RunStatus, StopMode, TaskState
 from flightagent.domain.ids import generate_run_id
 from flightagent.domain.itinerary import NormalizedItinerary, RawOffer
+from flightagent.domain.policy import DestinationAnalysis
 from flightagent.domain.run import _ERROR_STATES as _TASK_ERROR_STATES
 from flightagent.domain.run import RunEnvelope, RunMeta, SearchRequest, SearchTask, TaskOutcome
 from flightagent.domain.scoring import ScoredItinerary
@@ -91,6 +92,7 @@ from flightagent.observability.events import EventName
 from flightagent.observability.logging import log_event, setup_logging
 from flightagent.orchestration.executor import execute_plan
 from flightagent.orchestration.plan import build_dual_mode_plan_for_origin
+from flightagent.policy.direct_vs_stop import analyze_destination
 from flightagent.providers.base import CallBudget, FlightProvider
 from flightagent.providers.errors import ProviderNotConfigured
 from flightagent.providers.mock.generator import compute_seed
@@ -522,6 +524,35 @@ def _build_direct_vs_stop_pools(
     return pools
 
 
+def _analyze_all_destinations(
+    pools_by_destination: dict[str, _DirectVsStopPools], *, settings: FlightAgentSettings
+) -> list[DestinationAnalysis]:
+    """T33: run the D10 direct-vs-stop policy (``policy.direct_vs_stop.analyze_destination``)
+    over every destination in ``pools_by_destination``, one ``DestinationAnalysis``
+    each -- the "Direct Flight Analysis" section's (and the JSON's
+    ``destination_analyses`` array's) entire data source.
+
+    Iterates ``pools_by_destination`` in its own (dict-insertion) order,
+    which ``_build_direct_vs_stop_pools`` builds from ``tasks`` -- direct-mode
+    tasks first, one-stop-mode tasks second, both in registry destination
+    order -- so this always comes out as all 8 registry destinations, in
+    registry order, never re-sorted here and never silently dropping one
+    (D15's amendment: this table is the only per-destination visibility
+    the global top-N ranking cannot provide).
+    """
+    return [
+        analyze_destination(
+            destination,
+            direct_pool=pools.direct,
+            one_stop_pool=pools.one_stop,
+            direct_tier_settings=settings.direct_tier,
+            scoring_settings=settings.scoring,
+            layover_settings=settings.layover,
+        )
+        for destination, pools in pools_by_destination.items()
+    ]
+
+
 def _run_all_destinations(
     *,
     origin: str,
@@ -550,8 +581,13 @@ def _run_all_destinations(
     destination AND both modes (T20) -> score (T13) -> rank (T14) ->
     construct a ``RunEnvelope`` and branch on its ``RunStatus`` (finding
     0.5). Separately, ``_build_direct_vs_stop_pools`` builds the D13
-    pool-separated per-destination view T31 will consume -- that pass does
-    not feed the ranked report at all (see its own docstring).
+    pool-separated per-destination view, and ``_analyze_all_destinations``
+    runs the D10 policy (T31/T33, ``policy.direct_vs_stop.analyze_destination``)
+    over it -- one ``DestinationAnalysis`` per registry destination, fed
+    into both artifacts' "Direct Flight Analysis"/``destination_analyses``
+    output. That pass never feeds the ranked report itself (see
+    ``_build_direct_vs_stop_pools``' own docstring); it is a separate,
+    per-destination view assembled from the same already-validated pools.
 
     Never raises a bare pydantic error for the ordinary cases (COMPLETE,
     PARTIAL, NO_RESULTS, FAILED) -- see ``_compute_run_status`` for the one
@@ -601,10 +637,13 @@ def _run_all_destinations(
 
     final_task_outcomes = tuple(finalized_outcomes)
 
-    # D13 pool separation (T29): built now so T31 can consume it directly;
-    # this task's own ranked report/artifacts below are unaffected -- see
-    # _build_direct_vs_stop_pools' own docstring.
+    # D13 pool separation (T29) plus the D10 policy comparison itself (T31,
+    # T33): built now so both artifacts below can render the "Direct Flight
+    # Analysis" section -- this pass does not feed the ranked report at all
+    # (see _build_direct_vs_stop_pools' own docstring), it is a separate,
+    # per-destination view assembled from the same already-validated pools.
     _direct_vs_stop_pools = _build_direct_vs_stop_pools(tasks, valid_by_task_id)
+    destination_analyses = _analyze_all_destinations(_direct_vs_stop_pools, settings=settings)
 
     deduplicated_itineraries = deduplicate(combined_valid_itineraries)
     scored_itineraries = [
@@ -663,6 +702,7 @@ def _run_all_destinations(
             generated_at=generated_at,
             data_source="mock",
             task_outcomes=final_task_outcomes,
+            destination_analyses=destination_analyses,
         )
         json_document = build_results_document(
             ranked,
@@ -672,6 +712,7 @@ def _run_all_destinations(
             generated_at=generated_at,
             data_source="mock",
             task_outcomes=final_task_outcomes,
+            destination_analyses=destination_analyses,
         )
         report_path, results_path = write_report_artifacts(
             markdown=markdown,

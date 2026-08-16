@@ -30,9 +30,10 @@ from zoneinfo import ZoneInfo
 import jsonschema
 import pytest
 
-from flightagent.domain.enums import CabinClass, TaskState
+from flightagent.domain.enums import CabinClass, DirectTier, TaskState
 from flightagent.domain.itinerary import Leg, NormalizedItinerary
 from flightagent.domain.money import Money
+from flightagent.domain.policy import DestinationAnalysis
 from flightagent.domain.run import TaskOutcome
 from flightagent.domain.scoring import ScoreComponents, ScoredItinerary
 from flightagent.domain.segment import Layover, Segment
@@ -218,6 +219,198 @@ def _ranked_pair() -> list[ScoredItinerary]:
         layover_penalty=Decimal("0"),
     )
     return [top, second]
+
+
+def _direct_itinerary(
+    *,
+    itinerary_id: str,
+    price_eur: Decimal,
+    carrier: str,
+    destination: str,
+    destination_tz: str,
+) -> NormalizedItinerary:
+    """A single-segment, zero-layover AMS -> ``destination`` itinerary --
+    the "Direct Flight Analysis" table's ``cheapest_direct`` shape (T33)."""
+    origin_tz = "Europe/Amsterdam"
+    depart_utc = datetime(2027, 7, 17, 8, 0, tzinfo=UTC)
+    arrive_utc = depart_utc + timedelta(hours=9)
+    seg = _segment(
+        origin="AMS",
+        destination=destination,
+        depart_utc=depart_utc,
+        arrive_utc=arrive_utc,
+        origin_tz=origin_tz,
+        destination_tz=destination_tz,
+        marketing_carrier=carrier,
+        flight_number="900",
+    )
+    leg = Leg(segments=(seg,), layovers=())
+    price = Money(amount=price_eur, currency="EUR")
+    return NormalizedItinerary(
+        itinerary_id=itinerary_id,
+        provider="mock",
+        legs=(leg,),
+        price_original=price,
+        price_eur=price,
+        booking_url=None,
+        booking_url_kind="unavailable",
+        shape_key=f"shape-{itinerary_id}",
+        fare_as_of=datetime(2026, 8, 14, 10, 0, tzinfo=UTC),
+    )
+
+
+def _destination_analysis(
+    *,
+    destination: str,
+    tier: DirectTier,
+    cheapest_direct: NormalizedItinerary | None = None,
+    cheapest_valid_stop: NormalizedItinerary | None = None,
+    price_difference: Decimal | None = None,
+    relative_difference: Decimal | None = None,
+    time_saved: timedelta | None = None,
+    score_policy_divergence: bool = False,
+    divergence_explanation: str | None = None,
+) -> DestinationAnalysis:
+    return DestinationAnalysis(
+        destination=destination,
+        cheapest_direct=cheapest_direct,
+        cheapest_valid_stop=cheapest_valid_stop,
+        price_difference=(
+            Money(amount=price_difference, currency="EUR") if price_difference is not None else None
+        ),
+        relative_difference=relative_difference,
+        tier=tier,
+        tier_reason=f"test tier reason for {destination}",
+        time_saved=time_saved,
+        score_policy_divergence=score_policy_divergence,
+        divergence_explanation=divergence_explanation,
+    )
+
+
+def _eight_destination_analyses() -> list[DestinationAnalysis]:
+    """One ``DestinationAnalysis`` per registry destination (D10, T33),
+    covering every tier at least once -- including HYD as the arranged
+    zero-direct-offers ``NOT_AVAILABLE`` destination (T29) and MAA as the
+    ``score_policy_divergence`` case (finding 0.1)."""
+    return [
+        _destination_analysis(
+            destination="DEL",
+            tier=DirectTier.RECOMMENDED,
+            cheapest_direct=_direct_itinerary(
+                itinerary_id="itin_del_direct",
+                price_eur=Decimal("710.00"),
+                carrier="KL",
+                destination="DEL",
+                destination_tz="Asia/Kolkata",
+            ),
+            cheapest_valid_stop=_second_itinerary(),
+            price_difference=Decimal("90.00"),
+            relative_difference=Decimal("90.00") / Decimal("620.00"),
+            time_saved=timedelta(hours=5),
+        ),
+        _destination_analysis(
+            destination="BOM",
+            tier=DirectTier.GOOD_VALUE,
+            cheapest_direct=_direct_itinerary(
+                itinerary_id="itin_bom_direct",
+                price_eur=Decimal("690.00"),
+                carrier="AI",
+                destination="BOM",
+                destination_tz="Asia/Kolkata",
+            ),
+            cheapest_valid_stop=_second_itinerary(),
+            price_difference=Decimal("110.00"),
+            relative_difference=Decimal("110.00") / Decimal("580.00"),
+            time_saved=timedelta(hours=4),
+        ),
+        _destination_analysis(
+            destination="BLR",
+            tier=DirectTier.NOT_RECOMMENDED,
+            cheapest_direct=_direct_itinerary(
+                itinerary_id="itin_blr_direct",
+                price_eur=Decimal("860.00"),
+                carrier="6E",
+                destination="BLR",
+                destination_tz="Asia/Kolkata",
+            ),
+            cheapest_valid_stop=_second_itinerary(),
+            price_difference=Decimal("300.00"),
+            relative_difference=Decimal("300.00") / Decimal("560.00"),
+            time_saved=timedelta(hours=-1),
+        ),
+        _destination_analysis(
+            destination="HYD",
+            tier=DirectTier.NOT_AVAILABLE,
+            cheapest_direct=None,
+            cheapest_valid_stop=_second_itinerary(),
+        ),
+        _destination_analysis(
+            destination="MAA",
+            tier=DirectTier.GOOD_VALUE,
+            cheapest_direct=_direct_itinerary(
+                itinerary_id="itin_maa_direct",
+                price_eur=Decimal("1195.00"),
+                carrier="EK",
+                destination="MAA",
+                destination_tz="Asia/Kolkata",
+            ),
+            cheapest_valid_stop=_second_itinerary(),
+            price_difference=Decimal("195.00"),
+            relative_difference=Decimal("0.195"),
+            time_saved=timedelta(hours=7),
+            score_policy_divergence=True,
+            divergence_explanation=(
+                "Direct-tier policy recommends the direct itinerary (good_value, price "
+                "difference EUR195.00), but adjusted_score ranks the one-stop itinerary "
+                "ahead instead (finding 0.1)."
+            ),
+        ),
+        _destination_analysis(
+            destination="CCU",
+            tier=DirectTier.RECOMMENDED,
+            cheapest_direct=_direct_itinerary(
+                itinerary_id="itin_ccu_direct",
+                price_eur=Decimal("900.00"),
+                carrier="AI",
+                destination="CCU",
+                destination_tz="Asia/Kolkata",
+            ),
+            cheapest_valid_stop=None,
+            price_difference=None,
+            relative_difference=None,
+            time_saved=None,
+        ),
+        _destination_analysis(
+            destination="LKO",
+            tier=DirectTier.GOOD_VALUE,
+            cheapest_direct=_direct_itinerary(
+                itinerary_id="itin_lko_direct",
+                price_eur=Decimal("650.00"),
+                carrier="AI",
+                destination="LKO",
+                destination_tz="Asia/Kolkata",
+            ),
+            cheapest_valid_stop=_second_itinerary(),
+            price_difference=Decimal("150.00"),
+            relative_difference=Decimal("0.30"),
+            time_saved=timedelta(hours=3),
+        ),
+        _destination_analysis(
+            destination="VNS",
+            tier=DirectTier.NOT_RECOMMENDED,
+            cheapest_direct=_direct_itinerary(
+                itinerary_id="itin_vns_direct",
+                price_eur=Decimal("800.00"),
+                carrier="6E",
+                destination="VNS",
+                destination_tz="Asia/Kolkata",
+            ),
+            cheapest_valid_stop=_second_itinerary(),
+            price_difference=Decimal("300.00"),
+            relative_difference=Decimal("0.60"),
+            time_saved=timedelta(hours=2),
+        ),
+    ]
 
 
 def _task_outcome(
@@ -712,6 +905,311 @@ class TestFailedSearchesJson:
         )
         schema = json.loads(_SCHEMA_PATH.read_text(encoding="utf-8"))
         jsonschema.validate(instance=doc, schema=schema)
+
+
+def _direct_flight_analysis_section(rendered: str) -> str:
+    """The "## Direct Flight Analysis" section's own text, up to (not
+    including) the next ``##`` heading or end of document."""
+    start = rendered.index("## Direct Flight Analysis")
+    rest = rendered[start + len("## Direct Flight Analysis") :]
+    next_heading = rest.find("\n## ")
+    tail_length = next_heading if next_heading != -1 else len(rest)
+    end = start + len("## Direct Flight Analysis") + tail_length
+    return rendered[start:end]
+
+
+def _table_row(section: str, destination: str) -> str:
+    """The single Markdown table row starting with ``| {destination} |``."""
+    for line in section.splitlines():
+        if line.startswith(f"| {destination} |"):
+            return line
+    raise AssertionError(f"no table row found for destination {destination!r} in:\n{section}")
+
+
+class TestDirectFlightAnalysisMarkdown:
+    """Phase 5, T33: Addendum 1's exact 5-column table."""
+
+    def _rendered(self) -> str:
+        return render_markdown_report(
+            _ranked_pair(),
+            departure_date=_DEPARTURE_DATE,
+            accepted_count=2,
+            generated_at=_GENERATED_AT,
+            destination_analyses=_eight_destination_analyses(),
+        )
+
+    def test_no_section_when_no_destination_analyses_supplied(self) -> None:
+        rendered = render_markdown_report(
+            _ranked_pair(),
+            departure_date=_DEPARTURE_DATE,
+            accepted_count=2,
+            generated_at=_GENERATED_AT,
+        )
+        assert "## Direct Flight Analysis" not in rendered
+
+    def test_exactly_five_required_column_headers_in_order(self) -> None:
+        rendered = self._rendered()
+        assert (
+            "| Destination | Airline | Price | Difference vs Cheapest Stop | Recommendation |"
+            in rendered
+        )
+        section = _direct_flight_analysis_section(rendered)
+        assert section.count("| Destination |") == 1
+
+    def test_exactly_eight_rows_one_per_destination(self) -> None:
+        section = _direct_flight_analysis_section(self._rendered())
+        data_rows = [
+            line
+            for line in section.splitlines()
+            if line.startswith("|") and not line.startswith("|---") and "Destination" not in line
+        ]
+        assert len(data_rows) == 8
+        destinations = {line.split("|")[1].strip() for line in data_rows}
+        assert destinations == {"DEL", "BOM", "BLR", "HYD", "MAA", "CCU", "LKO", "VNS"}
+
+    def test_not_available_row_uses_exact_required_string(self) -> None:
+        section = _direct_flight_analysis_section(self._rendered())
+        row = _table_row(section, "HYD")
+        assert "Not available" in row
+        # Never confusable with "Optional" (NOT_RECOMMENDED) or a recommended label.
+        assert "Optional" not in row
+        assert "Recommended" not in row
+
+    def test_recommended_row_carries_a_visual_marker_and_the_word_recommended(self) -> None:
+        section = _direct_flight_analysis_section(self._rendered())
+        row = _table_row(section, "DEL")
+        assert "Recommended" in row
+        assert "(good value)" not in row
+        assert "★" in row
+
+    def test_good_value_row_says_recommended_good_value(self) -> None:
+        section = _direct_flight_analysis_section(self._rendered())
+        row = _table_row(section, "BOM")
+        assert "Recommended (good value)" in row
+
+    def test_not_recommended_row_says_optional(self) -> None:
+        section = _direct_flight_analysis_section(self._rendered())
+        row = _table_row(section, "BLR")
+        assert "Optional" in row
+
+    def test_not_available_row_has_placeholder_airline_and_price(self) -> None:
+        section = _direct_flight_analysis_section(self._rendered())
+        row = _table_row(section, "HYD")
+        cells = [cell.strip() for cell in row.strip("|").split("|")]
+        # Destination | Airline | Price | Difference | Recommendation
+        assert cells[1] == "–"
+        assert cells[2] == "–"
+        assert cells[3] == "–"
+
+    def test_row_with_no_one_stop_alternative_shows_price_but_placeholder_difference(self) -> None:
+        section = _direct_flight_analysis_section(self._rendered())
+        row = _table_row(section, "CCU")
+        cells = [cell.strip() for cell in row.strip("|").split("|")]
+        assert cells[1] == "AI"
+        assert "€900.00" in cells[2]
+        assert cells[3] == "–"
+
+    def test_section_appears_after_other_good_options_before_failed_searches(self) -> None:
+        rendered = render_markdown_report(
+            _ranked_pair(),
+            departure_date=_DEPARTURE_DATE,
+            accepted_count=2,
+            generated_at=_GENERATED_AT,
+            task_outcomes=[_provider_error_outcome()],
+            destination_analyses=_eight_destination_analyses(),
+        )
+        other_options_index = rendered.index("## Other Good Options")
+        direct_analysis_index = rendered.index("## Direct Flight Analysis")
+        failed_index = rendered.index("## Failed Searches")
+        summary_index = rendered.index("**Summary:**")
+
+        assert other_options_index < direct_analysis_index < failed_index < summary_index
+
+
+class TestDirectFlightAnalysisDivergence:
+    """Finding 0.1: score_policy_divergence must render visibly, not just
+    exist as a flag on the model."""
+
+    def test_divergent_destination_renders_its_explanation_sentence(self) -> None:
+        rendered = render_markdown_report(
+            _ranked_pair(),
+            departure_date=_DEPARTURE_DATE,
+            accepted_count=2,
+            generated_at=_GENERATED_AT,
+            destination_analyses=_eight_destination_analyses(),
+        )
+        section = _direct_flight_analysis_section(rendered)
+        assert "MAA" in section
+        assert "finding 0.1" in section
+        assert "adjusted_score ranks the one-stop itinerary" in section
+
+    def test_non_divergent_destinations_get_no_explanation_text(self) -> None:
+        rendered = render_markdown_report(
+            _ranked_pair(),
+            departure_date=_DEPARTURE_DATE,
+            accepted_count=2,
+            generated_at=_GENERATED_AT,
+            destination_analyses=_eight_destination_analyses(),
+        )
+        section = _direct_flight_analysis_section(rendered)
+        assert "**DEL:**" not in section
+        assert "**BOM:**" not in section
+
+    def test_no_divergent_destinations_renders_no_note_at_all(self) -> None:
+        non_divergent = [
+            analysis
+            for analysis in _eight_destination_analyses()
+            if not analysis.score_policy_divergence
+        ]
+        rendered = render_markdown_report(
+            _ranked_pair(),
+            departure_date=_DEPARTURE_DATE,
+            accepted_count=2,
+            generated_at=_GENERATED_AT,
+            destination_analyses=non_divergent,
+        )
+        section = _direct_flight_analysis_section(rendered)
+        assert "disagree" not in section
+
+
+class TestDirectFlightAnalysisJson:
+    """Phase 5, T33: the top-level ``destination_analyses`` array."""
+
+    def _doc(self) -> dict[str, object]:
+        return build_results_document(
+            _ranked_pair(),
+            departure_date=_DEPARTURE_DATE,
+            accepted_count=2,
+            top_n=10,
+            generated_at=_GENERATED_AT,
+            destination_analyses=_eight_destination_analyses(),
+        )
+
+    def test_default_destination_analyses_is_present_but_empty(self) -> None:
+        doc = build_results_document(
+            _ranked_pair(),
+            departure_date=_DEPARTURE_DATE,
+            accepted_count=2,
+            top_n=10,
+            generated_at=_GENERATED_AT,
+        )
+        assert doc["destination_analyses"] == []
+
+    def test_exactly_eight_entries_one_per_destination(self) -> None:
+        entries = self._doc()["destination_analyses"]
+        assert isinstance(entries, list)
+        assert len(entries) == 8
+        assert {entry["destination"] for entry in entries} == {
+            "DEL",
+            "BOM",
+            "BLR",
+            "HYD",
+            "MAA",
+            "CCU",
+            "LKO",
+            "VNS",
+        }
+
+    def test_not_available_entry_has_null_airline_price_and_difference(self) -> None:
+        entries = self._doc()["destination_analyses"]
+        by_destination = {entry["destination"]: entry for entry in entries}
+        hyd = by_destination["HYD"]
+
+        assert hyd["tier"] == "not_available"
+        assert hyd["recommendation"] == "Not available"
+        assert hyd["airline"] is None
+        assert hyd["price_eur"] is None
+        assert hyd["price_difference_eur"] is None
+        assert hyd["relative_difference"] is None
+        assert hyd["time_saved_minutes"] is None
+
+    def test_negative_price_difference_and_time_saved_are_preserved_signed(self) -> None:
+        entries = self._doc()["destination_analyses"]
+        by_destination = {entry["destination"]: entry for entry in entries}
+        blr = by_destination["BLR"]
+
+        assert blr["price_difference_eur"] == "300.00"
+        assert blr["time_saved_minutes"] == -60
+
+    def test_document_with_destination_analyses_validates_against_schema(self) -> None:
+        doc = self._doc()
+        schema = json.loads(_SCHEMA_PATH.read_text(encoding="utf-8"))
+        jsonschema.validate(instance=doc, schema=schema)
+
+
+class TestDirectFlightAnalysisCrossArtifactConsistency:
+    """Both artifacts are built from the exact same ``DestinationAnalysis``
+    list -- this proves they actually agree, rather than each independently
+    looking right in isolation."""
+
+    def _rendered_and_doc(self) -> tuple[str, dict[str, object]]:
+        analyses = _eight_destination_analyses()
+        rendered = render_markdown_report(
+            _ranked_pair(),
+            departure_date=_DEPARTURE_DATE,
+            accepted_count=2,
+            generated_at=_GENERATED_AT,
+            destination_analyses=analyses,
+        )
+        doc = build_results_document(
+            _ranked_pair(),
+            departure_date=_DEPARTURE_DATE,
+            accepted_count=2,
+            top_n=10,
+            generated_at=_GENERATED_AT,
+            destination_analyses=analyses,
+        )
+        return rendered, doc
+
+    def test_every_destination_agrees_on_tier_price_and_recommendation(self) -> None:
+        rendered, doc = self._rendered_and_doc()
+        section = _direct_flight_analysis_section(rendered)
+        entries = doc["destination_analyses"]
+        assert isinstance(entries, list)
+
+        for entry in entries:
+            row = _table_row(section, entry["destination"])
+            cells = [cell.strip() for cell in row.strip("|").split("|")]
+            markdown_airline, markdown_price, markdown_diff, markdown_recommendation = cells[1:]
+
+            # Airline: JSON None <-> Markdown placeholder, otherwise identical text.
+            if entry["airline"] is None:
+                assert markdown_airline == "–"
+            else:
+                assert markdown_airline == entry["airline"]
+
+            # Price: JSON is a bare decimal string, Markdown is euro-prefixed.
+            if entry["price_eur"] is None:
+                assert markdown_price == "–"
+            else:
+                assert markdown_price == f"€{entry['price_eur']}"
+
+            # Difference vs cheapest stop: same rule.
+            if entry["price_difference_eur"] is None:
+                assert markdown_diff == "–"
+            else:
+                assert markdown_diff == f"€{entry['price_difference_eur']}"
+
+            # Recommendation: Markdown may carry a star prefix the JSON never does,
+            # but the JSON's plain-text label must appear in the Markdown cell verbatim.
+            assert entry["recommendation"] in markdown_recommendation
+            if entry["tier"] == "recommended":
+                assert markdown_recommendation == f"★ {entry['recommendation']}"
+            else:
+                assert markdown_recommendation == entry["recommendation"]
+
+    def test_score_policy_divergence_flag_matches_and_maa_is_the_divergent_one(self) -> None:
+        rendered, doc = self._rendered_and_doc()
+        section = _direct_flight_analysis_section(rendered)
+        entries = doc["destination_analyses"]
+        assert isinstance(entries, list)
+
+        divergent_destinations = {
+            entry["destination"] for entry in entries if entry["score_policy_divergence"]
+        }
+        assert divergent_destinations == {"MAA"}
+        for destination in divergent_destinations:
+            assert f"**{destination}:**" in section
 
 
 class TestAtomicWriter:

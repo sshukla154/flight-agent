@@ -8,14 +8,21 @@ in this task's brief -- not an invented format:
 - An "Other Good Options" table with exactly four columns: Airline |
   Route | Layover | Price.
 
-Scope note (v1, per this task's brief): the "Direct Flight Analysis"
-section (Phase 5, T33) and the "Origin Comparison" table (Phase 6, T41)
-are deliberately NOT built here -- their underlying data (the
-direct-vs-stop policy, multi-origin fan-out) doesn't exist until those
-phases. ``render_markdown_report`` therefore still requires at least one
-ranked itinerary; the empty/no-results report path (finding 0.5's
-NO_RESULTS/FAILED ``RunStatus`` values) remains out of this function's
-scope.
+Phase 5 (T33) adds the "Direct Flight Analysis" section: Addendum 1's own
+five-column table (Destination | Airline | Price | Difference vs Cheapest
+Stop | Recommendation), one row per registry destination regardless of
+tier -- D15's amendment is explicit that this table is the only place a
+NOT_AVAILABLE/all-tier destination is visible at all once the global
+top-N ranking has truncated the main list. Rendered whenever the caller
+supplies at least one ``DestinationAnalysis``; empty (the pre-Phase-5
+default) renders no such section, matching every pre-Phase-5 call site.
+
+Scope note (v1, per this task's brief): the "Origin Comparison" table
+(Phase 6, T41) is deliberately NOT built here -- its underlying data (the
+multi-origin fan-out) doesn't exist until that phase. ``render_markdown_report``
+therefore still requires at least one ranked itinerary; the empty/no-results
+report path (finding 0.5's NO_RESULTS/FAILED ``RunStatus`` values) remains
+out of this function's scope.
 
 Phase 4 (T26) adds the "Failed Searches" section: rendered only when at
 least one ``TaskOutcome`` in the run's ledger is in an error state
@@ -39,7 +46,9 @@ from __future__ import annotations
 from collections.abc import Sequence
 from datetime import date, datetime
 
+from flightagent.domain.enums import DirectTier
 from flightagent.domain.itinerary import NormalizedItinerary
+from flightagent.domain.policy import DestinationAnalysis
 from flightagent.domain.run import TaskOutcome
 from flightagent.domain.scoring import ScoredItinerary
 from flightagent.reporting.booking_link import (
@@ -51,6 +60,7 @@ from flightagent.reporting.booking_link import (
 from flightagent.reporting.view import (
     airline_string,
     destination_from_task_id,
+    direct_tier_recommendation_label,
     failed_task_outcomes,
     first_segment,
     format_layover,
@@ -145,6 +155,92 @@ def _escape_table_cell(text: str) -> str:
     return text.replace("|", "\\|").replace("\n", " ")
 
 
+_NO_DIRECT_ITINERARY_TEXT = "–"
+"""En dash, D18's own "no value to show" convention (the fare-matrix's
+``NO_OFFERS`` cell) reused here for a ``DestinationAnalysis`` with no
+``cheapest_direct`` (NOT_AVAILABLE) or no ``price_difference`` (the
+degenerate "direct exists, no one-stop alternative" case, T31) -- never a
+fabricated 0.00 or an empty cell that could be mistaken for a rendering
+bug."""
+
+_DIRECT_TIER_STAR = "★ "
+"""Prefixed onto the Recommendation cell's text for ``DirectTier.RECOMMENDED``
+only -- a display-only visual marker (this task's own "consider a visual
+marker like the spec's own star" note), layered on top of
+``reporting.view.direct_tier_recommendation_label``'s shared plain-text
+label rather than baked into it, so the JSON artifact's ``recommendation``
+field (which reuses that same shared label) stays star-free plain text."""
+
+
+def _direct_tier_recommendation_cell(tier: DirectTier) -> str:
+    label = direct_tier_recommendation_label(tier)
+    if tier == DirectTier.RECOMMENDED:
+        return f"{_DIRECT_TIER_STAR}{label}"
+    return label
+
+
+def _direct_flight_analysis_table(analyses: Sequence[DestinationAnalysis]) -> str:
+    """Addendum 1's exact 5-column table (D10, T33): one row per
+    ``DestinationAnalysis``, in the order given -- ALL of them, regardless
+    of tier, per D15's amendment (a NOT_AVAILABLE destination has to stay
+    visible here even though the global top-N ranking may have dropped it
+    from every other section entirely).
+
+    Airline/Price come from ``cheapest_direct`` -- this table is about the
+    DIRECT option specifically -- and render as
+    ``_NO_DIRECT_ITINERARY_TEXT`` when no direct service exists at all
+    (``tier == NOT_AVAILABLE``, ``cheapest_direct is None``). Difference
+    vs Cheapest Stop renders the same placeholder whenever
+    ``price_difference`` is ``None`` -- either that same NOT_AVAILABLE
+    case, or the degenerate "direct exists, no valid one-stop alternative"
+    case (T31), where there is nothing priced to compare against.
+
+    Any destination with ``score_policy_divergence`` set appends one
+    sentence per destination after the table (finding 0.1) -- the ranked
+    list's ``adjusted_score`` ordering and this table's tier can
+    legitimately disagree above roughly a EUR755 one-stop fare, and the
+    report must say so rather than silently contradicting itself two
+    sections apart.
+    """
+    lines = [
+        "## Direct Flight Analysis",
+        "",
+        "| Destination | Airline | Price | Difference vs Cheapest Stop | Recommendation |",
+        "|---|---|---|---|---|",
+    ]
+    for analysis in analyses:
+        if analysis.cheapest_direct is not None:
+            airline = airline_string(analysis.cheapest_direct)
+            price = format_price_eur(analysis.cheapest_direct.price_eur)
+        else:
+            airline = _NO_DIRECT_ITINERARY_TEXT
+            price = _NO_DIRECT_ITINERARY_TEXT
+
+        difference = (
+            format_price_eur(analysis.price_difference)
+            if analysis.price_difference is not None
+            else _NO_DIRECT_ITINERARY_TEXT
+        )
+        recommendation = _direct_tier_recommendation_cell(analysis.tier)
+
+        lines.append(
+            f"| {analysis.destination} | {airline} | {price} | {difference} | "
+            f"{recommendation} |"
+        )
+
+    divergent = [analysis for analysis in analyses if analysis.score_policy_divergence]
+    if divergent:
+        lines.append("")
+        lines.append(
+            "**Note:** for the destination(s) below, this table's recommendation and the "
+            "ranked list's `adjusted_score` ordering disagree (finding 0.1):"
+        )
+        for analysis in divergent:
+            lines.append(f"- **{analysis.destination}:** {analysis.divergence_explanation}")
+
+    return "\n".join(lines)
+
+
 def _failed_searches_table(failed: Sequence[TaskOutcome]) -> str:
     lines = [
         "## Failed Searches",
@@ -173,6 +269,7 @@ def render_markdown_report(
     generated_at: datetime,
     data_source: DataSource = "mock",
     task_outcomes: Sequence[TaskOutcome] = (),
+    destination_analyses: Sequence[DestinationAnalysis] = (),
 ) -> str:
     """Render the full v1 Markdown report.
 
@@ -192,6 +289,12 @@ def render_markdown_report(
     non-empty. Passing nothing (the default) renders no such section at
     all, matching the ``ranked``-only call sites this function already had
     before Phase 4.
+
+    ``destination_analyses`` is one ``DestinationAnalysis`` per registry
+    destination (Phase 5, T33, D10) -- rendered as the "## Direct Flight
+    Analysis" section, ALL of them regardless of tier, whenever this
+    sequence is non-empty. Passing nothing (the default) renders no such
+    section, matching every pre-Phase-5 call site.
 
     Raises ``ValueError`` if ``ranked`` is empty: the empty/no-results
     report path is Phase 4 scope, not this task's (see module docstring).
@@ -219,6 +322,10 @@ def render_markdown_report(
     ]
     if others:
         sections.append(_other_good_options_table(others))
+        sections.append("")
+
+    if destination_analyses:
+        sections.append(_direct_flight_analysis_table(destination_analyses))
         sections.append("")
 
     if failed:
