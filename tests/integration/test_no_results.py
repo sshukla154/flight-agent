@@ -1,37 +1,39 @@
 """Integration: the NO_RESULTS/D19 contract, proved end to end through the
 real CLI (T28).
 
-Two NO_RESULTS scenarios plus a regression guard for the pre-Phase-4
-single-destination path.
+Two original NO_RESULTS scenarios, a regression guard for the pre-Phase-4
+single-destination path, and a THIRD NO_RESULTS scenario added by this
+task's own Fix 1 (see below).
 
-**A confirmed, pre-existing gap this file works around (found while
-building this test, not a hypothetical):** ``domain.run.RunEnvelope``'s own
-status validator requires ``RunStatus.NO_RESULTS`` to have at least one
-task in ``TaskState.OK``/``NO_OFFERS`` (see ``domain/run.py``'s
-``_validate_status``). If literally EVERY one of the 8 planned tasks ends
-in ``TaskState.ALL_REJECTED`` (offers existed, all were rejected by
-validation, no task ever had zero offers and no task ever errored),
-``cli.py``'s own ``_compute_run_status`` still computes a NO_RESULTS
-candidate -- but constructing the actual ``RunEnvelope`` with that status
-then raises ``pydantic.ValidationError`` from the model itself, because
-``has_successful`` (>=1 OK/NO_OFFERS task) is false. ``cli.py``'s own
-``_compute_run_status`` docstring already names this exact combination as
-"a real gap in the already-built domain model (verified empirically, not a
-hypothetical) ... flagged separately as a follow-up rather than patched
-here" -- confirmed again here by literally constructing that scenario
-against the real CLI and observing the unhandled ``ValidationError``
-(``result.exception``) instead of a clean NO_RESULTS report.
+**A previously-confirmed gap, now fixed (Fix 1):** ``domain.run.RunEnvelope``'s
+own status validator used to require ``RunStatus.NO_RESULTS`` to have at
+least one task in ``TaskState.OK``/``NO_OFFERS`` specifically (see
+``domain/run.py``'s ``_validate_status``). If literally EVERY one of the 8
+planned tasks ended in ``TaskState.ALL_REJECTED`` (offers existed, all were
+rejected by validation, no task ever had zero offers and no task ever
+errored), ``cli.py``'s own ``_compute_run_status`` still computed a
+NO_RESULTS candidate -- but constructing the actual ``RunEnvelope`` with
+that status then raised ``pydantic.ValidationError`` from the model itself,
+because ``has_successful`` (>=1 OK/NO_OFFERS task) was false even though
+every task DID get a real answer from the provider. Fixed by widening what
+is now ``domain.run._ANSWERED_STATES`` (renamed from
+``_SUCCESSFUL_STATES``) to include ``TaskState.ALL_REJECTED`` -- "the
+provider genuinely answered" is true for ALL_REJECTED just as much as for
+OK/NO_OFFERS, it just means nothing usable came of it. See
+``TestAllTasksAllRejectedNoNoOffersStillValidatesAsNoResults`` below for the
+regression test proving this against the real CLI.
 
-Both scenarios below therefore leave exactly ONE of the 8 destinations
-returning zero offers (``TaskState.NO_OFFERS``, an honest "the route
-doesn't exist" case, per D18's own cell-state table) rather than also
-rejecting it on the same rule as the other seven -- this keeps
-``has_successful`` true and the run genuinely NO_RESULTS, without
-papering over or silently avoiding the underlying gap: it is called out
-explicitly here, not hidden. The dominant rejection code is computed only
-from the SEVEN destinations that did return (and reject) an offer, and
-stays unambiguous either way (one rejection code contributes 100% of the
-tally in each scenario).
+The two ORIGINAL scenarios below still leave exactly ONE of the 8
+destinations returning zero offers (``TaskState.NO_OFFERS``, an honest "the
+route doesn't exist" case, per D18's own cell-state table) rather than also
+rejecting it on the same rule as the other seven -- kept exactly as
+originally written (not because ``has_successful``/``has_answered`` would
+fail without it anymore, but because they are still valid, independent
+NO_RESULTS scenarios worth keeping, and rewriting them to also drop the
+carve-out would lose the "dominant rejection code computed from exactly 7,
+unambiguously" property both their own comments rely on). The third
+scenario this task adds is the one case those two deliberately never
+covered: zero NO_OFFERS, ALL EIGHT destinations ALL_REJECTED.
 """
 
 from __future__ import annotations
@@ -42,6 +44,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 from typer.testing import CliRunner
 
 from flightagent.cli import (
@@ -263,6 +266,57 @@ class TestDominantRejectionOtherThanLayoverGetsAnHonestMessage:
         assert "3–6 hour layover rule" not in result.stderr
         assert "no_results" in result.stderr
         assert "destination_mismatch" in result.stderr
+
+
+class TestAllTasksAllRejectedNoNoOffersStillValidatesAsNoResults:
+    """Fix 1's own regression test: every one of the 8 destinations returns
+    exactly one offer with a 120-minute layover -- outside the [180, 360]
+    window on the short side, same as
+    ``TestLayoverTooShortIsTheSpecMessage`` above -- but here NO destination
+    is carved out as ``TaskState.NO_OFFERS``. Every single task therefore
+    ends ``TaskState.ALL_REJECTED``, and none ends ``TaskState.NO_OFFERS``.
+
+    Before Fix 1, this exact combination made ``RunEnvelope`` construction
+    raise an unhandled ``pydantic.ValidationError`` from
+    ``_validate_status`` (see this module's own docstring) -- the CLI would
+    have crashed instead of printing a clean NO_RESULTS report. Now that
+    ``domain.run._ANSWERED_STATES`` includes ``ALL_REJECTED``, this
+    constructs cleanly and prints the IDENTICAL spec JSON string as
+    ``TestLayoverTooShortIsTheSpecMessage`` (dominant rejection code is
+    still ``layover_too_short`` in both, so D19's exact-spec-string branch
+    fires either way).
+    """
+
+    def test_all_eight_destinations_all_rejected_prints_clean_no_results_json(
+        self, isolated_cwd: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # `no_offers_destination` set to a code that never matches any of
+        # the 8 registry destinations built by build_plan_for_origin, so
+        # EVERY destination gets (and rejects) an offer -- none is left at
+        # zero offers/NO_OFFERS, unlike every other scenario in this file.
+        provider = _FixedOfferProvider(layover_minutes=120, no_offers_destination="ZZZ")
+        monkeypatch.setattr("flightagent.cli._build_provider", lambda name: provider)
+
+        result = runner.invoke(app, _ALL_DESTINATIONS_ARGS)
+
+        # The real proof this is a fix, not a hypothetical: before Fix 1,
+        # ``RunEnvelope(...)`` raised ``pydantic.ValidationError`` from
+        # inside ``_run_all_destinations`` -- an unhandled exception Click's
+        # ``CliRunner`` would have captured right here as ``result.exception``
+        # (still exit code 1 either way, since Click's default exception
+        # handling and this command's own deliberate ``typer.Exit(code=1)``
+        # both land on 1 -- exit code alone can't distinguish "crashed" from
+        # "correctly reported NO_RESULTS", only the exception object and the
+        # actual stdout content can).
+        assert not isinstance(result.exception, ValidationError), result.exception
+        assert result.exit_code == NO_VALID_ITINERARIES_EXIT_CODE, result.output
+        assert not (isolated_cwd / "out").exists()
+
+        expected = json.dumps(
+            {"status": "no_results", "message": _SPEC_NO_RESULTS_MESSAGE}, ensure_ascii=False
+        )
+        assert result.stdout.strip() == expected
+        assert "3–6 hour layover rule" in result.stdout
 
 
 class TestSingleDestinationRegressionGuard:

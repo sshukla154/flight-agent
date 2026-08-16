@@ -66,8 +66,10 @@ from __future__ import annotations
 import asyncio
 import importlib.metadata
 import json
+import logging
 import socket
 import sys
+from collections.abc import Sequence
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from typing import Annotated
@@ -95,6 +97,7 @@ from flightagent.providers.mock.generator import compute_seed
 from flightagent.providers.mock.provider import MockProvider
 from flightagent.reporting.json_report import build_results_document
 from flightagent.reporting.markdown import render_markdown_report
+from flightagent.reporting.view import last_segment
 from flightagent.reporting.writer import write_report_artifacts
 from flightagent.scoring.ranking import rank_itineraries
 from flightagent.scoring.score import score_itinerary
@@ -377,6 +380,55 @@ def _dominant_rejection_code(task_outcomes: tuple[TaskOutcome, ...]) -> Rejectio
     return max(totals.items(), key=lambda item: (item[1], item[0].value))[0]
 
 
+def _warn_on_truncated_destinations(
+    scored_itineraries: Sequence[ScoredItinerary], ranked: Sequence[ScoredItinerary]
+) -> None:
+    """Non-blocking gap mitigation (Phase 4 fix, D15's ``top_n_global`` cut):
+    when the global top-N truncation discards EVERY accepted itinerary for
+    a destination that had >=1 valid, accepted itinerary before truncation,
+    that destination becomes indistinguishable in the final report from one
+    that was never searched at all.
+
+    This does NOT fix that visibility gap -- full per-destination
+    visibility (an "Origin Comparison"/"Direct Flight Analysis" section) is
+    genuinely Phase 5/6 scope, per ``reporting.markdown``'s own docstring.
+    It only makes the gap OBSERVABLE in logs rather than completely silent,
+    consistent with this project's repeated "never silently discard"
+    principle: one ``EventName.RANK_DESTINATION_DROPPED`` WARNING-level
+    event, naming every destination whose itineraries were entirely cut
+    plus the total-accepted-vs-shown counts for the whole batch, is emitted
+    when (and only when) at least one destination was fully dropped.
+
+    ``scored_itineraries`` is the full, pre-truncation set; ``ranked`` is
+    ``rank_itineraries``'s already-truncated output. Both are keyed by each
+    itinerary's arrival airport (``reporting.view.last_segment``), the same
+    "destination" every other per-destination view in this codebase (e.g.
+    ``json_report``'s ``destination`` field) already uses.
+    """
+    total_by_destination: dict[str, int] = {}
+    for item in scored_itineraries:
+        destination = last_segment(item.itinerary).destination
+        total_by_destination[destination] = total_by_destination.get(destination, 0) + 1
+
+    shown_destinations = {last_segment(item.itinerary).destination for item in ranked}
+
+    dropped = sorted(
+        destination
+        for destination in total_by_destination
+        if destination not in shown_destinations
+    )
+    if not dropped:
+        return
+
+    log_event(
+        EventName.RANK_DESTINATION_DROPPED,
+        level=logging.WARNING,
+        destinations=dropped,
+        total_accepted=len(scored_itineraries),
+        shown_count=len(ranked),
+    )
+
+
 def _compute_run_status(task_outcomes: tuple[TaskOutcome, ...]) -> RunStatus:
     """Mirror ``RunEnvelope``'s own status validator (domain/run.py) so the
     candidate status handed to its constructor is already consistent by
@@ -389,19 +441,16 @@ def _compute_run_status(task_outcomes: tuple[TaskOutcome, ...]) -> RunStatus:
     - 0 accepted, every task in an error state: FAILED.
     - 0 accepted, otherwise: NO_RESULTS.
 
-    One combination this mirror (deliberately) cannot paper over: a batch
-    where EVERY task ends in ``ALL_REJECTED`` with no task in
-    ``NO_OFFERS`` and no task in an error state. ``RunEnvelope``'s own
-    validator requires NO_RESULTS to have >=1 task in ``OK``/``NO_OFFERS``
-    specifically (domain/run.py), which no task in that exact combination
-    satisfies -- constructing ``RunEnvelope`` with the ``NO_RESULTS``
-    guess below would then raise ``pydantic.ValidationError`` from the
-    model itself. That is a real gap in the already-built domain model
-    (verified empirically, not a hypothetical), not something this
-    function should route around by inventing a fifth status or silently
-    reclassifying ``ALL_REJECTED`` as "successful" -- flagged separately as
-    a follow-up rather than patched here, since widening ``domain.run``'s
-    private state sets is out of this task's scope.
+    A batch where EVERY task ends in ``ALL_REJECTED`` (no task in
+    ``NO_OFFERS``, no task in an error state) is exactly this last
+    NO_RESULTS branch, and constructs cleanly: ``RunEnvelope``'s own
+    validator now requires NO_RESULTS to have >=1 task in
+    ``OK``/``NO_OFFERS``/``ALL_REJECTED`` (``domain.run._ANSWERED_STATES``),
+    not ``OK``/``NO_OFFERS`` alone -- previously ``ALL_REJECTED`` was
+    excluded from that set, which made this exact all-``ALL_REJECTED``
+    combination raise ``pydantic.ValidationError`` from the model itself
+    instead of validating as NO_RESULTS. Fixed in domain/run.py; this
+    docstring no longer describes a gap.
     """
     total_accepted = sum(outcome.accepted_count for outcome in task_outcomes)
     has_errors = any(outcome.state in _TASK_ERROR_STATES for outcome in task_outcomes)
@@ -508,6 +557,7 @@ def _run_all_destinations(
         for itinerary in deduplicated_itineraries
     ]
     ranked = rank_itineraries(scored_itineraries, top_n=settings.output.top_n_global)
+    _warn_on_truncated_destinations(scored_itineraries, ranked)
     accepted_count = len(scored_itineraries)
 
     dominant_code = _dominant_rejection_code(final_task_outcomes)

@@ -150,7 +150,18 @@ class RunMeta(BaseModel):
 
 
 _ERROR_STATES = frozenset({TaskState.PROVIDER_ERROR, TaskState.RATE_LIMITED, TaskState.TIMEOUT})
-_SUCCESSFUL_STATES = frozenset({TaskState.OK, TaskState.NO_OFFERS})
+_ANSWERED_STATES = frozenset({TaskState.OK, TaskState.NO_OFFERS, TaskState.ALL_REJECTED})
+"""Every terminal state in which the provider call itself did NOT fail --
+as opposed to ``_ERROR_STATES``, which means the provider call failed.
+``ALL_REJECTED`` (offers existed, every one failed post-hoc validation) is
+just as much "the provider genuinely answered" as ``OK``/``NO_OFFERS`` --
+this set is deliberately about whether a task got a real answer, never
+about whether that answer contained anything usable. Renamed from
+``_SUCCESSFUL_STATES`` (this task's fix): a batch where every task lands in
+``ALL_REJECTED`` is a real, plausible production scenario (e.g. a
+misconfigured layover window rejecting every offer uniformly) and must
+validate as ``RunStatus.NO_RESULTS``, not raise ``pydantic.ValidationError``
+from this very validator -- see ``_validate_status`` below."""
 
 
 class RunEnvelope(BaseModel):
@@ -163,7 +174,9 @@ class RunEnvelope(BaseModel):
 
     - COMPLETE: no error-state tasks, >=1 accepted itinerary.
     - PARTIAL: >=1 error-state task, >=1 accepted itinerary.
-    - NO_RESULTS: 0 accepted, >=1 task in OK/NO_OFFERS.
+    - NO_RESULTS: 0 accepted, >=1 task in OK/NO_OFFERS/ALL_REJECTED (i.e.
+      >=1 task the provider actually answered, whether or not anything
+      usable came of it -- see ``_ANSWERED_STATES``).
     - FAILED: 0 accepted, every task errored.
     """
 
@@ -181,7 +194,7 @@ class RunEnvelope(BaseModel):
         total_accepted = sum(outcome.accepted_count for outcome in self.task_outcomes)
         has_errors = any(outcome.state in _ERROR_STATES for outcome in self.task_outcomes)
         all_errored = all(outcome.state in _ERROR_STATES for outcome in self.task_outcomes)
-        has_successful = any(outcome.state in _SUCCESSFUL_STATES for outcome in self.task_outcomes)
+        has_answered = any(outcome.state in _ANSWERED_STATES for outcome in self.task_outcomes)
 
         if self.status == RunStatus.COMPLETE:
             if has_errors or total_accepted < 1:
@@ -196,10 +209,11 @@ class RunEnvelope(BaseModel):
                     "itinerary (finding 0.5)"
                 )
         elif self.status == RunStatus.NO_RESULTS:
-            if total_accepted != 0 or not has_successful:
+            if total_accepted != 0 or not has_answered:
                 raise ValueError(
                     "status NO_RESULTS requires zero accepted itineraries and >=1 "
-                    "OK/NO_OFFERS task (finding 0.5)"
+                    "OK/NO_OFFERS/ALL_REJECTED task -- i.e. >=1 task the provider actually "
+                    "answered (finding 0.5)"
                 )
         elif self.status == RunStatus.FAILED:
             if total_accepted != 0 or not all_errored:
