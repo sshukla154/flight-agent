@@ -19,10 +19,24 @@ and later integration tests (T28) need:
    This is what lets a retry test say "fail twice, then succeed" and a
    partial-failure test say "always fails", per destination, independent
    of every other destination in the same run.
+
+T28: an optional ``call_delay_seconds`` constructor knob (default ``0.0``,
+so every T25 call site above is unaffected) makes concurrent overlap
+actually observable end to end through the real CLI. Without it, a call
+that never awaits anything runs to completion atomically before the event
+loop ever switches to a sibling task -- the same reasoning
+``tests/unit/test_orchestrator.py``'s own inline ``_ConcurrencyTrackingProvider``
+already documents for the executor-level peak-concurrency test; this just
+gives the SHARED double the identical capability so an integration test can
+assert peak concurrency against ``InstrumentedProvider``'s own call log
+instead of a second, throwaway fake. The delay is placed between the
+in-flight increment and decrement (not before either), so it is the window
+``peak_in_flight`` measures that actually widens, not some window outside it.
 """
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -115,12 +129,14 @@ class InstrumentedProvider:
         *,
         scripts: dict[str, list[ScriptStep]] | None = None,
         provider_name: str = "instrumented",
+        call_delay_seconds: float = 0.0,
     ) -> None:
         self._scripts: dict[str, tuple[ScriptStep, ...]] = {
             destination: tuple(steps) for destination, steps in (scripts or {}).items()
         }
         self._call_counts: dict[str, int] = {}
         self._provider_name = provider_name
+        self._call_delay_seconds = call_delay_seconds
         self.call_log: list[CallRecord] = []
         self._in_flight = 0
         self.peak_in_flight = 0
@@ -149,6 +165,15 @@ class InstrumentedProvider:
         self._in_flight += 1
         self.peak_in_flight = max(self.peak_in_flight, self._in_flight)
         try:
+            if self._call_delay_seconds > 0:
+                # Deliberately INSIDE the try/finally, between the
+                # increment and decrement above/below -- see the module
+                # docstring's T28 note. Sleeping here, not before the
+                # increment, is what lets every concurrently-dispatched
+                # call actually overlap in ``peak_in_flight`` instead of
+                # each one running to completion atomically before the
+                # event loop ever switches to a sibling task.
+                await asyncio.sleep(self._call_delay_seconds)
             destination = request.destination
             call_index = self._call_counts.get(destination, 0)
             self._call_counts[destination] = call_index + 1
