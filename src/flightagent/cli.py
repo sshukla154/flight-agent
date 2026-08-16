@@ -64,6 +64,9 @@ rejection breakdown is queryable from logs even on the zero-valid exit path.
 from __future__ import annotations
 
 import asyncio
+import importlib.metadata
+import json
+import socket
 import sys
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
@@ -71,16 +74,21 @@ from typing import Annotated
 
 import typer
 
-from flightagent.config.loader import load_config
-from flightagent.domain.enums import CabinClass, StopMode
+from flightagent.config.loader import compute_config_digest, load_config
+from flightagent.config.models import FlightAgentSettings
+from flightagent.domain.enums import CabinClass, RejectionCode, RunStatus, StopMode, TaskState
+from flightagent.domain.ids import generate_run_id
 from flightagent.domain.itinerary import NormalizedItinerary, RawOffer
-from flightagent.domain.run import SearchRequest
+from flightagent.domain.run import _ERROR_STATES as _TASK_ERROR_STATES
+from flightagent.domain.run import RunEnvelope, RunMeta, SearchRequest, TaskOutcome
 from flightagent.domain.scoring import ScoredItinerary
 from flightagent.domain.validation import ValidationResult
 from flightagent.normalize.builder import build_normalized_itinerary
 from flightagent.normalize.dedup import deduplicate
 from flightagent.observability.events import EventName
 from flightagent.observability.logging import log_event, setup_logging
+from flightagent.orchestration.executor import execute_plan
+from flightagent.orchestration.plan import build_plan_for_origin
 from flightagent.providers.base import CallBudget, FlightProvider
 from flightagent.providers.errors import ProviderNotConfigured
 from flightagent.providers.mock.generator import compute_seed
@@ -100,10 +108,43 @@ app = typer.Typer(
 )
 
 NO_VALID_ITINERARIES_EXIT_CODE = 1
-"""Exit code when zero itineraries survived validation. A placeholder
-single value, not Phase 4's full ``RunStatus``-derived exit-code table
-(finding 0.5) -- this task only has to get "zero valid == nonzero exit"
-right, not the full NO_RESULTS-vs-FAILED distinction."""
+"""Exit code when zero itineraries survived validation.
+
+T27 (Phase 4's full ``RunStatus``-derived exit-code table, finding 0.5)
+reuses this SAME value for ``--all-destinations``'s ``RunStatus.NO_RESULTS``
+branch -- both mean exactly the same thing to a caller ("nothing valid was
+found"), just reached via two different pipelines (single-destination vs
+the full fan-out). ``ALL_DESTINATIONS_FAILED_EXIT_CODE`` below is
+deliberately a THIRD, distinct value for ``RunStatus.FAILED`` -- finding
+0.5's whole point is that "nothing validated" and "the provider was down"
+must never look identical to a caller inspecting only the exit code.
+"""
+
+ALL_DESTINATIONS_FAILED_EXIT_CODE = 3
+"""Exit code for ``--all-destinations``'s ``RunStatus.FAILED`` branch --
+every planned task ended in an error state, zero accepted. Deliberately
+skips ``2`` (Click/Typer's own reserved usage-error exit code, e.g. a
+``typer.BadParameter`` raised by this module's own CLI validation) so a
+usage mistake and a fully-failed search are never confusable by exit code
+alone, and deliberately distinct from ``NO_VALID_ITINERARIES_EXIT_CODE``
+per this module's own docstring above.
+"""
+
+_LAYOVER_REJECTION_CODES = frozenset(
+    {RejectionCode.LAYOVER_TOO_SHORT, RejectionCode.LAYOVER_TOO_LONG}
+)
+"""D19: the only two ``RejectionCode`` values for which the spec's exact
+hardcoded ``no_results`` string is honest. Any other dominant rejection
+reason under ``RunStatus.NO_RESULTS`` gets an accurate message naming the
+real cause instead (finding 0.5)."""
+
+_SPEC_NO_RESULTS_MESSAGE = "No itinerary satisfied the 3–6 hour layover rule."
+"""The ORIGINAL spec's own exact hardcoded string (section 9), reproduced
+verbatim -- DECISIONS.md D19 and the master plan both quote this exact
+sentence, en dash included. Printed only when ``RunStatus.NO_RESULTS`` AND
+the dominant rejection code is a layover violation (D19) -- never
+unconditionally, which is exactly finding 0.5's complaint about the
+original spec."""
 
 _DEFAULT_ADULTS = 1
 """D3: 1 adult, 0 children, 0 infants -- not a CLI flag, the spec takes no
@@ -262,13 +303,315 @@ def _normalize_and_validate(
     return valid_itineraries, validation_results
 
 
+def _to_rejection_code_counts(raw: dict[str, int]) -> dict[RejectionCode, int]:
+    """Convert ``summarize_validation_results``'s ``dict[str, int]`` (keyed
+    by the plain ``RejectionCode.value`` string, matching
+    ``observability.events.ValidateCompletedFields``'s own schema) into the
+    ``dict[RejectionCode, int]`` shape ``TaskOutcome.rejection_counts``
+    (domain/run.py) is actually typed as.
+
+    This conversion has to happen explicitly: ``TaskOutcome`` is frozen and
+    gets finalized here via ``model_copy``, which -- per
+    ``normalize.dedup``'s own docstring on the identical point -- does NOT
+    re-run pydantic validators. Handing ``model_copy`` a plain string-keyed
+    dict would silently leave the finalized ``TaskOutcome`` holding
+    ``str`` keys instead of ``RejectionCode`` members, which still happens
+    to compare equal (``RejectionCode`` is a ``StrEnum``) but breaks the
+    first real attribute access that assumes an actual enum member (e.g.
+    ``RejectionCode.value``, used by ``_dominant_rejection_code`` below).
+    """
+    return {RejectionCode(code): count for code, count in raw.items()}
+
+
+def _finalize_task_outcome(
+    outcome: TaskOutcome, *, accepted_count: int, rejection_counts: dict[RejectionCode, int]
+) -> TaskOutcome:
+    """Finalize one executor-produced, provisional ``TaskOutcome`` (T24/T25)
+    with the REAL ``accepted_count``/``rejection_counts`` this CLI layer
+    just computed by running that task's offers through normalize+validate.
+
+    T27's own upgrade rule: a task the executor left in ``TaskState.OK``
+    ("the provider answered with offers") whose real ``accepted_count``
+    came back ``0`` is upgraded to ``TaskState.ALL_REJECTED`` -- offers
+    existed but every one failed validation, a genuinely different
+    situation from ``TaskState.NO_OFFERS`` (the provider had nothing to
+    offer at all). Every other state (``NO_OFFERS``, the three error
+    states) is left exactly as the executor produced it -- this function is
+    only ever called for ``OK`` tasks in practice (see ``_run_all_destinations``),
+    but is written to be a safe no-op-on-state for any other input too.
+    """
+    upgrade = outcome.state == TaskState.OK and accepted_count == 0
+    state = TaskState.ALL_REJECTED if upgrade else outcome.state
+    return outcome.model_copy(
+        update={
+            "state": state,
+            "accepted_count": accepted_count,
+            "rejection_counts": rejection_counts,
+        }
+    )
+
+
+def _dominant_rejection_code(task_outcomes: tuple[TaskOutcome, ...]) -> RejectionCode | None:
+    """D19: the single most frequent ``RejectionCode`` across every task's
+    ``rejection_counts``, combined -- a plain function over already-modeled
+    data, computed here at the CLI layer rather than stored on
+    ``RunEnvelope`` itself (see D19's own rationale in DECISIONS.md: a
+    ``RunEnvelope`` field would force every constructor to compute this
+    even when the status is COMPLETE/PARTIAL, where it is meaningless).
+
+    Returns ``None`` when no task carries any rejection at all (e.g. every
+    task is ``NO_OFFERS`` or already in an error state) -- there is no
+    "dominant" reason among zero rejections.
+
+    Ties are broken by the code's own string value, descending -- a
+    deterministic function of the counts alone, never of task processing
+    order (which, under the executor's concurrent fan-out, is not
+    reproducible run-to-run).
+    """
+    totals: dict[RejectionCode, int] = {}
+    for outcome in task_outcomes:
+        for code, count in outcome.rejection_counts.items():
+            totals[code] = totals.get(code, 0) + count
+    if not totals:
+        return None
+    return max(totals.items(), key=lambda item: (item[1], item[0].value))[0]
+
+
+def _compute_run_status(task_outcomes: tuple[TaskOutcome, ...]) -> RunStatus:
+    """Mirror ``RunEnvelope``'s own status validator (domain/run.py) so the
+    candidate status handed to its constructor is already consistent by
+    that validator's own logic -- per this task's explicit instruction not
+    to compute a status independently and then try to force an
+    inconsistent one past it.
+
+    - >=1 accepted itinerary anywhere: COMPLETE (no error-state task) or
+      PARTIAL (>=1 error-state task).
+    - 0 accepted, every task in an error state: FAILED.
+    - 0 accepted, otherwise: NO_RESULTS.
+
+    One combination this mirror (deliberately) cannot paper over: a batch
+    where EVERY task ends in ``ALL_REJECTED`` with no task in
+    ``NO_OFFERS`` and no task in an error state. ``RunEnvelope``'s own
+    validator requires NO_RESULTS to have >=1 task in ``OK``/``NO_OFFERS``
+    specifically (domain/run.py), which no task in that exact combination
+    satisfies -- constructing ``RunEnvelope`` with the ``NO_RESULTS``
+    guess below would then raise ``pydantic.ValidationError`` from the
+    model itself. That is a real gap in the already-built domain model
+    (verified empirically, not a hypothetical), not something this
+    function should route around by inventing a fifth status or silently
+    reclassifying ``ALL_REJECTED`` as "successful" -- flagged separately as
+    a follow-up rather than patched here, since widening ``domain.run``'s
+    private state sets is out of this task's scope.
+    """
+    total_accepted = sum(outcome.accepted_count for outcome in task_outcomes)
+    has_errors = any(outcome.state in _TASK_ERROR_STATES for outcome in task_outcomes)
+    all_errored = all(outcome.state in _TASK_ERROR_STATES for outcome in task_outcomes)
+
+    if total_accepted >= 1:
+        return RunStatus.PARTIAL if has_errors else RunStatus.COMPLETE
+    if all_errored:
+        return RunStatus.FAILED
+    return RunStatus.NO_RESULTS
+
+
+def _tzdata_version() -> str:
+    """The installed ``tzdata`` PyPI package's own version.
+
+    Not an IANA tzdata release identifier (e.g. ``"2026a"``) -- there is no
+    stdlib API exposing that string. This project's tz database source IS
+    exactly the pinned PyPI package (``pyproject.toml``: ``tzdata>=2026a``),
+    so that package's own installed version is the honest, actually-available
+    answer to "which tz database is this process using", not a compromise
+    standing in for a real one.
+    """
+    return importlib.metadata.version("tzdata")
+
+
+def _run_all_destinations(
+    *,
+    origin: str,
+    departure_date: date,
+    stop_mode: StopMode,
+    provider_instance: FlightProvider,
+    settings: FlightAgentSettings,
+) -> None:
+    """``--all-destinations``: search ``origin`` against every registry
+    destination, finalize the task ledger, and render the no_results/
+    PARTIAL/FAILED status contract (T27, finding 0.5, D19).
+
+    Pipeline: ``orchestration.plan.build_plan_for_origin`` (T24) ->
+    ``orchestration.executor.execute_plan`` (T24/T25, retry already wired
+    in) -> per successful task, this module's own ``_normalize_and_validate``
+    (reused unchanged) -> finalize every ``TaskOutcome`` (T27's own
+    OK-with-zero-accepted -> ALL_REJECTED upgrade) -> dedup the COMBINED
+    valid itineraries across every destination (T20) -> score (T13) ->
+    rank (T14) -> construct a ``RunEnvelope`` and branch on its
+    ``RunStatus`` (finding 0.5).
+
+    Never raises a bare pydantic error for the ordinary cases (COMPLETE,
+    PARTIAL, NO_RESULTS, FAILED) -- see ``_compute_run_status`` for the one
+    degenerate task-ledger shape this candidate-status mirror cannot
+    always satisfy.
+    """
+    started_at = datetime.now(UTC)
+
+    origin_code = origin.upper()
+    tasks = build_plan_for_origin(
+        origin_code, departure_date=departure_date, max_stops=stop_mode, settings=settings
+    )
+    execution_results = asyncio.run(execute_plan(tasks, provider_instance, settings=settings))
+
+    finalized_outcomes: list[TaskOutcome] = []
+    combined_valid_itineraries: list[NormalizedItinerary] = []
+
+    for task, execution_result in zip(tasks, execution_results, strict=True):
+        outcome = execution_result.outcome
+        if outcome.state != TaskState.OK:
+            # NO_OFFERS / an error state: no offers exist to normalize or
+            # validate, and accepted_count/rejection_counts are already
+            # 0/{} from the executor -- nothing to finalize.
+            finalized_outcomes.append(outcome)
+            continue
+
+        as_of = _deterministic_as_of(task.request)
+        valid_itineraries, validation_results = _normalize_and_validate(
+            task.request, execution_result.offers, as_of=as_of
+        )
+        raw_accepted_count, raw_rejection_counts = summarize_validation_results(validation_results)
+        log_event(
+            EventName.VALIDATE_COMPLETED,
+            accepted_count=raw_accepted_count,
+            rejection_counts=raw_rejection_counts,
+        )
+        finalized_outcomes.append(
+            _finalize_task_outcome(
+                outcome,
+                accepted_count=raw_accepted_count,
+                rejection_counts=_to_rejection_code_counts(raw_rejection_counts),
+            )
+        )
+        combined_valid_itineraries.extend(valid_itineraries)
+
+    final_task_outcomes = tuple(finalized_outcomes)
+
+    deduplicated_itineraries = deduplicate(combined_valid_itineraries)
+    scored_itineraries = [
+        ScoredItinerary(
+            itinerary=itinerary,
+            components=score_itinerary(
+                itinerary, scoring_settings=settings.scoring, layover_settings=settings.layover
+            ),
+            rank_by_adjusted_score=1,
+            rank_by_total_journey_score=1,
+            rank_by_price=1,
+        )
+        for itinerary in deduplicated_itineraries
+    ]
+    ranked = rank_itineraries(scored_itineraries, top_n=settings.output.top_n_global)
+    accepted_count = len(scored_itineraries)
+
+    dominant_code = _dominant_rejection_code(final_task_outcomes)
+    status = _compute_run_status(final_task_outcomes)
+
+    completed_at = datetime.now(UTC)
+    duration_ms = int((completed_at - started_at).total_seconds() * 1000)
+
+    run_meta = RunMeta(
+        run_id=generate_run_id(),
+        started_at=started_at,
+        completed_at=completed_at,
+        duration_ms=duration_ms,
+        host=socket.gethostname(),
+    )
+    envelope = RunEnvelope(
+        run_meta=run_meta,
+        status=status,
+        task_outcomes=final_task_outcomes,
+        config_digest=compute_config_digest(settings),
+        tzdata_version=_tzdata_version(),
+    )
+
+    destination_count = len(tasks)
+
+    if envelope.status in (RunStatus.COMPLETE, RunStatus.PARTIAL):
+        # T26's Failed Searches section reads task_outcomes itself: it
+        # naturally renders for PARTIAL (>=1 error-state task) and stays
+        # empty for COMPLETE (zero error-state tasks) -- no branching
+        # needed here beyond passing final_task_outcomes through.
+        generated_at = _deterministic_as_of(tasks[0].request)
+        markdown = render_markdown_report(
+            ranked,
+            departure_date=departure_date,
+            accepted_count=accepted_count,
+            generated_at=generated_at,
+            data_source="mock",
+            task_outcomes=final_task_outcomes,
+        )
+        json_document = build_results_document(
+            ranked,
+            departure_date=departure_date,
+            accepted_count=accepted_count,
+            top_n=settings.output.top_n_global,
+            generated_at=generated_at,
+            data_source="mock",
+            task_outcomes=final_task_outcomes,
+        )
+        report_path, results_path = write_report_artifacts(
+            markdown=markdown,
+            json_data=json_document,
+            report_path=Path(settings.output.report_path),
+            results_path=Path(settings.output.results_path),
+        )
+        typer.echo(
+            f"flightagent: {envelope.status.value} -- {accepted_count} valid itinerary(ies) "
+            f"across {destination_count} destination(s) from {origin_code} on "
+            f"{departure_date.isoformat()}; wrote {report_path} and {results_path}"
+        )
+        log_event(EventName.RUN_COMPLETED, status=envelope.status.value, duration_ms=duration_ms)
+        return
+
+    if envelope.status == RunStatus.NO_RESULTS:
+        if dominant_code in _LAYOVER_REJECTION_CODES:
+            # D19 / spec section 9: the ORIGINAL spec's exact hardcoded
+            # string, verbatim, and ONLY here -- the one dominant-code case
+            # where it happens to be true.
+            typer.echo(
+                json.dumps(
+                    {"status": "no_results", "message": _SPEC_NO_RESULTS_MESSAGE},
+                    ensure_ascii=False,
+                )
+            )
+        else:
+            reason = dominant_code.value if dominant_code is not None else "no valid offers found"
+            typer.echo(
+                f"flightagent: no_results -- 0 valid itinerary(ies) across "
+                f"{destination_count} destination(s) from {origin_code} on "
+                f"{departure_date.isoformat()} -- dominant rejection reason: {reason}. "
+                f"No report written.",
+                err=True,
+            )
+        log_event(EventName.RUN_COMPLETED, status=envelope.status.value, duration_ms=duration_ms)
+        raise typer.Exit(code=NO_VALID_ITINERARIES_EXIT_CODE)
+
+    # RunStatus.FAILED: every task errored, zero accepted -- finding 0.5's
+    # own case the original spec omitted entirely. Must never read like
+    # NO_RESULTS's message (that is finding 0.5's whole point): distinct
+    # wording, distinct exit code.
+    typer.echo(
+        f"flightagent: failed -- every search for {origin_code} across "
+        f"{destination_count} destination(s) on {departure_date.isoformat()} errored; "
+        f"the provider was unreachable (or every attempt otherwise failed), not merely "
+        f"short of valid itineraries. No report written.",
+        err=True,
+    )
+    log_event(EventName.RUN_COMPLETED, status=envelope.status.value, duration_ms=duration_ms)
+    raise typer.Exit(code=ALL_DESTINATIONS_FAILED_EXIT_CODE)
+
+
 @app.command()
 def run(
     origin: Annotated[
         str, typer.Option("--origin", help="Origin IATA airport code, e.g. AMS.")
-    ],
-    dest: Annotated[
-        str, typer.Option("--dest", help="Destination IATA airport code, e.g. DEL.")
     ],
     date_str: Annotated[
         str, typer.Option("--date", help="Departure date, ISO format YYYY-MM-DD.")
@@ -282,23 +625,55 @@ def run(
             help="Maximum stops: 0 (direct only) or 1 (at most one stop, D13).",
         ),
     ],
+    dest: Annotated[
+        str | None,
+        typer.Option(
+            "--dest",
+            help="Destination IATA airport code, e.g. DEL. Required unless --all-destinations "
+            "is given; mutually exclusive with it.",
+        ),
+    ] = None,
     provider: Annotated[
         str,
         typer.Option("--provider", help="Provider to search. Only 'mock' works in Phase 2."),
     ] = "mock",
+    all_destinations: Annotated[
+        bool,
+        typer.Option(
+            "--all-destinations",
+            help="Search --origin against all 8 registry destinations at once (T27) instead "
+            "of a single --dest. Mutually exclusive with --dest.",
+        ),
+    ] = False,
 ) -> None:
-    """Search, validate, dedup, score, rank, and report one origin/destination pair.
+    """Search, validate, dedup, score, rank, and report -- either one
+    origin/destination pair (the default) or, with ``--all-destinations``,
+    ``--origin`` against every registry destination at once (T27).
 
-    Pipeline (in order): build a ``SearchRequest`` -> ``MockProvider.search()``
-    (T10) -> normalize every offer (T11) -> validate every itinerary,
-    keeping only the valid ones (T12) -> deduplicate by itinerary shape key
-    (T20) -> score (T13) -> rank (T14) -> write both artifacts (T15). Exits
-    ``0`` only if at least one itinerary validated and both artifacts were
-    written; exits ``NO_VALID_ITINERARIES_EXIT_CODE`` if zero itineraries
-    validated, writing nothing to ``out/``. Dedup runs on the
-    already-valid set and can only ever reduce or preserve its size, never
-    turn a zero-valid outcome into a non-zero one or vice versa.
+    Single-destination pipeline (in order, unchanged since Phase 2): build a
+    ``SearchRequest`` -> ``MockProvider.search()`` (T10) -> normalize every
+    offer (T11) -> validate every itinerary, keeping only the valid ones
+    (T12) -> deduplicate by itinerary shape key (T20) -> score (T13) -> rank
+    (T14) -> write both artifacts (T15). Exits ``0`` only if at least one
+    itinerary validated and both artifacts were written; exits
+    ``NO_VALID_ITINERARIES_EXIT_CODE`` if zero itineraries validated,
+    writing nothing to ``out/``. Dedup runs on the already-valid set and can
+    only ever reduce or preserve its size, never turn a zero-valid outcome
+    into a non-zero one or vice versa.
+
+    ``--all-destinations`` pipeline: see ``_run_all_destinations``'s own
+    docstring for the fan-out/finalize/status-branch contract (finding 0.5,
+    D19). Exactly one of ``--dest``/``--all-destinations`` must be given --
+    both or neither raises ``typer.BadParameter`` (a clean CLI usage error,
+    exit code 2) rather than either silently ignoring one or guessing.
     """
+    if all_destinations and dest is not None:
+        raise typer.BadParameter(
+            "--dest and --all-destinations are mutually exclusive -- give exactly one."
+        )
+    if not all_destinations and dest is None:
+        raise typer.BadParameter("--dest is required unless --all-destinations is given.")
+
     # Resolve the provider FIRST -- a bad --provider value must fail before
     # any config is loaded or any (deterministic, harmless) mock work runs.
     provider_instance = _build_provider(provider)
@@ -306,6 +681,22 @@ def run(
     settings = load_config()
     departure_date = _parse_departure_date(date_str)
     stop_mode = _to_stop_mode(max_stops)
+
+    if all_destinations:
+        _run_all_destinations(
+            origin=origin,
+            departure_date=departure_date,
+            stop_mode=stop_mode,
+            provider_instance=provider_instance,
+            settings=settings,
+        )
+        return
+
+    # Narrows `dest: str | None` -> `str` for every line below: the guard
+    # above already raised if `dest` were `None` here (this line is only
+    # ever reached when `all_destinations` is False), but mypy cannot trace
+    # that cross-branch invariant on its own.
+    assert dest is not None
 
     request = SearchRequest(
         origin=origin.upper(),

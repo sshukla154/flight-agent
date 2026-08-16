@@ -34,6 +34,7 @@ import typer
 from typer.testing import CliRunner
 
 from flightagent.cli import (
+    ALL_DESTINATIONS_FAILED_EXIT_CODE,
     NO_VALID_ITINERARIES_EXIT_CODE,
     _deterministic_as_of,
     _parse_departure_date,
@@ -43,9 +44,30 @@ from flightagent.cli import (
 )
 from flightagent.domain.enums import CabinClass
 from flightagent.domain.run import SearchRequest
-from flightagent.providers.errors import ProviderConfigError, ProviderNotConfigured
+from flightagent.providers.errors import (
+    ProviderConfigError,
+    ProviderNotConfigured,
+    ProviderTimeoutError,
+)
+from tests.support.instrumented_provider import Fail, InstrumentedProvider, Succeed
 
 runner = CliRunner()
+
+# The 8 registered destinations, per airports.registry -- matching
+# tests/unit/test_retry.py's own constant, so a script keyed by this tuple
+# covers every task the planner builds for a single origin.
+_ALL_8_DESTINATIONS = ("DEL", "BOM", "BLR", "HYD", "MAA", "CCU", "LKO", "VNS")
+
+_ALL_DESTINATIONS_ARGS = [
+    "run",
+    "--origin",
+    "AMS",
+    "--date",
+    "2027-07-17",
+    "--max-stops",
+    "1",
+    "--all-destinations",
+]
 
 _TARGET_ARGS = [
     "run",
@@ -245,3 +267,113 @@ class TestHelperFunctions:
         )
         as_of = _deterministic_as_of(request)
         assert as_of.date() < request.departure_date
+
+
+class TestAllDestinationsCliValidation:
+    """T27: exactly one of ``--dest``/``--all-destinations`` must be given
+    -- both, or neither, is a ``typer.BadParameter`` usage error (exit code
+    2), never a silent ambiguity resolved in either flag's favour.
+    """
+
+    def test_both_dest_and_all_destinations_is_rejected(self, isolated_cwd: Path) -> None:
+        args = [*_ALL_DESTINATIONS_ARGS, "--dest", "DEL"]
+        result = runner.invoke(app, args)
+
+        assert result.exit_code == 2, result.output
+        assert "mutually exclusive" in result.output
+        assert not (isolated_cwd / "out").exists()
+
+    def test_neither_dest_nor_all_destinations_is_rejected(self, isolated_cwd: Path) -> None:
+        args = [arg for arg in _ALL_DESTINATIONS_ARGS if arg != "--all-destinations"]
+        result = runner.invoke(app, args)
+
+        assert result.exit_code == 2, result.output
+        assert "required" in result.output
+        assert not (isolated_cwd / "out").exists()
+
+
+class TestAllDestinationsSucceeds:
+    """T27: ``--all-destinations`` fans ``--origin`` out across every
+    registry destination. Proved here with T25's own ``InstrumentedProvider``
+    test double, scripted to succeed everywhere, via ``_build_provider``
+    monkeypatched to hand back that instrumented instance for
+    ``--provider mock`` -- exactly the same substitution pattern
+    ``test_retry.py`` uses for the executor, applied one layer up at the
+    CLI.
+    """
+
+    def _succeeding_provider(self) -> InstrumentedProvider:
+        # offer_count=2 exactly matches how many offers MockProvider's own
+        # generator returns for these request shapes (verified against the
+        # real target invocation) -- this double's offers are the SAME
+        # deterministic ``generate_offers`` output, not a hand-rolled stub,
+        # so "succeeds for all 8 destinations" here means the identical
+        # thing it would mean running the real mock provider directly.
+        return InstrumentedProvider(
+            scripts={destination: [Succeed(offer_count=2)] for destination in _ALL_8_DESTINATIONS}
+        )
+
+    def test_issues_exactly_8_provider_calls_and_writes_both_artifacts(
+        self, isolated_cwd: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        provider = self._succeeding_provider()
+        monkeypatch.setattr("flightagent.cli._build_provider", lambda name: provider)
+
+        result = runner.invoke(app, _ALL_DESTINATIONS_ARGS)
+
+        assert result.exit_code == 0, result.output
+        assert len(provider.call_log) == 8
+        assert {record.destination for record in provider.call_log} == set(_ALL_8_DESTINATIONS)
+        assert {record.origin for record in provider.call_log} == {"AMS"}
+
+        report_path = isolated_cwd / "out" / "flight_report_2027-07-17.md"
+        results_path = isolated_cwd / "out" / "flight_results_2027-07-17.json"
+        assert report_path.is_file()
+        assert results_path.is_file()
+
+        report_text = report_path.read_text(encoding="utf-8")
+        assert "SYNTHETIC DATA" in report_text
+        assert "## Recommended Flight" in report_text
+        # Every destination succeeded -- T26's Failed Searches section must
+        # stay absent, not render an empty heading.
+        assert "Failed Searches" not in report_text
+
+        results = json.loads(results_path.read_text(encoding="utf-8"))
+        assert results["data_source"] == "mock"
+        assert results["accepted_count"] >= 1
+        assert results["failed_searches"] == []
+        represented_destinations = {item["destination"] for item in results["top_itineraries"]}
+        assert represented_destinations
+        assert represented_destinations <= set(_ALL_8_DESTINATIONS)
+
+
+class TestAllDestinationsFailed:
+    """T27 / finding 0.5: every task erroring must produce ``RunStatus.FAILED``
+    -- a distinct exit code and distinct wording from the NO_RESULTS path,
+    never the spec's misleading layover-rule string.
+    """
+
+    def test_every_destination_erroring_exits_with_the_failed_code_and_distinct_message(
+        self, isolated_cwd: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        provider = InstrumentedProvider(
+            scripts={
+                destination: [
+                    Fail(
+                        ProviderTimeoutError(
+                            f"{destination} unreachable", provider="instrumented"
+                        )
+                    )
+                ]
+                for destination in _ALL_8_DESTINATIONS
+            }
+        )
+        monkeypatch.setattr("flightagent.cli._build_provider", lambda name: provider)
+
+        result = runner.invoke(app, _ALL_DESTINATIONS_ARGS)
+
+        assert result.exit_code == ALL_DESTINATIONS_FAILED_EXIT_CODE, result.output
+        assert result.exit_code != NO_VALID_ITINERARIES_EXIT_CODE
+        assert "3–6 hour layover rule" not in result.output
+        assert "unreachable" in result.output or "failed" in result.output.lower()
+        assert not (isolated_cwd / "out").exists()
