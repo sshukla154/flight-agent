@@ -40,6 +40,7 @@ from flightagent.domain.segment import Layover, Segment
 from flightagent.reporting.booking_link import BookingUrlRejected, validate_booking_url
 from flightagent.reporting.json_report import build_results_document
 from flightagent.reporting.markdown import SYNTHETIC_DATA_BANNER, render_markdown_report
+from flightagent.reporting.run_artifacts import run_artifact_paths, write_run_artifacts
 from flightagent.reporting.writer import atomic_write_text, write_report_artifacts
 
 _SCHEMA_PATH = Path(__file__).resolve().parents[2] / "config" / "results.schema.json"
@@ -1497,3 +1498,125 @@ class TestAtomicWriter:
 
         assert not path.exists()
         assert list(tmp_path.iterdir()) == []
+
+
+class TestRunArtifactPaths:
+    """T45: the ``(report_path, results_path)`` pair for one run's own
+    artifact directory -- pure path computation, no I/O."""
+
+    def test_paths_are_keyed_under_runs_dir_by_run_id(self, tmp_path: Path) -> None:
+        runs_dir = tmp_path / "data" / "runs"
+
+        report_path, results_path = run_artifact_paths("run-abc-123", runs_dir=runs_dir)
+
+        assert report_path == runs_dir / "run-abc-123" / "report.md"
+        assert results_path == runs_dir / "run-abc-123" / "results.json"
+
+    def test_different_run_ids_yield_different_directories(self, tmp_path: Path) -> None:
+        runs_dir = tmp_path / "data" / "runs"
+
+        report_a, results_a = run_artifact_paths("run-a", runs_dir=runs_dir)
+        report_b, results_b = run_artifact_paths("run-b", runs_dir=runs_dir)
+
+        assert report_a.parent == results_a.parent
+        assert report_b.parent == results_b.parent
+        assert report_a.parent != report_b.parent
+
+
+class TestWriteRunArtifacts:
+    """T45: the per-run artifact directory writer -- additive to, and
+    independent of, ``write_report_artifacts``'s own D15 fixed-path pair."""
+
+    def test_writes_both_files_with_full_content_under_run_id_directory(
+        self, tmp_path: Path
+    ) -> None:
+        runs_dir = tmp_path / "data" / "runs"
+        markdown = "hello per-run report\n"
+        data = {"data_source": "mock", "n": 1}
+
+        returned_report, returned_results = write_run_artifacts(
+            run_id="run-xyz",
+            markdown=markdown,
+            json_data=data,
+            runs_dir=runs_dir,
+        )
+
+        assert returned_report == runs_dir / "run-xyz" / "report.md"
+        assert returned_results == runs_dir / "run-xyz" / "results.json"
+        assert returned_report.read_text(encoding="utf-8") == markdown
+        assert json.loads(returned_results.read_text(encoding="utf-8")) == data
+
+    def test_creates_missing_runs_dir_and_run_id_subdirectory(self, tmp_path: Path) -> None:
+        runs_dir = tmp_path / "does" / "not" / "exist" / "yet"
+
+        report_path, results_path = write_run_artifacts(
+            run_id="run-fresh",
+            markdown="content",
+            json_data={"k": "v"},
+            runs_dir=runs_dir,
+        )
+
+        assert report_path.is_file()
+        assert results_path.is_file()
+
+    def test_two_different_run_ids_land_in_two_separate_directories_with_identical_content(
+        self, tmp_path: Path
+    ) -> None:
+        """Finding 0.3 / D15: artifact CONTENT is deterministic per
+        identical input, but ``run_id`` is allowed (and, per this task,
+        expected) to differ between two separate invocations -- proving
+        both halves of that at once: same content, different homes."""
+        runs_dir = tmp_path / "data" / "runs"
+        markdown = "deterministic content\n"
+        data = {"data_source": "mock", "accepted_count": 2}
+
+        report_1, results_1 = write_run_artifacts(
+            run_id="run-111", markdown=markdown, json_data=data, runs_dir=runs_dir
+        )
+        report_2, results_2 = write_run_artifacts(
+            run_id="run-222", markdown=markdown, json_data=data, runs_dir=runs_dir
+        )
+
+        assert report_1 != report_2
+        assert results_1 != results_2
+        assert report_1.read_bytes() == report_2.read_bytes()
+        assert results_1.read_bytes() == results_2.read_bytes()
+
+    def test_does_not_touch_the_d15_fixed_paths(self, tmp_path: Path) -> None:
+        """The per-run write is purely additive: it must never create,
+        read, or overwrite anything at the D15 fixed-path location."""
+        out_dir = tmp_path / "out"
+        runs_dir = tmp_path / "data" / "runs"
+
+        write_run_artifacts(
+            run_id="run-additive",
+            markdown="run-scoped content\n",
+            json_data={"data_source": "mock"},
+            runs_dir=runs_dir,
+        )
+
+        assert not out_dir.exists()
+
+    def test_writing_both_d15_and_per_run_artifacts_leaves_both_intact(
+        self, tmp_path: Path
+    ) -> None:
+        """The realistic call shape: a caller writes the D15 fixed pair
+        AND the per-run copy from the SAME rendered content -- both must
+        survive, independently, with matching content."""
+        report_path = tmp_path / "out" / "flight_report_2027-07-17.md"
+        results_path = tmp_path / "out" / "flight_results_2027-07-17.json"
+        runs_dir = tmp_path / "data" / "runs"
+        markdown = "shared rendered markdown\n"
+        data = {"data_source": "mock", "accepted_count": 1}
+
+        write_report_artifacts(
+            markdown=markdown, json_data=data, report_path=report_path, results_path=results_path
+        )
+        run_report, run_results = write_run_artifacts(
+            run_id="run-shared", markdown=markdown, json_data=data, runs_dir=runs_dir
+        )
+
+        assert report_path.read_text(encoding="utf-8") == markdown
+        assert run_report.read_text(encoding="utf-8") == markdown
+        assert json.loads(results_path.read_text(encoding="utf-8")) == data
+        assert json.loads(run_results.read_text(encoding="utf-8")) == data

@@ -161,3 +161,10 @@ results_path = "out/flight_results_2027-07-17.json"
 # comparison) reads the full set, never the truncated one.
 top_n_global = 10
 top_n_per_destination = 3
+# Per-run artifact directory layout (T45) — additive to, and independent
+# of, the two fixed D15 paths above. Each run additionally writes its own
+# report.md/results.json under runs_dir/<run_id>/, so a single run's
+# artifacts are addressable by run_id (needed by the future FastAPI app's
+# GET /runs/{id}/report.md). "data/" is already gitignored (see
+# .gitignore), matching the master plan §3 persistence layer's own home.
+runs_dir = "data/runs"

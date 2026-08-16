@@ -138,12 +138,23 @@ class CacheSettings(BaseSettings):
 
 
 class OutputSettings(BaseSettings):
-    """``[output]`` — D15: exact output filenames and top-N truncation."""
+    """``[output]`` — D15: exact output filenames and top-N truncation.
+
+    ``runs_dir`` (T45) is a SEPARATE, additive concern from ``report_path``/
+    ``results_path``: those two remain D15's fixed, spec-literal paths and
+    must never be derived from ``runs_dir`` or vice versa. ``runs_dir`` is
+    the parent of the per-run artifact layout
+    (``reporting.run_artifacts``) — ``{runs_dir}/{run_id}/report.md`` and
+    ``{runs_dir}/{run_id}/results.json`` — that exists alongside the fixed
+    D15 paths so one run's own artifacts are addressable by ``run_id``
+    without disturbing D15's own contract at all.
+    """
 
     model_config = SettingsConfigDict(extra="forbid")
 
     report_path: str
     results_path: str
+    runs_dir: str
     top_n_global: int
     top_n_per_destination: int
 

@@ -99,6 +99,7 @@ from flightagent.providers.mock.generator import compute_seed
 from flightagent.providers.mock.provider import MockProvider
 from flightagent.reporting.json_report import build_results_document
 from flightagent.reporting.markdown import render_markdown_report
+from flightagent.reporting.run_artifacts import write_run_artifacts
 from flightagent.reporting.view import last_segment
 from flightagent.reporting.writer import write_report_artifacts
 from flightagent.scoring.ranking import rank_itineraries
@@ -720,6 +721,17 @@ def _run_all_destinations(
             report_path=Path(settings.output.report_path),
             results_path=Path(settings.output.results_path),
         )
+        # T45: alongside (never instead of) the D15 fixed-path pair just
+        # written above -- reuses this run's own run_meta.run_id (already
+        # generated for the RunEnvelope, not a second independent id) so
+        # this run's artifacts are individually addressable without
+        # disturbing D15's own fixed-path contract at all.
+        write_run_artifacts(
+            run_id=run_meta.run_id,
+            markdown=markdown,
+            json_data=json_document,
+            runs_dir=Path(settings.output.runs_dir),
+        )
         typer.echo(
             f"flightagent: {envelope.status.value} -- {accepted_count} valid itinerary(ies) "
             f"across {destination_count} destination(s) from {origin_code} on "
@@ -940,6 +952,21 @@ def run(
         json_data=json_document,
         report_path=Path(settings.output.report_path),
         results_path=Path(settings.output.results_path),
+    )
+    # T45: alongside (never instead of) the D15 fixed-path pair just written
+    # above. This single-``--dest`` pipeline never builds a ``RunMeta`` (no
+    # ``RunEnvelope`` exists on this path at all), so a fresh id is
+    # generated here purely to key this run's own artifact directory --
+    # the same ``generate_run_id()`` (UUID4) ``_run_all_destinations`` uses
+    # for its ``RunMeta.run_id``, not a second, independently-invented
+    # convention. The id differs between any two invocations (UUID4), even
+    # though the D15 artifact CONTENT it copies is itself deterministic
+    # (finding 0.3) -- see ``reporting.run_artifacts``'s own docstring.
+    write_run_artifacts(
+        run_id=generate_run_id(),
+        markdown=markdown,
+        json_data=json_document,
+        runs_dir=Path(settings.output.runs_dir),
     )
 
     typer.echo(

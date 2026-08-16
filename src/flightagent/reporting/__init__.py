@@ -31,6 +31,11 @@ from flightagent.reporting.booking_link import (
 )
 from flightagent.reporting.json_report import build_results_document
 from flightagent.reporting.markdown import SYNTHETIC_DATA_BANNER, render_markdown_report
+from flightagent.reporting.run_artifacts import (
+    DEFAULT_RUNS_DIR,
+    run_artifact_paths,
+    write_run_artifacts,
+)
 from flightagent.reporting.writer import (
     DEFAULT_REPORT_PATH,
     DEFAULT_RESULTS_PATH,
@@ -42,6 +47,7 @@ from flightagent.reporting.writer import (
 __all__ = [
     "DEFAULT_REPORT_PATH",
     "DEFAULT_RESULTS_PATH",
+    "DEFAULT_RUNS_DIR",
     "SYNTHETIC_DATA_BANNER",
     "BookingUrlRejected",
     "DataSource",
@@ -52,6 +58,8 @@ __all__ = [
     "escape_markdown_link_text",
     "markdown_link",
     "render_markdown_report",
+    "run_artifact_paths",
     "validate_booking_url",
     "write_report_artifacts",
+    "write_run_artifacts",
 ]
