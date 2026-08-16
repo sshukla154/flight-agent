@@ -427,6 +427,78 @@ class TestScorePolicyDivergence:
         assert analysis.divergence_explanation is None
 
 
+class TestTimeSaved:
+    """T32: ``time_saved = cheapest_valid_stop.total_duration -
+    cheapest_direct.total_duration``. Positive means the direct itinerary is
+    faster; this can legitimately go negative, and must be exactly ``None``
+    (not a fabricated zero) whenever either side of the comparison is
+    missing."""
+
+    def test_direct_seven_hours_faster_is_positive_exact_timedelta(self) -> None:
+        # Direct: 8h total (see _direct_itinerary's default). One-stop: 6h
+        # first leg + 3h30m layover + 5h30m second leg = 15h total.
+        # time_saved = 15h - 8h = exactly 7h.
+        direct = _direct_itinerary(
+            Decimal("710.00"), itinerary_id="itin_time_direct_1", duration=timedelta(hours=8)
+        )
+        stop = _one_stop_itinerary(
+            Decimal("620.00"),
+            itinerary_id="itin_time_stop_1",
+            first_leg=timedelta(hours=6),
+            layover_duration=timedelta(hours=3, minutes=30),
+            second_leg=timedelta(hours=5, minutes=30),
+        )
+        assert stop.total_duration - direct.total_duration == timedelta(hours=7)
+
+        analysis = _analyze(direct_pool=(direct,), one_stop_pool=(stop,))
+
+        assert analysis.time_saved == timedelta(hours=7)
+
+    def test_direct_slower_than_stop_is_negative_not_clamped(self) -> None:
+        # Direct: 16h total (a long-haul direct). One-stop: 2h + 3h30m
+        # layover (210min -- inside D8's valid [180,360] layover window) +
+        # 2h30m = 8h total (a fast connection). time_saved = 8h - 16h = -8h:
+        # the direct flight is SLOWER, and this must surface as a real
+        # negative timedelta, not be clamped to zero or raise.
+        direct = _direct_itinerary(
+            Decimal("710.00"), itinerary_id="itin_time_direct_2", duration=timedelta(hours=16)
+        )
+        stop = _one_stop_itinerary(
+            Decimal("620.00"),
+            itinerary_id="itin_time_stop_2",
+            first_leg=timedelta(hours=2),
+            layover_duration=_WORKED_STOP_LAYOVER,
+            second_leg=timedelta(hours=2, minutes=30),
+        )
+        assert stop.total_duration - direct.total_duration == timedelta(hours=-8)
+
+        analysis = _analyze(direct_pool=(direct,), one_stop_pool=(stop,))
+
+        assert analysis.time_saved == timedelta(hours=-8)
+        assert analysis.time_saved is not None
+        assert analysis.time_saved < timedelta(0)
+
+    def test_no_direct_service_time_saved_is_none_not_zero(self) -> None:
+        stop = _one_stop_itinerary(
+            Decimal("620.00"),
+            itinerary_id="itin_time_na_s",
+            first_leg=_WORKED_STOP_FIRST_LEG,
+            layover_duration=_WORKED_STOP_LAYOVER,
+            second_leg=_WORKED_STOP_SECOND_LEG,
+        )
+        analysis = _analyze(direct_pool=(), one_stop_pool=(stop,))
+
+        assert analysis.tier == DirectTier.NOT_AVAILABLE
+        assert analysis.time_saved is None
+
+    def test_no_valid_one_stop_alternative_time_saved_is_none_not_zero(self) -> None:
+        direct = _direct_itinerary(Decimal("900.00"), itinerary_id="itin_time_direct_only")
+        analysis = _analyze(direct_pool=(direct,), one_stop_pool=())
+
+        assert analysis.cheapest_valid_stop is None
+        assert analysis.time_saved is None
+
+
 class TestConfigDrivenTierThresholds:
     """The D10 thresholds are genuinely read from config, not hardcoded --
     overriding ``[direct_tier]`` must change the outcome for the identical

@@ -1,4 +1,5 @@
-"""D10's direct-vs-one-stop tier ladder (Phase 5, T31).
+"""D10's direct-vs-one-stop tier ladder (Phase 5, T31) plus time-savings
+(Phase 5, T32).
 
 Builds one ``domain.policy.DestinationAnalysis`` per destination from two
 already-D13-pool-separated inputs (``cli.py``'s ``_build_direct_vs_stop_pools``,
@@ -263,6 +264,7 @@ def analyze_destination(
             relative_difference=None,
             tier=tier,
             tier_reason=tier_reason,
+            time_saved=None,
         )
 
     if cheapest_valid_stop is None:
@@ -284,6 +286,7 @@ def analyze_destination(
             relative_difference=None,
             tier=tier,
             tier_reason=tier_reason,
+            time_saved=None,
         )
 
     price_difference = cheapest_direct.price_eur.amount - cheapest_valid_stop.price_eur.amount
@@ -330,6 +333,13 @@ def analyze_destination(
         layover_settings=layover_settings,
     )
 
+    # Positive means the direct itinerary is FASTER by that much -- the
+    # common case. This can legitimately go negative (a direct itinerary
+    # that is slower than the one-stop alternative, e.g. a long-haul direct
+    # vs a fast connection) -- never clamped to zero, never treated as an
+    # error; it is real data (T32).
+    time_saved = cheapest_valid_stop.total_duration - cheapest_direct.total_duration
+
     return DestinationAnalysis(
         destination=destination,
         cheapest_direct=cheapest_direct,
@@ -338,6 +348,7 @@ def analyze_destination(
         relative_difference=relative_difference,
         tier=tier,
         tier_reason=tier_reason,
+        time_saved=time_saved,
         score_policy_divergence=divergence,
         divergence_explanation=divergence_explanation,
     )
