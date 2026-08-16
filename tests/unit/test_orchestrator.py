@@ -28,12 +28,23 @@ from flightagent.config.loader import load_config
 from flightagent.domain.enums import TaskState
 from flightagent.domain.run import SearchRequest
 from flightagent.orchestration.executor import execute_plan
-from flightagent.orchestration.plan import build_dual_mode_plan_for_origin, build_plan_for_origin
+from flightagent.orchestration.plan import (
+    build_dual_mode_plan_for_origin,
+    build_multi_origin_plan,
+    build_plan_for_origin,
+)
 from flightagent.providers.base import CallBudget, ProviderCapabilities, ProviderSearchResult
 from flightagent.providers.errors import ProviderTimeoutError
 from flightagent.providers.mock.provider import MockProvider
 
 _ORIGIN = "AMS"
+
+_ORIGIN_PRIORITY_ORDER = ("AMS", "EIN", "RTM", "DUS", "BRU", "NRN", "CGN", "CRL", "MST", "GRQ")
+"""DECISIONS.md Addendum 2's exact origin search order -- also asserted
+directly against ``airports.registry.origins()`` in ``test_airports.py``;
+duplicated here as a plain tuple so this file's own assertions read as
+self-contained checks against the literal spec order, not an indirect
+"whatever the registry happens to return" tautology."""
 
 
 def _departure_date() -> date:
@@ -173,6 +184,119 @@ class TestBuildDualModePlanForOrigin:
             assert task.origin_priority == expected_priority
             assert task.wave == 0
             assert task.request.origin == _ORIGIN
+
+
+class TestBuildMultiOriginPlan:
+    """T37: the run-level, ten-origin fan-out -- 10 origins x 8
+    destinations x {0, 1} stop modes = 160 tasks, master plan S5's default
+    "Option B" (full concurrent fan-out; per-task ``wave`` is metadata for
+    a later sequential-priority execution mode, T39, not consulted here).
+    """
+
+    def test_produces_exactly_160_tasks_for_a_full_run(self) -> None:
+        tasks = build_multi_origin_plan(departure_date=_departure_date())
+        assert len(tasks) == 160
+
+    def test_origins_appear_in_the_exact_addendum_2_priority_order(self) -> None:
+        """Asserts on the actual sequence of origin codes in the returned
+        task list: each origin's 16 tasks (``build_dual_mode_plan_for_origin``,
+        reused unchanged) arrive as one contiguous block, and those blocks
+        appear in exactly AMS, EIN, RTM, DUS, BRU, NRN, CGN, CRL, MST, GRQ
+        order -- never alphabetised, never re-derived.
+        """
+        tasks = build_multi_origin_plan(departure_date=_departure_date())
+
+        observed_order: list[str] = []
+        for task in tasks:
+            if not observed_order or observed_order[-1] != task.request.origin:
+                observed_order.append(task.request.origin)
+
+        assert observed_order == list(_ORIGIN_PRIORITY_ORDER)
+
+    def test_every_origin_contributes_exactly_16_contiguous_tasks(self) -> None:
+        tasks = build_multi_origin_plan(departure_date=_departure_date())
+        for origin in _ORIGIN_PRIORITY_ORDER:
+            origin_tasks = [task for task in tasks if task.request.origin == origin]
+            assert len(origin_tasks) == 16
+
+    def test_every_task_carries_its_own_origins_registry_priority(self) -> None:
+        tasks = build_multi_origin_plan(departure_date=_departure_date())
+        for task in tasks:
+            expected_priority = get_airport(task.request.origin).priority
+            assert expected_priority is not None
+            assert task.origin_priority == expected_priority
+
+    def test_wave_1_is_exactly_the_three_primary_origins_together_and_nothing_else(
+        self,
+    ) -> None:
+        """Master plan S5's own resolution: wave 1 is always AMS+EIN+RTM
+        TOGETHER, never a single airport -- this is what structurally
+        avoids finding 0.7's vacuous-truth-on-the-first-airport bug (a
+        single-airport wave 1 would make the early-stop rule trivially
+        true against an empty "previously completed origins" comparison
+        set, T39/D12).
+        """
+        tasks = build_multi_origin_plan(departure_date=_departure_date())
+        wave_1_tasks = [task for task in tasks if task.wave == 1]
+
+        assert {task.request.origin for task in wave_1_tasks} == {"AMS", "EIN", "RTM"}
+        assert len(wave_1_tasks) == 48  # 3 origins x 16 tasks each
+
+    def test_waves_2_through_8_are_exactly_one_origin_each_in_priority_order(self) -> None:
+        tasks = build_multi_origin_plan(departure_date=_departure_date())
+        expected_origin_by_wave = {
+            2: "DUS",
+            3: "BRU",
+            4: "NRN",
+            5: "CGN",
+            6: "CRL",
+            7: "MST",
+            8: "GRQ",
+        }
+        for wave, expected_origin in expected_origin_by_wave.items():
+            wave_tasks = [task for task in tasks if task.wave == wave]
+            assert {task.request.origin for task in wave_tasks} == {expected_origin}
+            assert len(wave_tasks) == 16
+
+    def test_every_task_has_a_wave_between_1_and_8_inclusive(self) -> None:
+        tasks = build_multi_origin_plan(departure_date=_departure_date())
+        observed_waves = {task.wave for task in tasks}
+        assert observed_waves == set(range(1, 9))
+
+    def test_single_origin_path_is_unaffected_regression(self) -> None:
+        """T37's own explicit regression requirement: the pre-existing
+        single-origin ``build_dual_mode_plan_for_origin`` path (used by
+        ``--dest``/``--all-destinations`` without ``--all-origins``) must
+        still produce the exact same plan shape as before -- proved by
+        calling it directly and confirming it is untouched by this task
+        (still 16 tasks, still ``wave=0`` for every one of them), exactly
+        as ``TestBuildDualModePlanForOrigin`` above already covers.
+        """
+        tasks = build_dual_mode_plan_for_origin(_ORIGIN, departure_date=_departure_date())
+        assert len(tasks) == 16
+        assert all(task.wave == 0 for task in tasks)
+
+    def test_amss_slice_of_the_multi_origin_plan_matches_calling_it_directly(self) -> None:
+        """The multi-origin plan's AMS block is byte-for-byte what calling
+        ``build_dual_mode_plan_for_origin("AMS", ...)`` directly produces,
+        aside from ``wave`` (legitimately overwritten from 0 to 1 for the
+        primary-wave origins -- see the wave tests above) -- proof the
+        multi-origin function really does reuse the existing per-origin
+        builder rather than a parallel, possibly-diverging implementation.
+        """
+        multi_tasks = build_multi_origin_plan(departure_date=_departure_date())
+        ams_tasks_from_multi = [task for task in multi_tasks if task.request.origin == "AMS"]
+        direct_tasks = build_dual_mode_plan_for_origin("AMS", departure_date=_departure_date())
+
+        assert [task.task_id for task in ams_tasks_from_multi] == [
+            task.task_id for task in direct_tasks
+        ]
+        assert [task.request for task in ams_tasks_from_multi] == [
+            task.request for task in direct_tasks
+        ]
+        assert [task.origin_priority for task in ams_tasks_from_multi] == [
+            task.origin_priority for task in direct_tasks
+        ]
 
 
 class TestNoDirectServiceDestinationReturnsZeroOffers:

@@ -1,12 +1,16 @@
-"""Deterministic task planning for one origin (T24).
+"""Deterministic task planning for one origin (T24), and the run-level,
+ten-origin fan-out over it (T37).
 
 Master plan S3 places ``plan`` first in the ``orchestration`` package for a
 reason: the task set for a run must be derivable from config alone, with no
-network call and no randomness. This module builds that plan for exactly
-ONE origin against all 8 destinations from ``airports.registry`` — the
-run-level, ten-origin fan-out (``MultiOriginSearchRequest`` in
-``domain/run.py``) is a separate, later concern that calls this function
-once per origin; it is not built here.
+network call and no randomness. Most of this module builds that plan for
+exactly ONE origin against all 8 destinations from ``airports.registry``;
+``build_multi_origin_plan`` at the bottom is the run-level, ten-origin
+fan-out (``MultiOriginSearchRequest`` in ``domain/run.py`` is the proposed
+run-level REQUEST shape this responds to -- no provider adapter ever sees
+more than one origin, per D1) that calls the single-origin builder once per
+origin, in priority order, and concatenates the results -- it does not
+duplicate the per-mode task-building loop.
 
 Each ``SearchRequest`` is built with the identical defaults ``cli.py``'s
 ``run()`` command already uses (D3: economy cabin, 1 adult, EUR; layover
@@ -22,6 +26,7 @@ from datetime import date, timedelta
 from flightagent.airports.registry import UnknownAirportError
 from flightagent.airports.registry import destinations as registry_destinations
 from flightagent.airports.registry import get as get_airport
+from flightagent.airports.registry import origins as registry_origins
 from flightagent.config.loader import load_config
 from flightagent.config.models import FlightAgentSettings
 from flightagent.domain.enums import CabinClass, StopMode
@@ -201,3 +206,91 @@ def build_dual_mode_plan_for_origin(
 
     log_event(EventName.PLAN_BUILT, task_count=len(tasks))
     return tasks
+
+
+_PRIMARY_WAVE_ORIGIN_COUNT = 3
+"""Master plan S5's own resolution: wave 1 is always the three primary
+airports (AMS, EIN, RTM — priorities 1-3) TOGETHER, never a single airport.
+This is structural, not cosmetic — a single-airport wave 1 would make
+finding 0.7's early-stop rule vacuously true (D12: the rule compares a
+destination's cheapest fare so far against every PREVIOUSLY completed
+origin; with zero prior origins to compare against on the very first
+airport, the comparison set is empty and the rule trivially "passes").
+Grouping the first three priorities into one wave removes that empty-set
+case structurally instead of special-casing it later in the early-stop
+logic itself (T39)."""
+
+
+def _wave_for_priority(priority: int) -> int:
+    """Master plan S5's wave numbering for the FUTURE sequential-priority
+    execution mode (T39, not built here — see ``build_multi_origin_plan``'s
+    own docstring): priorities 1-3 (AMS, EIN, RTM) collapse to wave 1;
+    every priority after that is its own wave, one airport each, in
+    priority order (wave 2 = DUS, wave 3 = BRU, ..., wave 8 = GRQ).
+
+    A plain arithmetic mapping, not a lookup table, so it keeps working
+    unchanged if a future config edit reorders which airports occupy which
+    priority slot -- only the *shape* (3 primaries, then singles) is
+    hardcoded, matching master plan S5's own wording, not the airport
+    codes themselves.
+    """
+    if priority <= _PRIMARY_WAVE_ORIGIN_COUNT:
+        return 1
+    return priority - (_PRIMARY_WAVE_ORIGIN_COUNT - 1)
+
+
+def build_multi_origin_plan(
+    *,
+    departure_date: date,
+    settings: FlightAgentSettings | None = None,
+) -> tuple[SearchTask, ...]:
+    """Build the run-level plan: every origin in ``airports.registry.origins()``
+    (priority order, Addendum 2) fanned out across every destination at
+    BOTH ``max_stops`` modes — 10 origins x 8 destinations x {0, 1} = 160
+    ``SearchTask``s, the literal Phase 6 full fan-out (master plan S5's
+    default, Option B: "full fan-out, post-hoc deterministic replay").
+
+    Reuses ``build_dual_mode_plan_for_origin`` UNCHANGED, once per origin,
+    in priority order, concatenating the ten 16-task tuples it returns —
+    never a second per-mode task-building loop duplicated here. ``settings``
+    is resolved exactly ONCE up front and threaded into every one of those
+    ten calls (see ``build_plan_for_origin``'s own docstring on this exact
+    point), so a 160-task plan reloads config once, not ten times.
+
+    Every returned task's ``wave`` (0, as ``build_dual_mode_plan_for_origin``
+    always sets it) is overwritten here per ``_wave_for_priority`` — this is
+    METADATA for a FUTURE sequential-priority execution mode (T39) to
+    consume, not a control-flow decision made by this function: the 160
+    tasks are returned as one flat tuple, origin-priority order, and the
+    default execution path (``orchestration.executor.execute_plan``) fans
+    every one of them out concurrently regardless of ``wave`` — true
+    sequential, wave-by-wave EXECUTION is a separate, later, flag-gated
+    mode this function does not build.
+
+    Emits ten separate ``EventName.PLAN_BUILT`` events (one per origin, 16
+    tasks each, via the reused per-origin builder) rather than one combined
+    160-task event — a direct consequence of reusing that builder unchanged
+    per origin instead of duplicating its event-emission logic here.
+    """
+    resolved_settings = settings if settings is not None else load_config()
+
+    tasks: list[SearchTask] = []
+    for origin_airport in registry_origins():
+        # origins() only ever returns airports carrying ground/priority
+        # data (see Airport.is_origin) — this assert documents that
+        # invariant for mypy rather than re-deriving it via
+        # ``_origin_priority``'s own registry lookup a second time.
+        priority = origin_airport.priority
+        assert priority is not None, (
+            f"{origin_airport.iata!r} came from registry.origins() but has no priority — "
+            f"that function's own contract guarantees every entry is a real origin"
+        )
+        origin_tasks = build_dual_mode_plan_for_origin(
+            origin_airport.iata,
+            departure_date=departure_date,
+            settings=resolved_settings,
+        )
+        wave = _wave_for_priority(priority)
+        tasks.extend(task.model_copy(update={"wave": wave}) for task in origin_tasks)
+
+    return tuple(tasks)
