@@ -27,6 +27,13 @@ omitted, when none were computed (the single-``--dest`` pipeline never
 computes this at all, since D10's comparison is inherently a
 per-destination, both-modes-searched thing).
 
+Phase 6 (T39) adds the early-stop replay annotation: ``build_results_document``
+now optionally accepts a ``{destination: EarlyStopEvaluation}`` mapping
+(``orchestration.waves.replay_early_stop``, D12) and always emits a
+top-level ``early_stop_analysis`` array -- empty, never omitted, when none
+were computed. Purely additive/informational: computing it never changes
+``top_itineraries`` or ``accepted_count``.
+
 All money and score values are emitted as **decimal-shaped strings**, never
 JSON numbers -- JSON has no decimal type, and round-tripping a ``Decimal``
 through a JSON float would reintroduce exactly the float-nondeterminism
@@ -41,12 +48,13 @@ an ISO-8601 duration string.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import date, datetime, timedelta
+from types import MappingProxyType
 from typing import Any
 
 from flightagent.domain.itinerary import NormalizedItinerary
-from flightagent.domain.policy import DestinationAnalysis
+from flightagent.domain.policy import DestinationAnalysis, EarlyStopEvaluation
 from flightagent.domain.run import TaskOutcome
 from flightagent.domain.scoring import ScoreComponents, ScoredItinerary
 from flightagent.reporting.booking_link import BookingUrlRejected, DataSource, validate_booking_url
@@ -161,6 +169,35 @@ def _destination_analysis_to_json(analysis: DestinationAnalysis) -> dict[str, An
     }
 
 
+def _early_stop_evaluation_to_json(
+    destination: str, evaluation: EarlyStopEvaluation
+) -> dict[str, Any]:
+    """One "Early Stop Analysis" entry (Phase 6, T39, D12) -- the post-hoc
+    replay's annotation for one destination. ``destination`` comes from the
+    caller's ``early_stop_evaluations`` mapping key, not from the
+    evaluation itself -- ``EarlyStopEvaluation`` only carries
+    ``triggering_destination``, which its own validator forbids from being
+    set when ``triggered`` is ``False``, so the mapping key is the one
+    place "which destination is this" is recorded for the non-triggered
+    case. ``triggering_origin``/``margin_eur`` are ``None`` exactly when
+    ``triggered`` is ``False``. ``compared_against`` is always present --
+    D12/master plan S4: "an order-dependent rule with an implicit
+    comparison set is unauditable" -- even when empty (fewer than two
+    origins ever had a valid fare to this destination).
+    """
+    return {
+        "destination": destination,
+        "evaluated_at_wave": evaluation.evaluated_at_wave,
+        "triggered": evaluation.triggered,
+        "triggering_origin": evaluation.triggering_origin,
+        "margin_eur": (
+            f"{evaluation.margin.amount:.2f}" if evaluation.margin is not None else None
+        ),
+        "compared_against": list(evaluation.compared_against),
+        "mode": evaluation.mode,
+    }
+
+
 def _itinerary_to_json(item: ScoredItinerary, *, data_source: DataSource) -> dict[str, Any]:
     itinerary = item.itinerary
     departure_segment = first_segment(itinerary)
@@ -205,6 +242,7 @@ def build_results_document(
     data_source: DataSource = "mock",
     task_outcomes: Sequence[TaskOutcome] = (),
     destination_analyses: Sequence[DestinationAnalysis] = (),
+    early_stop_evaluations: Mapping[str, EarlyStopEvaluation] = MappingProxyType({}),
 ) -> dict[str, Any]:
     """Build the v1 JSON results document (not yet written to disk -- see
     ``reporting.writer``).
@@ -232,6 +270,15 @@ def build_results_document(
     present, empty when none were supplied (including the default), never
     omitted, for the same reason ``failed_searches`` never is.
 
+    ``early_stop_evaluations`` is the T39 (Phase 6, D12) post-hoc replay's
+    per-destination annotation (``orchestration.waves.replay_early_stop``),
+    keyed by destination -- becomes the top-level ``early_stop_analysis``
+    array, one entry per mapping item, in the mapping's own iteration
+    order -- always present, empty when none were supplied (including the
+    default), never omitted, for the same reason ``failed_searches`` never
+    is. Purely an annotation: it never removes or reorders anything in
+    ``top_itineraries`` -- see ``orchestration.waves``' own docstring.
+
     Raises ``ValueError`` if ``accepted_count`` is smaller than
     ``len(ranked)`` -- truncation can only ever shrink what is *shown*,
     never invent itineraries that were not actually accepted.
@@ -256,5 +303,9 @@ def build_results_document(
         ],
         "destination_analyses": [
             _destination_analysis_to_json(analysis) for analysis in destination_analyses
+        ],
+        "early_stop_analysis": [
+            _early_stop_evaluation_to_json(destination, evaluation)
+            for destination, evaluation in early_stop_evaluations.items()
         ],
     }

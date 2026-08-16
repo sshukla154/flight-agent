@@ -29,6 +29,13 @@ least one ``TaskOutcome`` in the run's ledger is in an error state
 (PROVIDER_ERROR / RATE_LIMITED / TIMEOUT, ``domain.run``'s
 ``_ERROR_STATES``) -- never an empty heading when every task succeeded.
 
+Phase 6 (T39) adds the "Early Stop Analysis" section: D12's EUR-threshold
+early-stop rule, replayed post-hoc over the complete result set
+(``orchestration.waves.replay_early_stop``) and rendered purely as an
+annotation -- the full fan-out above always ran regardless of what this
+table says. Rendered only when the caller supplies a non-empty
+``{destination: EarlyStopEvaluation}`` mapping.
+
 Phase 5 (T34) adds the closing "Final Summary" line: one of two prose
 templates (A1-8's restated acceptance criterion, DECISIONS.md), chosen by
 the tier of the ``DestinationAnalysis`` belonging to the report's OVERALL
@@ -57,13 +64,14 @@ footnote that can be truncated or ignored.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import date, datetime, timedelta
+from types import MappingProxyType
 
 from flightagent.domain.enums import DirectTier
 from flightagent.domain.itinerary import NormalizedItinerary
 from flightagent.domain.money import Money
-from flightagent.domain.policy import DestinationAnalysis
+from flightagent.domain.policy import DestinationAnalysis, EarlyStopEvaluation
 from flightagent.domain.run import TaskOutcome
 from flightagent.domain.scoring import ScoredItinerary
 from flightagent.reporting.booking_link import (
@@ -276,6 +284,63 @@ def _failed_searches_table(failed: Sequence[TaskOutcome]) -> str:
     return "\n".join(lines)
 
 
+_NOT_EVALUABLE_TEXT = "not yet evaluable (fewer than 2 prior origins)"
+"""D12 rule 1 / finding 0.7: the rule needs >=2 prior origins with a valid
+fare before it can compare anything at all. Rendered instead of a fake
+"no" verdict for a destination where that threshold was never reached --
+distinct from a real `triggered=False` verdict where a comparison DID run
+and simply did not cross the threshold."""
+
+
+def _early_stop_row(destination: str, evaluation: EarlyStopEvaluation) -> str:
+    if evaluation.triggered:
+        assert evaluation.triggering_origin is not None
+        assert evaluation.margin is not None
+        verdict = f"triggered at {evaluation.triggering_origin}"
+        margin_text = format_price_eur(evaluation.margin)
+    elif len(evaluation.compared_against) >= 2:
+        verdict = "not triggered"
+        margin_text = _NO_DIRECT_ITINERARY_TEXT
+    else:
+        verdict = _NOT_EVALUABLE_TEXT
+        margin_text = _NO_DIRECT_ITINERARY_TEXT
+
+    compared_against = (
+        ", ".join(evaluation.compared_against) if evaluation.compared_against else "(none yet)"
+    )
+    return (
+        f"| {destination} | wave {evaluation.evaluated_at_wave} | {verdict} | {margin_text} | "
+        f"{compared_against} |"
+    )
+
+
+def _early_stop_table(early_stop_evaluations: Mapping[str, EarlyStopEvaluation]) -> str:
+    """D12/T39's "Early Stop Analysis" section: what the EUR-threshold
+    early-stop rule WOULD have done, replayed post-hoc over the complete
+    result set (master plan S5's Option B) -- an annotation only, never a
+    reflection of anything actually skipped (the full fan-out above always
+    ran regardless of what this table says). One row per destination, in
+    ``early_stop_evaluations``' own (registry destination) order.
+
+    Every ``EarlyStopEvaluation`` carries ``mode="advisory"`` (T39 builds
+    only the post-hoc replay -- see ``policy.early_stop.MODE``), so the
+    heading states that plainly rather than repeating it in every row.
+    """
+    lines = [
+        "## Early Stop Analysis",
+        "",
+        "*Advisory only -- early stop is off by default (D12), and this run always "
+        "searched every origin regardless of what this table says. It shows what the "
+        "EUR-threshold rule would have done, replayed after the fact.*",
+        "",
+        "| Destination | Evaluated at | Verdict | Margin | Compared against |",
+        "|---|---|---|---|---|",
+    ]
+    for destination, evaluation in early_stop_evaluations.items():
+        lines.append(_early_stop_row(destination, evaluation))
+    return "\n".join(lines)
+
+
 _FINAL_SUMMARY_DIRECT_TIERS = (DirectTier.RECOMMENDED, DirectTier.GOOD_VALUE)
 """Tiers for which the Final Summary (T34) uses the "recommend the direct
 flight" template -- the same two tiers Addendum 1's report column renders
@@ -398,6 +463,7 @@ def render_markdown_report(
     data_source: DataSource = "mock",
     task_outcomes: Sequence[TaskOutcome] = (),
     destination_analyses: Sequence[DestinationAnalysis] = (),
+    early_stop_evaluations: Mapping[str, EarlyStopEvaluation] = MappingProxyType({}),
 ) -> str:
     """Render the full v1 Markdown report.
 
@@ -434,6 +500,14 @@ def render_markdown_report(
     a NOT_AVAILABLE/direct-only primary destination) rather than stating
     something the data doesn't support.
 
+    ``early_stop_evaluations`` is the T39 (Phase 6, D12) post-hoc replay
+    annotation, keyed by destination (``orchestration.waves.replay_early_stop``)
+    -- rendered as the "## Early Stop Analysis" section whenever this
+    mapping is non-empty. Passing nothing (the default) renders no such
+    section, matching every pre-Phase-6 call site. Purely informational --
+    never changes ``ranked``/``accepted_count`` or anything else in this
+    report.
+
     Raises ``ValueError`` if ``ranked`` is empty: the empty/no-results
     report path is Phase 4 scope, not this task's (see module docstring).
     """
@@ -468,6 +542,10 @@ def render_markdown_report(
 
     if failed:
         sections.append(_failed_searches_table(failed))
+        sections.append("")
+
+    if early_stop_evaluations:
+        sections.append(_early_stop_table(early_stop_evaluations))
         sections.append("")
 
     sections.append(

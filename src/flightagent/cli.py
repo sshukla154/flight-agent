@@ -76,6 +76,7 @@ from typing import Annotated, NamedTuple
 
 import typer
 
+from flightagent.airports.registry import destinations as registry_destinations
 from flightagent.airports.registry import origins as registry_origins
 from flightagent.config.loader import compute_config_digest, load_config
 from flightagent.config.models import FlightAgentSettings
@@ -93,6 +94,7 @@ from flightagent.observability.events import EventName
 from flightagent.observability.logging import log_event, setup_logging
 from flightagent.orchestration.executor import execute_plan
 from flightagent.orchestration.plan import build_dual_mode_plan_for_origin, build_multi_origin_plan
+from flightagent.orchestration.waves import replay_early_stop
 from flightagent.policy.direct_vs_stop import analyze_destination
 from flightagent.providers.base import CallBudget, FlightProvider
 from flightagent.providers.errors import ProviderNotConfigured
@@ -690,6 +692,20 @@ def _run_all_destinations(
     _direct_vs_stop_pools = _build_direct_vs_stop_pools(tasks, valid_by_task_id)
     destination_analyses = _analyze_all_destinations(_direct_vs_stop_pools, settings=settings)
 
+    # T39 (D12, finding 0.7): post-hoc, deterministic replay of the EUR250
+    # early-stop rule over the COMPLETE task/result set built above -- an
+    # annotation only (master plan S5's Option B default), never a
+    # control-flow decision. Read straight off `tasks`/`valid_by_task_id`,
+    # so it never removes, skips, or reorders any task's own results --
+    # `combined_valid_itineraries`/`deduplicated_itineraries` below are
+    # built from the exact same, untouched `valid_by_task_id`.
+    early_stop_evaluations = replay_early_stop(
+        tasks,
+        valid_by_task_id,
+        destinations=tuple(airport.iata for airport in registry_destinations()),
+        threshold_eur=settings.early_stop.threshold_eur,
+    )
+
     deduplicated_itineraries = deduplicate(combined_valid_itineraries)
     scored_itineraries = [
         ScoredItinerary(
@@ -748,6 +764,7 @@ def _run_all_destinations(
             data_source="mock",
             task_outcomes=final_task_outcomes,
             destination_analyses=destination_analyses,
+            early_stop_evaluations=early_stop_evaluations,
         )
         json_document = build_results_document(
             ranked,
@@ -758,6 +775,7 @@ def _run_all_destinations(
             data_source="mock",
             task_outcomes=final_task_outcomes,
             destination_analyses=destination_analyses,
+            early_stop_evaluations=early_stop_evaluations,
         )
         report_path, results_path = write_report_artifacts(
             markdown=markdown,

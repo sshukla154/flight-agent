@@ -14,7 +14,8 @@
     "top_n",
     "top_itineraries",
     "failed_searches",
-    "destination_analyses"
+    "destination_analyses",
+    "early_stop_analysis"
   ],
   "properties": {
     "schema_version": {
@@ -55,6 +56,11 @@
       "description": "Phase 5 (T33), D10: one entry per registry destination -- the direct-vs-one-stop policy comparison (flightagent.policy.direct_vs_stop.analyze_destination). Always present; empty for the single --dest pipeline, which never computes it.",
       "type": "array",
       "items": { "$ref": "#/$defs/destinationAnalysis" }
+    },
+    "early_stop_analysis": {
+      "description": "Phase 6 (T39), D12: one entry per destination -- the post-hoc, deterministic replay of the EUR-threshold early-stop rule (flightagent.orchestration.waves.replay_early_stop). Purely an annotation; never changes top_itineraries or accepted_count. Always present; empty when not computed (e.g. the single --dest pipeline).",
+      "type": "array",
+      "items": { "$ref": "#/$defs/earlyStopEvaluation" }
     }
   },
   "$defs": {
@@ -221,6 +227,42 @@
     "decimalStringOrNull": {
       "type": ["string", "null"],
       "pattern": "^-?[0-9]+(\\.[0-9]+)?$"
+    },
+    "earlyStopEvaluation": {
+      "description": "domain.policy.EarlyStopEvaluation, shaped for JSON (Phase 6, T39). triggering_origin/margin_eur are null exactly when triggered is false. mode is always 'advisory' -- this codebase only ever builds the post-hoc replay (master plan S5's Option B); true sequential-priority execution ('enforced') is a separate, unbuilt code path.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "destination",
+        "evaluated_at_wave",
+        "triggered",
+        "triggering_origin",
+        "margin_eur",
+        "compared_against",
+        "mode"
+      ],
+      "properties": {
+        "destination": { "type": "string", "pattern": "^[A-Z]{3}$" },
+        "evaluated_at_wave": { "type": "integer", "minimum": 0 },
+        "triggered": { "type": "boolean" },
+        "triggering_origin": {
+          "type": ["string", "null"],
+          "pattern": "^[A-Z]{3}$"
+        },
+        "margin_eur": {
+          "description": "EarlyStopEvaluation.margin.amount, quantized to the cent.",
+          "type": ["string", "null"],
+          "pattern": "^-?[0-9]+\\.[0-9]{2}$"
+        },
+        "compared_against": {
+          "description": "D12/master plan S4: the exact origin set this comparison used -- always present, possibly empty.",
+          "type": "array",
+          "items": { "type": "string", "pattern": "^[A-Z]{3}$" }
+        },
+        "mode": {
+          "enum": ["enforced", "advisory"]
+        }
+      }
     }
   }
 }
