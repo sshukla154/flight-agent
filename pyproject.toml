@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Autonomous flight-search agent (Nieuwegein-area -> India, 2027-07-17)"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "aiosqlite>=0.22.1",
     "pydantic>=2",
     "pydantic-settings>=2",
     "pyyaml>=6",
