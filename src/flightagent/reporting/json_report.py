@@ -5,15 +5,20 @@ as a **structural top-level field** -- not buried in a nested object, not
 optional. ``build_results_document`` puts it there directly.
 
 Scope note, per this task's brief: this is deliberately NOT the full
-``domain.run.RunEnvelope``/``RunMeta`` machinery -- that requires
-``TaskOutcome``s, a ``config_digest``, a ``tzdata_version``, none of which
-exist yet because no orchestration layer produces them in this phase. This
-is a smaller, honest subset: ``data_source``, ``departure_date``, and the
-ranked itineraries with their score components, shaped closely enough to
-what master plan section 4 eventually wants (``top_itineraries``,
-``accepted_count``) that migrating into a real ``RunEnvelope`` later is an
-additive move, not a rewrite. ``config/results.schema.json`` validates
-exactly this shape -- see that file for the field-level contract.
+``domain.run.RunEnvelope``/``RunMeta`` machinery -- that requires a
+``config_digest`` and a ``tzdata_version``, neither of which any
+orchestration layer produces in this phase. This is a smaller, honest
+subset: ``data_source``, ``departure_date``, and the ranked itineraries
+with their score components, shaped closely enough to what master plan
+section 4 eventually wants (``top_itineraries``, ``accepted_count``) that
+migrating into a real ``RunEnvelope`` later is an additive move, not a
+rewrite. ``config/results.schema.json`` validates exactly this shape --
+see that file for the field-level contract.
+
+Phase 4 (T26) adds ``TaskOutcome``-derived data: ``build_results_document``
+now optionally accepts the run's task ledger and always emits a top-level
+``failed_searches`` array (destination/error_type/error_detail per
+error-state task) -- empty, never omitted, when nothing failed.
 
 All money and score values are emitted as **decimal-shaped strings**, never
 JSON numbers -- JSON has no decimal type, and round-tripping a ``Decimal``
@@ -29,10 +34,13 @@ from datetime import date, datetime
 from typing import Any
 
 from flightagent.domain.itinerary import NormalizedItinerary
+from flightagent.domain.run import TaskOutcome
 from flightagent.domain.scoring import ScoreComponents, ScoredItinerary
 from flightagent.reporting.booking_link import BookingUrlRejected, DataSource, validate_booking_url
 from flightagent.reporting.view import (
     airline_string,
+    destination_from_task_id,
+    failed_task_outcomes,
     first_segment,
     last_segment,
     route_string,
@@ -77,6 +85,20 @@ def _booking_json(
         return url_str, False
 
 
+def _failed_search_to_json(outcome: TaskOutcome) -> dict[str, Any]:
+    """One "Failed Searches" entry (Phase 4, T26) -- destination, error
+    class, and detail for one error-state ``TaskOutcome``. Matches the
+    naming convention ``build_results_document`` already uses for its
+    other top-level fields (plain snake_case, no nesting for a value this
+    small).
+    """
+    return {
+        "destination": destination_from_task_id(outcome.task_id),
+        "error_type": outcome.error_type,
+        "error_detail": outcome.error_detail,
+    }
+
+
 def _itinerary_to_json(item: ScoredItinerary, *, data_source: DataSource) -> dict[str, Any]:
     itinerary = item.itinerary
     departure_segment = first_segment(itinerary)
@@ -119,6 +141,7 @@ def build_results_document(
     top_n: int,
     generated_at: datetime,
     data_source: DataSource = "mock",
+    task_outcomes: Sequence[TaskOutcome] = (),
 ) -> dict[str, Any]:
     """Build the v1 JSON results document (not yet written to disk -- see
     ``reporting.writer``).
@@ -130,6 +153,15 @@ def build_results_document(
     truncation -- D15 requires truncation to apply to presentation only,
     so this document keeps both numbers rather than only the truncated
     one.
+
+    ``task_outcomes`` is the run's full task ledger (T26, Phase 4) -- every
+    ``TaskOutcome``, successful or not. This function filters it down to
+    the error-state subset itself (``reporting.view.failed_task_outcomes``)
+    and emits it, one entry per failed destination, as the top-level
+    ``failed_searches`` array -- always present, empty when nothing failed
+    (including when ``task_outcomes`` is left at its default), never
+    omitted, so a consumer never has to distinguish a missing key from an
+    empty list.
 
     Raises ``ValueError`` if ``accepted_count`` is smaller than
     ``len(ranked)`` -- truncation can only ever shrink what is *shown*,
@@ -150,4 +182,7 @@ def build_results_document(
         "accepted_count": accepted_count,
         "top_n": top_n,
         "top_itineraries": [_itinerary_to_json(item, data_source=data_source) for item in ranked],
+        "failed_searches": [
+            _failed_search_to_json(outcome) for outcome in failed_task_outcomes(task_outcomes)
+        ],
     }

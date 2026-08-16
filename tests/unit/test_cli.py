@@ -34,6 +34,7 @@ import typer
 from typer.testing import CliRunner
 
 from flightagent.cli import (
+    ALL_DESTINATIONS_FAILED_EXIT_CODE,
     NO_VALID_ITINERARIES_EXIT_CODE,
     _deterministic_as_of,
     _parse_departure_date,
@@ -43,9 +44,30 @@ from flightagent.cli import (
 )
 from flightagent.domain.enums import CabinClass
 from flightagent.domain.run import SearchRequest
-from flightagent.providers.errors import ProviderConfigError, ProviderNotConfigured
+from flightagent.providers.errors import (
+    ProviderConfigError,
+    ProviderNotConfigured,
+    ProviderTimeoutError,
+)
+from tests.support.instrumented_provider import Fail, InstrumentedProvider, Succeed
 
 runner = CliRunner()
+
+# The 8 registered destinations, per airports.registry -- matching
+# tests/unit/test_retry.py's own constant, so a script keyed by this tuple
+# covers every task the planner builds for a single origin.
+_ALL_8_DESTINATIONS = ("DEL", "BOM", "BLR", "HYD", "MAA", "CCU", "LKO", "VNS")
+
+_ALL_DESTINATIONS_ARGS = [
+    "run",
+    "--origin",
+    "AMS",
+    "--date",
+    "2027-07-17",
+    "--max-stops",
+    "1",
+    "--all-destinations",
+]
 
 _TARGET_ARGS = [
     "run",
@@ -69,6 +91,16 @@ def isolated_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     the real repo's ``out/`` directory from inside the test suite."""
     monkeypatch.chdir(tmp_path)
     return tmp_path
+
+
+def _parse_log_lines(stderr_text: str) -> list[dict[str, object]]:
+    """Every non-empty line of ``stderr_text`` parsed as one structured log
+    record -- ``observability.logging.RedactingJsonFormatter`` emits exactly
+    one JSON object per line (same helper as ``test_retry.py``'s own, kept
+    local here rather than shared, matching this test suite's existing
+    per-file-helper convention).
+    """
+    return [json.loads(line) for line in stderr_text.splitlines() if line.strip()]
 
 
 class TestTargetInvocation:
@@ -245,3 +277,190 @@ class TestHelperFunctions:
         )
         as_of = _deterministic_as_of(request)
         assert as_of.date() < request.departure_date
+
+
+class TestAllDestinationsCliValidation:
+    """T27: exactly one of ``--dest``/``--all-destinations`` must be given
+    -- both, or neither, is a ``typer.BadParameter`` usage error (exit code
+    2), never a silent ambiguity resolved in either flag's favour.
+    """
+
+    def test_both_dest_and_all_destinations_is_rejected(self, isolated_cwd: Path) -> None:
+        args = [*_ALL_DESTINATIONS_ARGS, "--dest", "DEL"]
+        result = runner.invoke(app, args)
+
+        assert result.exit_code == 2, result.output
+        assert "mutually exclusive" in result.output
+        assert not (isolated_cwd / "out").exists()
+
+    def test_neither_dest_nor_all_destinations_is_rejected(self, isolated_cwd: Path) -> None:
+        args = [arg for arg in _ALL_DESTINATIONS_ARGS if arg != "--all-destinations"]
+        result = runner.invoke(app, args)
+
+        assert result.exit_code == 2, result.output
+        assert "required" in result.output
+        assert not (isolated_cwd / "out").exists()
+
+
+class TestAllDestinationsSucceeds:
+    """T27: ``--all-destinations`` fans ``--origin`` out across every
+    registry destination. Proved here with T25's own ``InstrumentedProvider``
+    test double, scripted to succeed everywhere, via ``_build_provider``
+    monkeypatched to hand back that instrumented instance for
+    ``--provider mock`` -- exactly the same substitution pattern
+    ``test_retry.py`` uses for the executor, applied one layer up at the
+    CLI.
+    """
+
+    def _succeeding_provider(self) -> InstrumentedProvider:
+        # offer_count=2 exactly matches how many offers MockProvider's own
+        # generator returns for these request shapes (verified against the
+        # real target invocation) -- this double's offers are the SAME
+        # deterministic ``generate_offers`` output, not a hand-rolled stub,
+        # so "succeeds for all 8 destinations" here means the identical
+        # thing it would mean running the real mock provider directly.
+        return InstrumentedProvider(
+            scripts={destination: [Succeed(offer_count=2)] for destination in _ALL_8_DESTINATIONS}
+        )
+
+    def test_issues_exactly_8_provider_calls_and_writes_both_artifacts(
+        self, isolated_cwd: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        provider = self._succeeding_provider()
+        monkeypatch.setattr("flightagent.cli._build_provider", lambda name: provider)
+
+        result = runner.invoke(app, _ALL_DESTINATIONS_ARGS)
+
+        assert result.exit_code == 0, result.output
+        assert len(provider.call_log) == 8
+        assert {record.destination for record in provider.call_log} == set(_ALL_8_DESTINATIONS)
+        assert {record.origin for record in provider.call_log} == {"AMS"}
+
+        report_path = isolated_cwd / "out" / "flight_report_2027-07-17.md"
+        results_path = isolated_cwd / "out" / "flight_results_2027-07-17.json"
+        assert report_path.is_file()
+        assert results_path.is_file()
+
+        report_text = report_path.read_text(encoding="utf-8")
+        assert "SYNTHETIC DATA" in report_text
+        assert "## Recommended Flight" in report_text
+        # Every destination succeeded -- T26's Failed Searches section must
+        # stay absent, not render an empty heading.
+        assert "Failed Searches" not in report_text
+
+        results = json.loads(results_path.read_text(encoding="utf-8"))
+        assert results["data_source"] == "mock"
+        assert results["accepted_count"] >= 1
+        assert results["failed_searches"] == []
+        represented_destinations = {item["destination"] for item in results["top_itineraries"]}
+        assert represented_destinations
+        assert represented_destinations <= set(_ALL_8_DESTINATIONS)
+
+
+class TestTruncatedDestinationEmitsWarningLog:
+    """Non-blocking gap mitigation (Fix 2): when the global top-N cut
+    (``config.output.top_n_global``, default 10) discards every accepted
+    itinerary for a destination that DID have >=1 valid, accepted
+    itinerary, that destination silently vanishes from the report -- this
+    does not fix that (Phase 5/6 scope), it only makes sure the drop is
+    OBSERVABLE via a ``EventName.RANK_DESTINATION_DROPPED`` WARNING log
+    line.
+
+    Reuses ``TestAllDestinationsSucceeds``'s own scripted double
+    (``Succeed(offer_count=2)`` for all 8 destinations, the SAME
+    deterministic ``generate_offers`` output every other test in this class
+    uses) -- verified empirically (not asserted blind) to produce 11
+    accepted itineraries total, one more than ``top_n_global``'s default of
+    10, with destination ``LKO`` entirely cut from the truncated/shown set.
+    """
+
+    def _succeeding_provider(self) -> InstrumentedProvider:
+        return InstrumentedProvider(
+            scripts={destination: [Succeed(offer_count=2)] for destination in _ALL_8_DESTINATIONS}
+        )
+
+    def test_destination_entirely_cut_by_truncation_logs_a_warning(
+        self, isolated_cwd: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        provider = self._succeeding_provider()
+        monkeypatch.setattr("flightagent.cli._build_provider", lambda name: provider)
+
+        result = runner.invoke(app, _ALL_DESTINATIONS_ARGS)
+
+        assert result.exit_code == 0, result.output
+
+        results_path = isolated_cwd / "out" / "flight_results_2027-07-17.json"
+        results = json.loads(results_path.read_text(encoding="utf-8"))
+        # Ground truth: 11 accepted total, only 10 shown -- LKO has an
+        # accepted itinerary (it is NOT a failed search) but is absent from
+        # every shown destination.
+        assert results["accepted_count"] == 11
+        assert len(results["top_itineraries"]) == 10
+        shown_destinations = {item["destination"] for item in results["top_itineraries"]}
+        assert "LKO" not in shown_destinations
+        failed_destinations = {item["destination"] for item in results["failed_searches"]}
+        assert "LKO" not in failed_destinations
+
+        records = _parse_log_lines(result.stderr)
+        dropped_records = [
+            record for record in records if record.get("event") == "rank.destination_dropped"
+        ]
+        assert len(dropped_records) == 1
+        record = dropped_records[0]
+        assert record["level"] == "warning"
+        assert record["destinations"] == ["LKO"]
+        assert record["total_accepted"] == 11
+        assert record["shown_count"] == 10
+
+    def test_no_warning_when_nothing_is_truncated(
+        self, isolated_cwd: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The mirror case: a run where every destination fits inside
+        ``top_n_global`` untruncated must never emit the warning -- it is
+        not a generic "truncation happened" signal, only a "a destination
+        was entirely erased by it" one."""
+        provider = InstrumentedProvider(
+            scripts={destination: [Succeed(offer_count=1)] for destination in _ALL_8_DESTINATIONS}
+        )
+        monkeypatch.setattr("flightagent.cli._build_provider", lambda name: provider)
+
+        result = runner.invoke(app, _ALL_DESTINATIONS_ARGS)
+
+        assert result.exit_code == 0, result.output
+        records = _parse_log_lines(result.stderr)
+        dropped_records = [
+            record for record in records if record.get("event") == "rank.destination_dropped"
+        ]
+        assert dropped_records == []
+
+
+class TestAllDestinationsFailed:
+    """T27 / finding 0.5: every task erroring must produce ``RunStatus.FAILED``
+    -- a distinct exit code and distinct wording from the NO_RESULTS path,
+    never the spec's misleading layover-rule string.
+    """
+
+    def test_every_destination_erroring_exits_with_the_failed_code_and_distinct_message(
+        self, isolated_cwd: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        provider = InstrumentedProvider(
+            scripts={
+                destination: [
+                    Fail(
+                        ProviderTimeoutError(
+                            f"{destination} unreachable", provider="instrumented"
+                        )
+                    )
+                ]
+                for destination in _ALL_8_DESTINATIONS
+            }
+        )
+        monkeypatch.setattr("flightagent.cli._build_provider", lambda name: provider)
+
+        result = runner.invoke(app, _ALL_DESTINATIONS_ARGS)
+
+        assert result.exit_code == ALL_DESTINATIONS_FAILED_EXIT_CODE, result.output
+        assert result.exit_code != NO_VALID_ITINERARIES_EXIT_CODE
+        assert "3–6 hour layover rule" not in result.output
+        assert "unreachable" in result.output or "failed" in result.output.lower()
+        assert not (isolated_cwd / "out").exists()

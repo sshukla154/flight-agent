@@ -40,6 +40,7 @@ class EventName(StrEnum):
     DEDUP_COMPLETED = "dedup.completed"
     SCORE_COMPLETED = "score.completed"
     RANK_COMPLETED = "rank.completed"
+    RANK_DESTINATION_DROPPED = "rank.destination_dropped"
     POLICY_DIRECT_DECISION = "policy.direct_decision"
     EARLYSTOP_EVALUATED = "earlystop.evaluated"
     EARLYSTOP_TRIGGERED = "earlystop.triggered"
@@ -162,6 +163,23 @@ class RankCompletedFields(EventFields):
     rankings: list[tuple[int, str, float, float]]
 
 
+class RankDestinationDroppedFields(EventFields):
+    """Non-blocking gap mitigation (Phase 4 fix): the global top-N cut
+    (``config.output.top_n_global``) discarded EVERY accepted itinerary for
+    one or more destinations that DID have at least one valid, accepted
+    itinerary before truncation -- indistinguishable, in the final report,
+    from a destination that was never searched at all. Full per-destination
+    visibility is Phase 5/6 scope (see ``reporting.markdown``'s own
+    docstring); this event exists only so the gap is OBSERVABLE in logs
+    rather than completely silent (this project's "never silently discard"
+    principle), never as a substitute for that later fix.
+    """
+
+    destinations: list[str]
+    total_accepted: int
+    shown_count: int
+
+
 class PolicyDirectDecisionFields(EventFields):
     """D10: the direct-tier decision and which threshold fired."""
 
@@ -239,6 +257,7 @@ EVENT_SCHEMAS: dict[EventName, type[EventFields]] = {
     EventName.DEDUP_COMPLETED: DedupCompletedFields,
     EventName.SCORE_COMPLETED: ScoreCompletedFields,
     EventName.RANK_COMPLETED: RankCompletedFields,
+    EventName.RANK_DESTINATION_DROPPED: RankDestinationDroppedFields,
     EventName.POLICY_DIRECT_DECISION: PolicyDirectDecisionFields,
     EventName.EARLYSTOP_EVALUATED: EarlystopEvaluatedFields,
     EventName.EARLYSTOP_TRIGGERED: EarlystopTriggeredFields,

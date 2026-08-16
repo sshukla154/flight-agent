@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://flightagent.invalid/schemas/results.schema.json",
   "title": "flight-agent results artifact (v1)",
-  "description": "Schema for out/flight_results_2027-07-17.json (D15), as produced by flightagent.reporting.json_report.build_results_document. v1 scope only (T15) -- grow this schema alongside the writer, never ahead of it. data_source is a structural top-level field per master plan S8.6.",
+  "description": "Schema for out/flight_results_2027-07-17.json (D15), as produced by flightagent.reporting.json_report.build_results_document. v1 scope plus Phase 4's T26 failed_searches -- grow this schema alongside the writer, never ahead of it. data_source is a structural top-level field per master plan S8.6.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -12,7 +12,8 @@
     "generated_at",
     "accepted_count",
     "top_n",
-    "top_itineraries"
+    "top_itineraries",
+    "failed_searches"
   ],
   "properties": {
     "schema_version": {
@@ -43,9 +44,34 @@
     "top_itineraries": {
       "type": "array",
       "items": { "$ref": "#/$defs/rankedItinerary" }
+    },
+    "failed_searches": {
+      "description": "Phase 4 (T26): one entry per TaskOutcome whose state is an error state (PROVIDER_ERROR, RATE_LIMITED, TIMEOUT -- domain.run's _ERROR_STATES). Always present, empty when nothing failed.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/failedSearch" }
     }
   },
   "$defs": {
+    "failedSearch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["destination", "error_type", "error_detail"],
+      "properties": {
+        "destination": {
+          "description": "Destination IATA code parsed from the failed task's task_id (domain.ids.compute_task_id's '{origin}-{destination}-sN' shape).",
+          "type": "string",
+          "pattern": "^[A-Z]{3}$"
+        },
+        "error_type": {
+          "description": "TaskOutcome.error_type -- the error class, e.g. 'circuit_open'. Null when the outcome carries no error classification.",
+          "type": ["string", "null"]
+        },
+        "error_detail": {
+          "description": "TaskOutcome.error_detail -- a short human-readable detail. Null when the outcome carries no detail.",
+          "type": ["string", "null"]
+        }
+      }
+    },
     "rankedItinerary": {
       "type": "object",
       "additionalProperties": false,

@@ -12,10 +12,13 @@ files to catch.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import timedelta
 
 from flightagent.domain.itinerary import NormalizedItinerary
 from flightagent.domain.money import Money
+from flightagent.domain.run import _ERROR_STATES as _TASK_ERROR_STATES
+from flightagent.domain.run import TaskOutcome
 from flightagent.domain.segment import Segment
 
 _ONE_MINUTE = timedelta(minutes=1)
@@ -93,3 +96,36 @@ def format_price_eur(price: Money) -> str:
     a value that wasn't already exactly two decimal digits.
     """
     return f"€{price.amount:.2f}"
+
+
+def destination_from_task_id(task_id: str) -> str:
+    """The destination IATA code embedded in a ``task_id``.
+
+    ``domain.ids.compute_task_id`` builds every ``task_id`` as
+    ``f"{origin}-{destination}-s{max_stops}"`` (master plan S7). IATA codes
+    are always exactly three uppercase letters (``domain.airport.IataCode``)
+    and never contain a hyphen, so splitting on ``"-"`` and taking the
+    middle field is an exact inverse of that construction, not a
+    best-effort guess.
+    """
+    parts = task_id.split("-")
+    if len(parts) != 3:
+        raise ValueError(
+            f"task_id {task_id!r} does not match the "
+            "'{origin}-{destination}-s{max_stops}' shape produced by "
+            "domain.ids.compute_task_id"
+        )
+    return parts[1]
+
+
+def failed_task_outcomes(task_outcomes: Sequence[TaskOutcome]) -> list[TaskOutcome]:
+    """The subset of ``task_outcomes`` in an error state (``domain.run``'s
+    ``_ERROR_STATES``: PROVIDER_ERROR, RATE_LIMITED, TIMEOUT), in the same
+    relative order as given.
+
+    Factored out here for the same reason as every other helper in this
+    module: the Markdown and JSON renderers must never quietly disagree
+    about which tasks count as "failed" for the "Failed Searches" section
+    (Phase 4, T26).
+    """
+    return [outcome for outcome in task_outcomes if outcome.state in _TASK_ERROR_STATES]
