@@ -8,19 +8,40 @@ in this task's brief -- not an invented format:
 - An "Other Good Options" table with exactly four columns: Airline |
   Route | Layover | Price.
 
-Scope note (v1, per this task's brief): the "Direct Flight Analysis"
-section (Phase 5, T33) and the "Origin Comparison" table (Phase 6, T41)
-are deliberately NOT built here -- their underlying data (the
-direct-vs-stop policy, multi-origin fan-out) doesn't exist until those
-phases. ``render_markdown_report`` therefore still requires at least one
-ranked itinerary; the empty/no-results report path (finding 0.5's
-NO_RESULTS/FAILED ``RunStatus`` values) remains out of this function's
-scope.
+Phase 5 (T33) adds the "Direct Flight Analysis" section: Addendum 1's own
+five-column table (Destination | Airline | Price | Difference vs Cheapest
+Stop | Recommendation), one row per registry destination regardless of
+tier -- D15's amendment is explicit that this table is the only place a
+NOT_AVAILABLE/all-tier destination is visible at all once the global
+top-N ranking has truncated the main list. Rendered whenever the caller
+supplies at least one ``DestinationAnalysis``; empty (the pre-Phase-5
+default) renders no such section, matching every pre-Phase-5 call site.
+
+Scope note (v1, per this task's brief): the "Origin Comparison" table
+(Phase 6, T41) is deliberately NOT built here -- its underlying data (the
+multi-origin fan-out) doesn't exist until that phase. ``render_markdown_report``
+therefore still requires at least one ranked itinerary; the empty/no-results
+report path (finding 0.5's NO_RESULTS/FAILED ``RunStatus`` values) remains
+out of this function's scope.
 
 Phase 4 (T26) adds the "Failed Searches" section: rendered only when at
 least one ``TaskOutcome`` in the run's ledger is in an error state
 (PROVIDER_ERROR / RATE_LIMITED / TIMEOUT, ``domain.run``'s
 ``_ERROR_STATES``) -- never an empty heading when every task succeeded.
+
+Phase 5 (T34) adds the closing "Final Summary" line: one of two prose
+templates (A1-8's restated acceptance criterion, DECISIONS.md), chosen by
+the tier of the ``DestinationAnalysis`` belonging to the report's OVERALL
+best destination -- ``ranked[0]`` (``top`` below), the exact same
+itinerary T15/T33 already treat as "the primary result" for the
+"Recommended Flight" block, never a second, independently-chosen notion
+of "the main destination". Every number in the sentence (the EUR price
+difference, the whole-hours time saving) is read directly off that
+``DestinationAnalysis``, never hardcoded -- rendered only when
+``destination_analyses`` contains a matching, price-comparable entry for
+that destination, so a pre-Phase-5 call site (no ``destination_analyses``)
+or a NOT_AVAILABLE/direct-only primary destination (nothing priced to
+state a difference from) renders no such line at all.
 
 Assembly is plain f-string/helper functions, not a templating engine --
 the report is small enough (one block, one table, one summary line) that
@@ -37,9 +58,12 @@ footnote that can be truncated or ignored.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
+from flightagent.domain.enums import DirectTier
 from flightagent.domain.itinerary import NormalizedItinerary
+from flightagent.domain.money import Money
+from flightagent.domain.policy import DestinationAnalysis
 from flightagent.domain.run import TaskOutcome
 from flightagent.domain.scoring import ScoredItinerary
 from flightagent.reporting.booking_link import (
@@ -51,6 +75,7 @@ from flightagent.reporting.booking_link import (
 from flightagent.reporting.view import (
     airline_string,
     destination_from_task_id,
+    direct_tier_recommendation_label,
     failed_task_outcomes,
     first_segment,
     format_layover,
@@ -145,6 +170,92 @@ def _escape_table_cell(text: str) -> str:
     return text.replace("|", "\\|").replace("\n", " ")
 
 
+_NO_DIRECT_ITINERARY_TEXT = "–"
+"""En dash, D18's own "no value to show" convention (the fare-matrix's
+``NO_OFFERS`` cell) reused here for a ``DestinationAnalysis`` with no
+``cheapest_direct`` (NOT_AVAILABLE) or no ``price_difference`` (the
+degenerate "direct exists, no one-stop alternative" case, T31) -- never a
+fabricated 0.00 or an empty cell that could be mistaken for a rendering
+bug."""
+
+_DIRECT_TIER_STAR = "★ "
+"""Prefixed onto the Recommendation cell's text for ``DirectTier.RECOMMENDED``
+only -- a display-only visual marker (this task's own "consider a visual
+marker like the spec's own star" note), layered on top of
+``reporting.view.direct_tier_recommendation_label``'s shared plain-text
+label rather than baked into it, so the JSON artifact's ``recommendation``
+field (which reuses that same shared label) stays star-free plain text."""
+
+
+def _direct_tier_recommendation_cell(tier: DirectTier) -> str:
+    label = direct_tier_recommendation_label(tier)
+    if tier == DirectTier.RECOMMENDED:
+        return f"{_DIRECT_TIER_STAR}{label}"
+    return label
+
+
+def _direct_flight_analysis_table(analyses: Sequence[DestinationAnalysis]) -> str:
+    """Addendum 1's exact 5-column table (D10, T33): one row per
+    ``DestinationAnalysis``, in the order given -- ALL of them, regardless
+    of tier, per D15's amendment (a NOT_AVAILABLE destination has to stay
+    visible here even though the global top-N ranking may have dropped it
+    from every other section entirely).
+
+    Airline/Price come from ``cheapest_direct`` -- this table is about the
+    DIRECT option specifically -- and render as
+    ``_NO_DIRECT_ITINERARY_TEXT`` when no direct service exists at all
+    (``tier == NOT_AVAILABLE``, ``cheapest_direct is None``). Difference
+    vs Cheapest Stop renders the same placeholder whenever
+    ``price_difference`` is ``None`` -- either that same NOT_AVAILABLE
+    case, or the degenerate "direct exists, no valid one-stop alternative"
+    case (T31), where there is nothing priced to compare against.
+
+    Any destination with ``score_policy_divergence`` set appends one
+    sentence per destination after the table (finding 0.1) -- the ranked
+    list's ``adjusted_score`` ordering and this table's tier can
+    legitimately disagree above roughly a EUR755 one-stop fare, and the
+    report must say so rather than silently contradicting itself two
+    sections apart.
+    """
+    lines = [
+        "## Direct Flight Analysis",
+        "",
+        "| Destination | Airline | Price | Difference vs Cheapest Stop | Recommendation |",
+        "|---|---|---|---|---|",
+    ]
+    for analysis in analyses:
+        if analysis.cheapest_direct is not None:
+            airline = airline_string(analysis.cheapest_direct)
+            price = format_price_eur(analysis.cheapest_direct.price_eur)
+        else:
+            airline = _NO_DIRECT_ITINERARY_TEXT
+            price = _NO_DIRECT_ITINERARY_TEXT
+
+        difference = (
+            format_price_eur(analysis.price_difference)
+            if analysis.price_difference is not None
+            else _NO_DIRECT_ITINERARY_TEXT
+        )
+        recommendation = _direct_tier_recommendation_cell(analysis.tier)
+
+        lines.append(
+            f"| {analysis.destination} | {airline} | {price} | {difference} | "
+            f"{recommendation} |"
+        )
+
+    divergent = [analysis for analysis in analyses if analysis.score_policy_divergence]
+    if divergent:
+        lines.append("")
+        lines.append(
+            "**Note:** for the destination(s) below, this table's recommendation and the "
+            "ranked list's `adjusted_score` ordering disagree (finding 0.1):"
+        )
+        for analysis in divergent:
+            lines.append(f"- **{analysis.destination}:** {analysis.divergence_explanation}")
+
+    return "\n".join(lines)
+
+
 def _failed_searches_table(failed: Sequence[TaskOutcome]) -> str:
     lines = [
         "## Failed Searches",
@@ -165,6 +276,119 @@ def _failed_searches_table(failed: Sequence[TaskOutcome]) -> str:
     return "\n".join(lines)
 
 
+_FINAL_SUMMARY_DIRECT_TIERS = (DirectTier.RECOMMENDED, DirectTier.GOOD_VALUE)
+"""Tiers for which the Final Summary (T34) uses the "recommend the direct
+flight" template -- the same two tiers Addendum 1's report column renders
+as some flavour of "Recommended" (``reporting.view``'s
+``_DIRECT_TIER_RECOMMENDATION_LABELS``), reused here rather than a second,
+independently-maintained tier grouping."""
+
+_ONE_HOUR = timedelta(hours=1)
+_HALF_HOUR = timedelta(minutes=30)
+
+
+def _whole_hours_saved(time_saved: timedelta) -> int:
+    """Round a (non-negative) ``time_saved`` to the nearest whole hour,
+    half-up -- the spec's own "approximately 7 hours" phrasing implies
+    rounding, not truncation. Computed via ``timedelta`` floor-division
+    only (finding 0.3's convention: never route a number that ends up in a
+    report through ``float``), never called on a negative ``time_saved``
+    -- the caller omits the whole clause in that case instead.
+    """
+    return (time_saved + _HALF_HOUR) // _ONE_HOUR
+
+
+def _hours_saved_clause(time_saved: timedelta | None) -> str:
+    """`` and saves approximately {N} hour(s) of travel time"`` -- or the
+    empty string when there is nothing true to say: ``time_saved`` is
+    unknown (``None``) or negative (the direct itinerary is actually
+    SLOWER, T32's design) never gets this clause, because the sentence
+    must never state something false about the data.
+    """
+    if time_saved is None or time_saved < timedelta():
+        return ""
+    hours = _whole_hours_saved(time_saved)
+    unit = "hour" if hours == 1 else "hours"
+    return f" and saves approximately {hours} {unit} of travel time"
+
+
+def _final_summary_sentence(analysis: DestinationAnalysis) -> str:
+    """One of the two Final Summary templates (T34, A1-8), filled in from
+    ``analysis`` -- never from the spec's own example numbers.
+
+    Requires ``analysis.price_difference`` to be present: the caller
+    (``render_markdown_report``) only invokes this once it has confirmed a
+    real direct-vs-one-stop price comparison exists for the primary
+    destination. A NOT_AVAILABLE tier (no direct service at all) or the
+    "direct exists, no one-stop alternative" degenerate case (T31) has
+    nothing priced to state a difference from, so neither template's claim
+    would be true -- the caller renders no Final Summary line at all for
+    those, rather than calling this function.
+    """
+    if analysis.price_difference is None:
+        raise ValueError(
+            "_final_summary_sentence requires analysis.price_difference to be present -- "
+            "the caller must confirm a real direct-vs-one-stop comparison exists first"
+        )
+    diff_text = format_price_eur(analysis.price_difference)
+
+    if analysis.tier in _FINAL_SUMMARY_DIRECT_TIERS:
+        # DestinationAnalysis's own model_validator guarantees cheapest_direct
+        # is present whenever tier != NOT_AVAILABLE.
+        assert analysis.cheapest_direct is not None
+        route = route_string(analysis.cheapest_direct)
+        time_clause = _hours_saved_clause(analysis.time_saved)
+        if analysis.price_difference.amount < 0:
+            # The direct itinerary is not just tier-recommended but actually
+            # CHEAPER than the one-stop alternative (price_difference has no
+            # abs() by design -- see the module docstring). "Only €-X more
+            # expensive" reads as broken English for a negative diff, so this
+            # branch states the real relationship instead of the magnitude of
+            # a negative number formatted as if it were a surcharge.
+            cheaper_amount = -analysis.price_difference.amount
+            cheaper_text = format_price_eur(
+                Money(amount=cheaper_amount, currency=analysis.price_difference.currency)
+            )
+            return (
+                f"The direct {route} flight is actually {cheaper_text} cheaper than the "
+                f"cheapest valid one-stop option{time_clause}. I recommend choosing the "
+                f"direct flight."
+            )
+        return (
+            f"The direct {route} flight is only {diff_text} more expensive than the cheapest "
+            f"valid one-stop option{time_clause}. I recommend choosing the direct flight."
+        )
+
+    return (
+        f"The direct flight is {diff_text} more expensive than the cheapest valid one-stop "
+        "itinerary, so the one-stop option offers significantly better value."
+    )
+
+
+def _primary_destination(top: ScoredItinerary) -> str:
+    """The IATA code of the report's single primary result's destination
+    -- ``ranked[0]`` (this function's caller's own ``top``), the exact
+    itinerary T15/T33 already build the "Recommended Flight" block from.
+    The Final Summary sentence (T34) judges this same destination's
+    ``DestinationAnalysis``; there is no second notion of "the main
+    destination" to invent.
+    """
+    return last_segment(top.itinerary).destination
+
+
+def _primary_destination_analysis(
+    top: ScoredItinerary, destination_analyses: Sequence[DestinationAnalysis]
+) -> DestinationAnalysis | None:
+    """The ``DestinationAnalysis`` matching ``top``'s destination, or
+    ``None`` when ``destination_analyses`` is empty (no Phase 5 data
+    supplied) or simply has no entry for that destination."""
+    primary_destination = _primary_destination(top)
+    for analysis in destination_analyses:
+        if analysis.destination == primary_destination:
+            return analysis
+    return None
+
+
 def render_markdown_report(
     ranked: Sequence[ScoredItinerary],
     *,
@@ -173,6 +397,7 @@ def render_markdown_report(
     generated_at: datetime,
     data_source: DataSource = "mock",
     task_outcomes: Sequence[TaskOutcome] = (),
+    destination_analyses: Sequence[DestinationAnalysis] = (),
 ) -> str:
     """Render the full v1 Markdown report.
 
@@ -192,6 +417,22 @@ def render_markdown_report(
     non-empty. Passing nothing (the default) renders no such section at
     all, matching the ``ranked``-only call sites this function already had
     before Phase 4.
+
+    ``destination_analyses`` is one ``DestinationAnalysis`` per registry
+    destination (Phase 5, T33, D10) -- rendered as the "## Direct Flight
+    Analysis" section, ALL of them regardless of tier, whenever this
+    sequence is non-empty. Passing nothing (the default) renders no such
+    section, matching every pre-Phase-5 call site.
+
+    The same ``destination_analyses`` also drives the closing "Final
+    Summary" line (Phase 5, T34): whichever entry matches ``ranked[0]``'s
+    destination (the report's one primary result) picks one of two prose
+    templates by its ``tier``, filled in with its real EUR price
+    difference and, when non-negative, its real whole-hours time saving.
+    Rendered only when a matching, price-comparable entry exists; silently
+    omitted otherwise (no ``destination_analyses``, no matching entry, or
+    a NOT_AVAILABLE/direct-only primary destination) rather than stating
+    something the data doesn't support.
 
     Raises ``ValueError`` if ``ranked`` is empty: the empty/no-results
     report path is Phase 4 scope, not this task's (see module docstring).
@@ -221,6 +462,10 @@ def render_markdown_report(
         sections.append(_other_good_options_table(others))
         sections.append("")
 
+    if destination_analyses:
+        sections.append(_direct_flight_analysis_table(destination_analyses))
+        sections.append("")
+
     if failed:
         sections.append(_failed_searches_table(failed))
         sections.append("")
@@ -231,5 +476,10 @@ def render_markdown_report(
         f"with an adjusted score of {top.components.adjusted_score}. Report generated "
         f"{generated_at.isoformat()}."
     )
+
+    primary_analysis = _primary_destination_analysis(top, destination_analyses)
+    if primary_analysis is not None and primary_analysis.price_difference is not None:
+        sections.append("")
+        sections.append(f"**Final Summary:** {_final_summary_sentence(primary_analysis)}")
 
     return "\n".join(sections) + "\n"

@@ -13,7 +13,7 @@
 | `CONFIRMED` | The project owner has explicitly signed this off. |
 | `DEFAULT (unconfirmed)` | A recommended default that work proceeds on so implementation is not blocked. The owner has **not** signed it off. It can change. |
 
-As of 2026-08-14 exactly three decisions are `CONFIRMED`: **D16, D17, D18**. Every other decision in this register — D1 through D15, and D19 (added 2026-08-16, scoping Phase 4) — is `DEFAULT (unconfirmed)`. That distinction is the whole point of the register — do not quietly promote a default to a confirmation because code now depends on it.
+As of 2026-08-16, four decisions are `CONFIRMED`: **D10, D16, D17, D18**. Every other decision in this register — D1 through D9, D11 through D15, and D19 (added 2026-08-16, scoping Phase 4) — is `DEFAULT (unconfirmed)`. That distinction is the whole point of the register — do not quietly promote a default to a confirmation because code now depends on it.
 
 ---
 
@@ -199,7 +199,7 @@ Both weights are config. When the two orderings disagree, the report says so in 
 
 Record `tier_reason` carrying which threshold fired and with what numbers. The outer band (`<= 150` or `<= 0.20`) is the spec's own 150/20% rule and is **specified**; the inner band (`100` / `0.10`) is **inferred**.
 
-**Status.** `DEFAULT (unconfirmed)` — and the least settled decision in this register. See [Confirm before Phase 5](#confirm-before-phase-5).
+**Status.** `CONFIRMED` — decided by the project owner 2026-08-16, exactly matching the architecture pass's ladder shown above. Still config-driven per this decision's own mitigation, so a future retune remains a YAML edit, not a code change.
 
 **Rationale.** The spec's prose defines three outcomes, its predicate is binary, and its example table adds a fourth label ("Optional") for a case that fails both rules. Some inner threshold has to be invented; making it config means inventing it costs nothing to correct.
 
@@ -381,16 +381,7 @@ Currently `DEFAULT (unconfirmed)`: `[180,240) → 0`, `[240,300) → +10`, `[300
 
 ### D10 — direct-tier thresholds
 
-Currently `DEFAULT (unconfirmed)`. **The two planning passes disagreed**, and the disagreement is on record:
-
-| Pass | Proposed `RECOMMENDED` condition |
-|---|---|
-| Architecture pass (`01-architecture-pass.md`) | `diff <= 100` or `rel <= 0.10` |
-| Execution plan pass (`02-execution-plan-pass.md`) | `rel <= 0.15` |
-
-**Both readings are inferred, not specified**, and both reproduce all four of the spec's own example rows — which is exactly why the source underdetermines the answer and why two independent passes landed in different places. The register defaults to the architecture pass's ladder (see D10) because it expresses both an absolute and a relative arm, matching the shape of the spec's outer rule.
-
-**Mitigation, and it is already mandated by D10:** implement the tier ladder as a **config-driven band table** so a change is a YAML edit rather than a code change. That costs roughly 1h and removes the schedule risk entirely — Phase 5 no longer blocks on the answer, only the golden files do. Do not skip this on the grounds that the default "looks right".
+**RESOLVED 2026-08-16** — `CONFIRMED` by the project owner as the architecture pass's ladder (`diff <= 100` or `rel <= 0.10` for `RECOMMENDED`; `diff <= 150` or `rel <= 0.20` for `GOOD_VALUE`). The two planning passes had disagreed (execution-plan pass proposed `rel <= 0.15`); both readings were inferred, not specified, and both reproduced all four of the spec's own example rows. Still implemented as a config-driven band table per D10's own mitigation, so any future retune is a YAML edit, not a code change.
 
 ---
 

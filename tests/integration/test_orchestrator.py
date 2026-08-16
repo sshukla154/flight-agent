@@ -64,9 +64,14 @@ def _registry_destination_codes() -> set[str]:
 
 
 class TestFanOutIssuesExactlyOneCallPerDestination:
-    def test_issues_exactly_8_provider_calls_one_per_registry_destination(
+    def test_issues_exactly_16_provider_calls_two_per_registry_destination(
         self, isolated_cwd: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """T29: ``--all-destinations`` now searches both ``max_stops`` modes
+        for every destination -- 8 destinations x 2 modes = 16 calls, each
+        destination appearing exactly twice (one direct, one one-stop),
+        never once and never more than twice.
+        """
         expected_destinations = _registry_destination_codes()
         assert len(expected_destinations) == 8
 
@@ -83,13 +88,17 @@ class TestFanOutIssuesExactlyOneCallPerDestination:
 
         # EXACT count -- asserted against the instrumented provider's own
         # call log, never inferred from the report's contents.
-        assert len(provider.call_log) == 8
+        assert len(provider.call_log) == 16
 
         called_destinations = [record.destination for record in provider.call_log]
-        # No duplicate, no omission -- exactly the registry set, each
-        # exactly once.
+        # No omission -- exactly the registry set, each exactly twice.
         assert set(called_destinations) == expected_destinations
-        assert len(set(called_destinations)) == len(called_destinations)
+        assert len(called_destinations) == 2 * len(expected_destinations)
+        for destination in expected_destinations:
+            assert called_destinations.count(destination) == 2
+            destination_calls = [r for r in provider.call_log if r.destination == destination]
+            modes = sorted(record.max_stops for record in destination_calls)
+            assert modes == [0, 1]
         assert {record.origin for record in provider.call_log} == {_ORIGIN}
 
 
@@ -110,10 +119,10 @@ class TestFanOutConcurrencyIsBoundedAndReal:
             scripts={
                 destination: [Succeed(offer_count=2)] for destination in expected_destinations
             },
-            # Long enough that 8 calls truly overlapping in real wall-clock
+            # Long enough that calls truly overlapping in real wall-clock
             # time is not a coincidence of scheduling; short enough the
-            # test still runs in well under a second (all 8 delays overlap
-            # rather than stack).
+            # test still runs in well under a second (every batch of
+            # concurrent delays overlaps rather than stacks).
             call_delay_seconds=0.2,
         )
         monkeypatch.setattr("flightagent.cli._build_provider", lambda name: provider)
@@ -121,7 +130,8 @@ class TestFanOutConcurrencyIsBoundedAndReal:
         result = runner.invoke(app, _ALL_DESTINATIONS_ARGS)
 
         assert result.exit_code == 0, result.output
-        assert len(provider.call_log) == 8
+        # T29: 8 destinations x 2 modes (direct + one-stop) = 16 calls, not 8.
+        assert len(provider.call_log) == 16
 
         # Never exceeds the semaphore bound...
         assert provider.peak_in_flight <= max_concurrent

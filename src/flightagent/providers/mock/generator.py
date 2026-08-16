@@ -92,6 +92,22 @@ _DIRECT_CARRIERS: tuple[str, ...] = ("AI", "9W", "6E")
 
 _ONE_HUNDRED = Decimal(100)
 
+_NO_DIRECT_SERVICE_DESTINATIONS: frozenset[str] = frozenset({"VNS"})
+"""Destinations with no real nonstop Europe-India service (Phase 5, T29).
+
+Varanasi (VNS) is a regional/pilgrimage-city airport: every real-world
+itinerary from a European origin connects through DEL/BOM or a Gulf hub
+(DXB/IST/DOH) -- there is no genuine direct flight to reproduce here.
+Before this change every destination's ``max_stops=0`` search fabricated
+two direct offers regardless of real-world route existence, which made it
+impossible for Phase 5's own Direct Flight Analysis table to ever show a
+``NOT_AVAILABLE`` row (D10) -- ``_generate_direct_offers`` below returns
+``()`` for any destination in this set, a legitimate "no direct service"
+answer, never an error. One-stop searches for these destinations
+(``_generate_one_stop_offers``) are entirely unaffected -- VNS genuinely
+is reachable one-stop through a hub, exactly like every other destination.
+"""
+
 
 def _zone_for(iata: str) -> str:
     try:
@@ -149,6 +165,13 @@ def generate_offers(request: SearchRequest) -> tuple[RawOffer, ...]:
 
 
 def _generate_direct_offers(request: SearchRequest, rng: Random) -> tuple[RawOffer, ...]:
+    if request.destination in _NO_DIRECT_SERVICE_DESTINATIONS:
+        # Legitimate "no direct service exists" answer (D10's NOT_AVAILABLE
+        # tier, master plan/T29) -- not an error, not a shortage of RNG
+        # draws, just nothing to return. See _NO_DIRECT_SERVICE_DESTINATIONS'
+        # own docstring above.
+        return ()
+
     depart_times = (time(7, 30), time(13, 45))
     offers = []
     origin_zone = _zone_for(request.origin)

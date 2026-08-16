@@ -72,6 +72,26 @@ min_minutes = 300
 max_minutes = 360          # inclusive top of D8's [180, 360] window
 penalty_eur = 20
 
+[direct_tier]
+# D10 (CONFIRMED 2026-08-16): the direct-vs-one-stop tier ladder, as a
+# config-driven band table rather than inline constants -- D10's own
+# mitigation is that a future retune is a YAML edit here, never a code
+# change in policy/direct_vs_stop.py. Predicate per tier is OR, not AND:
+# a destination qualifies if EITHER the absolute-EUR arm OR the relative
+# arm passes.
+#   RECOMMENDED  if diff <= recommended_max_diff_eur  or rel <= recommended_max_relative
+#   GOOD_VALUE   if diff <= good_value_max_diff_eur   or rel <= good_value_max_relative
+#   NOT_RECOMMENDED otherwise
+#   NOT_AVAILABLE if no direct service exists at all
+# The outer band (150 / 0.20) is the spec's own specified 150€/20% rule;
+# the inner band (100 / 0.10) was inferred by the architecture pass and is
+# now owner-confirmed (DECISIONS.md D10) -- see that entry before touching
+# either number.
+recommended_max_diff_eur = 100
+recommended_max_relative = 0.10
+good_value_max_diff_eur = 150
+good_value_max_relative = 0.20
+
 [scoring]
 # score = price + time_value_eur_per_hour * duration_hours + layover_penalty
 #         + direct_bonus

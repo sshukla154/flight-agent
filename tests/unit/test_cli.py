@@ -304,12 +304,12 @@ class TestAllDestinationsCliValidation:
 
 class TestAllDestinationsSucceeds:
     """T27: ``--all-destinations`` fans ``--origin`` out across every
-    registry destination. Proved here with T25's own ``InstrumentedProvider``
-    test double, scripted to succeed everywhere, via ``_build_provider``
-    monkeypatched to hand back that instrumented instance for
-    ``--provider mock`` -- exactly the same substitution pattern
-    ``test_retry.py`` uses for the executor, applied one layer up at the
-    CLI.
+    registry destination, in BOTH ``max_stops`` modes (T29, Addendum 1).
+    Proved here with T25's own ``InstrumentedProvider`` test double,
+    scripted to succeed everywhere, via ``_build_provider`` monkeypatched to
+    hand back that instrumented instance for ``--provider mock`` -- exactly
+    the same substitution pattern ``test_retry.py`` uses for the executor,
+    applied one layer up at the CLI.
     """
 
     def _succeeding_provider(self) -> InstrumentedProvider:
@@ -319,11 +319,19 @@ class TestAllDestinationsSucceeds:
         # deterministic ``generate_offers`` output, not a hand-rolled stub,
         # so "succeeds for all 8 destinations" here means the identical
         # thing it would mean running the real mock provider directly.
+        # VNS's OWN direct-mode (max_stops=0) call is the one exception:
+        # T29's generator fix makes VNS legitimately return zero direct
+        # offers (NOT_AVAILABLE, D10) -- InstrumentedProvider's own
+        # _offers_for helper honours that instead of fabricating 2 offers
+        # anyway, so VNS's direct task ends NO_OFFERS while its one-stop
+        # task still succeeds normally. NO_OFFERS is not an error state
+        # (domain.run._ERROR_STATES), so this does not turn VNS into a
+        # "Failed Search" below.
         return InstrumentedProvider(
             scripts={destination: [Succeed(offer_count=2)] for destination in _ALL_8_DESTINATIONS}
         )
 
-    def test_issues_exactly_8_provider_calls_and_writes_both_artifacts(
+    def test_issues_exactly_16_provider_calls_and_writes_both_artifacts(
         self, isolated_cwd: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         provider = self._succeeding_provider()
@@ -332,9 +340,16 @@ class TestAllDestinationsSucceeds:
         result = runner.invoke(app, _ALL_DESTINATIONS_ARGS)
 
         assert result.exit_code == 0, result.output
-        assert len(provider.call_log) == 8
+        # T29: dual-mode search issues 2 calls per destination (direct AND
+        # one-stop), never just 1 -- 8 destinations x 2 modes = 16.
+        assert len(provider.call_log) == 16
         assert {record.destination for record in provider.call_log} == set(_ALL_8_DESTINATIONS)
         assert {record.origin for record in provider.call_log} == {"AMS"}
+        assert {record.max_stops for record in provider.call_log} == {0, 1}
+        for destination in _ALL_8_DESTINATIONS:
+            destination_calls = [r for r in provider.call_log if r.destination == destination]
+            modes_called = sorted(record.max_stops for record in destination_calls)
+            assert modes_called == [0, 1], f"{destination} should be searched at both modes"
 
         report_path = isolated_cwd / "out" / "flight_report_2027-07-17.md"
         results_path = isolated_cwd / "out" / "flight_results_2027-07-17.json"
@@ -344,8 +359,10 @@ class TestAllDestinationsSucceeds:
         report_text = report_path.read_text(encoding="utf-8")
         assert "SYNTHETIC DATA" in report_text
         assert "## Recommended Flight" in report_text
-        # Every destination succeeded -- T26's Failed Searches section must
-        # stay absent, not render an empty heading.
+        # Every destination succeeded at >=1 mode -- T26's Failed Searches
+        # section must stay absent, not render an empty heading. VNS's
+        # direct-mode NO_OFFERS (see _succeeding_provider's own docstring)
+        # is not an error state, so it does not populate this section.
         assert "Failed Searches" not in report_text
 
         results = json.loads(results_path.read_text(encoding="utf-8"))
@@ -369,9 +386,16 @@ class TestTruncatedDestinationEmitsWarningLog:
     Reuses ``TestAllDestinationsSucceeds``'s own scripted double
     (``Succeed(offer_count=2)`` for all 8 destinations, the SAME
     deterministic ``generate_offers`` output every other test in this class
-    uses) -- verified empirically (not asserted blind) to produce 11
-    accepted itineraries total, one more than ``top_n_global``'s default of
-    10, with destination ``LKO`` entirely cut from the truncated/shown set.
+    uses) -- verified empirically (not asserted blind), now under T29's
+    dual-mode search, to produce 25 accepted itineraries total (roughly
+    double Phase 4's single-mode 11, since every destination except VNS
+    now contributes from BOTH a direct AND a one-stop search), 15 more than
+    ``top_n_global``'s default of 10, with destination ``VNS`` entirely cut
+    from the truncated/shown set -- VNS's direct search legitimately
+    returns zero offers (T29's generator fix), leaving it with only its
+    one-stop search's single accepted itinerary, too little to make the
+    cut once every other destination's (now doubled) itineraries compete
+    for the same 10 slots.
     """
 
     def _succeeding_provider(self) -> InstrumentedProvider:
@@ -391,15 +415,15 @@ class TestTruncatedDestinationEmitsWarningLog:
 
         results_path = isolated_cwd / "out" / "flight_results_2027-07-17.json"
         results = json.loads(results_path.read_text(encoding="utf-8"))
-        # Ground truth: 11 accepted total, only 10 shown -- LKO has an
-        # accepted itinerary (it is NOT a failed search) but is absent from
-        # every shown destination.
-        assert results["accepted_count"] == 11
+        # Ground truth (T29, dual-mode search): 25 accepted total, only 10
+        # shown -- VNS has an accepted itinerary (it is NOT a failed
+        # search) but is absent from every shown destination.
+        assert results["accepted_count"] == 25
         assert len(results["top_itineraries"]) == 10
         shown_destinations = {item["destination"] for item in results["top_itineraries"]}
-        assert "LKO" not in shown_destinations
+        assert "VNS" not in shown_destinations
         failed_destinations = {item["destination"] for item in results["failed_searches"]}
-        assert "LKO" not in failed_destinations
+        assert "VNS" not in failed_destinations
 
         records = _parse_log_lines(result.stderr)
         dropped_records = [
@@ -408,8 +432,8 @@ class TestTruncatedDestinationEmitsWarningLog:
         assert len(dropped_records) == 1
         record = dropped_records[0]
         assert record["level"] == "warning"
-        assert record["destinations"] == ["LKO"]
-        assert record["total_accepted"] == 11
+        assert record["destinations"] == ["VNS"]
+        assert record["total_accepted"] == 25
         assert record["shown_count"] == 10
 
     def test_no_warning_when_nothing_is_truncated(
@@ -418,7 +442,18 @@ class TestTruncatedDestinationEmitsWarningLog:
         """The mirror case: a run where every destination fits inside
         ``top_n_global`` untruncated must never emit the warning -- it is
         not a generic "truncation happened" signal, only a "a destination
-        was entirely erased by it" one."""
+        was entirely erased by it" one.
+
+        T29: dual-mode search roughly doubles accepted-itinerary volume (a
+        direct AND a one-stop search per destination), so even
+        ``offer_count=1`` everywhere produces 15 accepted itineraries --
+        already past the default ``top_n_global`` of 10 (verified
+        empirically). ``top_n_global`` is bumped via the env var config
+        layer (``config.loader``'s layer 3) to comfortably exceed that, so
+        this test genuinely proves the "nothing dropped" case rather than
+        accidentally re-exercising the truncation path above.
+        """
+        monkeypatch.setenv("FLIGHTAGENT__OUTPUT__TOP_N_GLOBAL", "100")
         provider = InstrumentedProvider(
             scripts={destination: [Succeed(offer_count=1)] for destination in _ALL_8_DESTINATIONS}
         )
@@ -427,6 +462,12 @@ class TestTruncatedDestinationEmitsWarningLog:
         result = runner.invoke(app, _ALL_DESTINATIONS_ARGS)
 
         assert result.exit_code == 0, result.output
+        results_path = isolated_cwd / "out" / "flight_results_2027-07-17.json"
+        results = json.loads(results_path.read_text(encoding="utf-8"))
+        # Sanity: this really is the untruncated case, not an accident of
+        # top_itineraries happening to still be <= 10.
+        assert results["accepted_count"] == len(results["top_itineraries"])
+
         records = _parse_log_lines(result.stderr)
         dropped_records = [
             record for record in records if record.get("event") == "rank.destination_dropped"

@@ -20,26 +20,40 @@ now optionally accepts the run's task ledger and always emits a top-level
 ``failed_searches`` array (destination/error_type/error_detail per
 error-state task) -- empty, never omitted, when nothing failed.
 
+Phase 5 (T33) adds the direct-vs-stop policy output: ``build_results_document``
+now optionally accepts a sequence of ``DestinationAnalysis`` (D10) and
+always emits a top-level ``destination_analyses`` array -- empty, never
+omitted, when none were computed (the single-``--dest`` pipeline never
+computes this at all, since D10's comparison is inherently a
+per-destination, both-modes-searched thing).
+
 All money and score values are emitted as **decimal-shaped strings**, never
 JSON numbers -- JSON has no decimal type, and round-tripping a ``Decimal``
 through a JSON float would reintroduce exactly the float-nondeterminism
 finding 0.3 exists to eliminate from this codebase's money/score
-arithmetic.
+arithmetic. ``destination_analyses`` entries follow the identical
+convention for ``price_eur``/``price_difference_eur``/``relative_difference``,
+and ``time_saved_minutes`` is a plain (possibly negative) integer, matching
+this file's own ``layover_minutes``/``total_duration_minutes`` convention
+(whole minutes, exact ``timedelta`` floor-division) rather than seconds or
+an ISO-8601 duration string.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from flightagent.domain.itinerary import NormalizedItinerary
+from flightagent.domain.policy import DestinationAnalysis
 from flightagent.domain.run import TaskOutcome
 from flightagent.domain.scoring import ScoreComponents, ScoredItinerary
 from flightagent.reporting.booking_link import BookingUrlRejected, DataSource, validate_booking_url
 from flightagent.reporting.view import (
     airline_string,
     destination_from_task_id,
+    direct_tier_recommendation_label,
     failed_task_outcomes,
     first_segment,
     last_segment,
@@ -47,6 +61,8 @@ from flightagent.reporting.view import (
     total_duration_minutes,
     total_layover_minutes,
 )
+
+_ONE_MINUTE = timedelta(minutes=1)
 
 SCHEMA_VERSION = "1.0"
 
@@ -99,6 +115,52 @@ def _failed_search_to_json(outcome: TaskOutcome) -> dict[str, Any]:
     }
 
 
+def _destination_analysis_to_json(analysis: DestinationAnalysis) -> dict[str, Any]:
+    """One "Direct Flight Analysis" entry (Phase 5, T33, D10) -- the same
+    fields the Markdown table's row shows (destination, airline, price,
+    price difference, recommendation) plus the underlying numbers a
+    consumer would need to recompute or double-check the tier
+    (``relative_difference``, ``tier``/``tier_reason``, ``time_saved_minutes``,
+    the divergence flag/explanation).
+
+    ``airline``/``price_eur`` are ``None`` exactly when ``cheapest_direct``
+    is ``None`` (``DirectTier.NOT_AVAILABLE`` -- ``domain.policy.DestinationAnalysis``'s
+    own validator forbids ``cheapest_direct`` being present any other time
+    that tier is set). ``price_difference_eur``/``relative_difference`` are
+    ``None`` in that same case AND in the degenerate "direct exists, no
+    valid one-stop alternative" case (T31) -- there is nothing priced to
+    compare against either way.
+    """
+    if analysis.cheapest_direct is not None:
+        airline: str | None = airline_string(analysis.cheapest_direct)
+        price_eur: str | None = f"{analysis.cheapest_direct.price_eur.amount:.2f}"
+    else:
+        airline = None
+        price_eur = None
+
+    return {
+        "destination": str(analysis.destination),
+        "airline": airline,
+        "price_eur": price_eur,
+        "price_difference_eur": (
+            f"{analysis.price_difference.amount:.2f}"
+            if analysis.price_difference is not None
+            else None
+        ),
+        "relative_difference": (
+            str(analysis.relative_difference) if analysis.relative_difference is not None else None
+        ),
+        "tier": analysis.tier.value,
+        "tier_reason": analysis.tier_reason,
+        "recommendation": direct_tier_recommendation_label(analysis.tier),
+        "time_saved_minutes": (
+            analysis.time_saved // _ONE_MINUTE if analysis.time_saved is not None else None
+        ),
+        "score_policy_divergence": analysis.score_policy_divergence,
+        "divergence_explanation": analysis.divergence_explanation,
+    }
+
+
 def _itinerary_to_json(item: ScoredItinerary, *, data_source: DataSource) -> dict[str, Any]:
     itinerary = item.itinerary
     departure_segment = first_segment(itinerary)
@@ -142,6 +204,7 @@ def build_results_document(
     generated_at: datetime,
     data_source: DataSource = "mock",
     task_outcomes: Sequence[TaskOutcome] = (),
+    destination_analyses: Sequence[DestinationAnalysis] = (),
 ) -> dict[str, Any]:
     """Build the v1 JSON results document (not yet written to disk -- see
     ``reporting.writer``).
@@ -162,6 +225,12 @@ def build_results_document(
     (including when ``task_outcomes`` is left at its default), never
     omitted, so a consumer never has to distinguish a missing key from an
     empty list.
+
+    ``destination_analyses`` is one ``DestinationAnalysis`` per registry
+    destination (Phase 5, T33, D10) and becomes the top-level
+    ``destination_analyses`` array verbatim, in the order given -- always
+    present, empty when none were supplied (including the default), never
+    omitted, for the same reason ``failed_searches`` never is.
 
     Raises ``ValueError`` if ``accepted_count`` is smaller than
     ``len(ranked)`` -- truncation can only ever shrink what is *shown*,
@@ -184,5 +253,8 @@ def build_results_document(
         "top_itineraries": [_itinerary_to_json(item, data_source=data_source) for item in ranked],
         "failed_searches": [
             _failed_search_to_json(outcome) for outcome in failed_task_outcomes(task_outcomes)
+        ],
+        "destination_analyses": [
+            _destination_analysis_to_json(analysis) for analysis in destination_analyses
         ],
     }

@@ -84,6 +84,28 @@ class ScoringSettings(BaseSettings):
     direct_bonus_mode: Literal["fixed", "proportional"]
 
 
+class DirectTierSettings(BaseSettings):
+    """``[direct_tier]`` — D10 (CONFIRMED): the direct-vs-one-stop tier
+    ladder as a config-driven band table, so a threshold retune is a YAML
+    edit in ``config/defaults.toml`` rather than a code change in
+    ``flightagent.policy.direct_vs_stop``.
+
+    The outer band (``good_value_max_diff_eur``/``good_value_max_relative``
+    = 150/0.20) is the spec's own specified 150€/20% rule; the inner band
+    (``recommended_max_diff_eur``/``recommended_max_relative`` = 100/0.10)
+    was inferred by the architecture pass and is now owner-confirmed
+    (DECISIONS.md D10). Both pairs are ``Decimal``, matching every other
+    money/score-input field in this module (master plan §4).
+    """
+
+    model_config = SettingsConfigDict(extra="forbid")
+
+    recommended_max_diff_eur: Decimal
+    recommended_max_relative: Decimal
+    good_value_max_diff_eur: Decimal
+    good_value_max_relative: Decimal
+
+
 class GroundTravelSettings(BaseSettings):
     """``[ground_travel]`` — D7's hard filter plus the parallel total_journey_score weights."""
 
@@ -154,6 +176,7 @@ class FlightAgentSettings(BaseSettings):
     retry: RetrySettings
     layover: LayoverSettings
     scoring: ScoringSettings
+    direct_tier: DirectTierSettings
     ground_travel: GroundTravelSettings
     early_stop: EarlyStopSettings
     cache: CacheSettings

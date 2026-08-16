@@ -261,27 +261,193 @@ class TestWorkedFullFormulaExample:
         assert components.adjusted_score == Decimal("660.5")
 
 
-class TestDirectBonusAlwaysZeroInPhase2:
-    """Proves the T30/Phase-5 scope boundary is respected: direct_bonus is
-    ALWAYS exactly Decimal("0") out of this scorer, never a nonzero value
-    silently sneaking in (e.g. from ``scoring.direct_bonus_eur`` in
-    config, which is -120.0 and must NOT leak into v1's output)."""
+class TestDirectBonusAlwaysZeroForStopItineraries:
+    """T30/Phase-5: direct_bonus is ALWAYS exactly Decimal("0") for any
+    itinerary with stop_count >= 1, regardless of direct_bonus_mode — this
+    must NOT regress now that a direct (stop_count == 0) itinerary genuinely
+    gets a nonzero bonus. ``_worked_example_itinerary()`` (stop_count == 1)
+    and ``_two_layover_itinerary()`` (stop_count == 2) are the itineraries
+    this still applies to; ``_direct_itinerary()`` moved to its own class
+    below since it now legitimately gets a nonzero bonus."""
 
-    def test_direct_bonus_is_always_exactly_decimal_zero(self) -> None:
-        for itinerary in (
-            _worked_example_itinerary(),
-            _direct_itinerary(),
-            _two_layover_itinerary(),
-        ):
+    @pytest.mark.parametrize("mode", ["fixed", "proportional"])
+    def test_stop_itinerary_bonus_is_always_exactly_decimal_zero(self, mode: str) -> None:
+        settings = load_config(env={"FLIGHTAGENT__SCORING__DIRECT_BONUS_MODE": mode})
+        for itinerary in (_worked_example_itinerary(), _two_layover_itinerary()):
             components = score_itinerary(
                 itinerary,
-                scoring_settings=_SETTINGS.scoring,
-                layover_settings=_SETTINGS.layover,
+                scoring_settings=settings.scoring,
+                layover_settings=settings.layover,
+                cheapest_valid_stop_price_eur=Decimal("1000.00"),
             )
             assert components.direct_bonus == Decimal("0")
             # Not just numerically equal to 0 — must not have picked up
             # config's -120.0 direct_bonus_eur by accident.
-            assert components.direct_bonus != _SETTINGS.scoring.direct_bonus_eur
+            assert components.direct_bonus != settings.scoring.direct_bonus_eur
+
+
+class TestDirectBonusFixedMode:
+    """T30: a direct (stop_count == 0) itinerary under "fixed" mode gets
+    exactly ``settings.scoring.direct_bonus_eur`` — the flat -120.0
+    default — as a ``Decimal``, never a float, and never re-derived from
+    the fare."""
+
+    def test_direct_itinerary_bonus_equals_configured_fixed_eur_amount(self) -> None:
+        assert _SETTINGS.scoring.direct_bonus_mode == "fixed"
+        components = score_itinerary(
+            _direct_itinerary(),
+            scoring_settings=_SETTINGS.scoring,
+            layover_settings=_SETTINGS.layover,
+        )
+        assert components.direct_bonus == _SETTINGS.scoring.direct_bonus_eur
+        assert components.direct_bonus == Decimal("-120.0")
+        assert isinstance(components.direct_bonus, Decimal)
+        assert not isinstance(components.direct_bonus, float)
+
+
+class TestDirectBonusProportionalMode:
+    """T30: "proportional" mode scales the bonus to
+    ``-0.20 * cheapest_valid_stop_price_eur`` (finding 0.1, master plan
+    §0.1's own proposed resolution) instead of the flat -120.0, and the two
+    modes must produce genuinely different, correctly-scaled numbers on the
+    same itinerary — not just a config flag with no arithmetic effect.
+
+    Worked example, computed by hand: cheapest_valid_stop_price_eur =
+    Decimal("1000.00") -> -0.20 * 1000.00 = Decimal("-200.0000"), a bonus
+    50% deeper in magnitude than the -120.0 fixed default.
+    """
+
+    def test_proportional_bonus_matches_hand_computed_value(self) -> None:
+        settings = load_config(env={"FLIGHTAGENT__SCORING__DIRECT_BONUS_MODE": "proportional"})
+        components = score_itinerary(
+            _direct_itinerary(),
+            scoring_settings=settings.scoring,
+            layover_settings=settings.layover,
+            cheapest_valid_stop_price_eur=Decimal("1000.00"),
+        )
+        assert components.direct_bonus == Decimal("-200.0000")
+        assert isinstance(components.direct_bonus, Decimal)
+        assert not isinstance(components.direct_bonus, float)
+
+    def test_proportional_differs_from_fixed_on_the_same_itinerary(self) -> None:
+        fixed_settings = load_config(env={"FLIGHTAGENT__SCORING__DIRECT_BONUS_MODE": "fixed"})
+        proportional_settings = load_config(
+            env={"FLIGHTAGENT__SCORING__DIRECT_BONUS_MODE": "proportional"}
+        )
+        itinerary = _direct_itinerary()
+
+        fixed_components = score_itinerary(
+            itinerary,
+            scoring_settings=fixed_settings.scoring,
+            layover_settings=fixed_settings.layover,
+            cheapest_valid_stop_price_eur=Decimal("1000.00"),
+        )
+        proportional_components = score_itinerary(
+            itinerary,
+            scoring_settings=proportional_settings.scoring,
+            layover_settings=proportional_settings.layover,
+            cheapest_valid_stop_price_eur=Decimal("1000.00"),
+        )
+
+        assert fixed_components.direct_bonus == Decimal("-120.0")
+        assert proportional_components.direct_bonus == Decimal("-200.0000")
+        assert proportional_components.direct_bonus != fixed_components.direct_bonus
+
+    def test_proportional_mode_without_cheapest_stop_price_raises(self) -> None:
+        settings = load_config(env={"FLIGHTAGENT__SCORING__DIRECT_BONUS_MODE": "proportional"})
+        with pytest.raises(ValueError, match="cheapest_valid_stop_price_eur"):
+            score_itinerary(
+                _direct_itinerary(),
+                scoring_settings=settings.scoring,
+                layover_settings=settings.layover,
+            )
+
+
+class TestDirectBonusChangesRankingOutcome:
+    """T30's core proof: the bonus is not merely a field with the right
+    number in it — it actually changes which itinerary ranks first.
+
+    Constructs a direct itinerary and an otherwise-identical one-stop
+    itinerary (same fare, same total duration — a 210min/[180,240)->0
+    layover inserted so the one-stop's layover_penalty is also zero, isolating
+    the bonus as the only difference). Under the -120.0 fixed default, the
+    direct itinerary's adjusted_score must be lower (better) by EXACTLY 120,
+    flipping which one would sort first by adjusted_score — proving the bonus
+    is load-bearing for ranking, not just numerically present.
+    """
+
+    def test_direct_bonus_lowers_adjusted_score_below_equivalent_stop_itinerary(self) -> None:
+        fare = Decimal("900.00")
+
+        # Direct: AMS(08:00Z) -> DEL(16:00Z), 8h, stop_count == 0.
+        direct_seg = _segment(
+            origin="AMS",
+            destination="DEL",
+            depart_utc=datetime(2027, 7, 17, 8, 0, tzinfo=UTC),
+            arrive_utc=datetime(2027, 7, 17, 16, 0, tzinfo=UTC),
+            flight_number="872",
+        )
+        direct_leg = Leg(segments=(direct_seg,), layovers=())
+        direct_itinerary = _itinerary(
+            legs=(direct_leg,), price_eur=fare, itinerary_id="itin_rank_direct_0001"
+        )
+
+        # One-stop, same fare and same 8h total duration: two 4h segments
+        # around a 210min (3h30m) layover -- band [180,240) -> 0 penalty,
+        # so layover_penalty is 0 on both sides and only direct_bonus differs.
+        stop_seg1 = _segment(
+            origin="AMS",
+            destination="DXB",
+            depart_utc=datetime(2027, 7, 17, 8, 0, tzinfo=UTC),
+            arrive_utc=datetime(2027, 7, 17, 10, 30, tzinfo=UTC),
+            flight_number="431",
+        )
+        stop_layover = _layover(
+            airport="DXB",
+            arrive_utc=datetime(2027, 7, 17, 10, 30, tzinfo=UTC),
+            depart_utc=datetime(2027, 7, 17, 14, 0, tzinfo=UTC),
+        )
+        stop_seg2 = _segment(
+            origin="DXB",
+            destination="DEL",
+            depart_utc=datetime(2027, 7, 17, 14, 0, tzinfo=UTC),
+            arrive_utc=datetime(2027, 7, 17, 16, 0, tzinfo=UTC),
+            flight_number="512",
+        )
+        stop_leg = Leg(segments=(stop_seg1, stop_seg2), layovers=(stop_layover,))
+        stop_itinerary = _itinerary(
+            legs=(stop_leg,), price_eur=fare, itinerary_id="itin_rank_stop_0001"
+        )
+        assert stop_itinerary.total_duration == direct_itinerary.total_duration
+        assert stop_itinerary.stop_count == 1
+
+        direct_components = score_itinerary(
+            direct_itinerary,
+            scoring_settings=_SETTINGS.scoring,
+            layover_settings=_SETTINGS.layover,
+        )
+        stop_components = score_itinerary(
+            stop_itinerary,
+            scoring_settings=_SETTINGS.scoring,
+            layover_settings=_SETTINGS.layover,
+        )
+
+        # Same fare, same duration -> identical layover_penalty (0) and
+        # identical elapsed_time_component -> identical pre-bonus `score`.
+        assert direct_components.layover_penalty == Decimal("0")
+        assert stop_components.layover_penalty == Decimal("0")
+        assert direct_components.score == stop_components.score
+
+        # direct_bonus is the ONLY difference, and it is exactly -120.0.
+        assert direct_components.direct_bonus == Decimal("-120.0")
+        assert stop_components.direct_bonus == Decimal("0")
+
+        # Which flips the ranking: direct's adjusted_score is lower (better)
+        # by exactly the bonus amount, so direct now sorts first.
+        assert stop_components.adjusted_score - direct_components.adjusted_score == Decimal(
+            "120.0"
+        )
+        assert direct_components.adjusted_score < stop_components.adjusted_score
 
 
 class TestAllComponentsAreDecimalNeverFloat:

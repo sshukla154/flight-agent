@@ -72,7 +72,7 @@ import sys
 from collections.abc import Sequence
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, NamedTuple
 
 import typer
 
@@ -81,8 +81,9 @@ from flightagent.config.models import FlightAgentSettings
 from flightagent.domain.enums import CabinClass, RejectionCode, RunStatus, StopMode, TaskState
 from flightagent.domain.ids import generate_run_id
 from flightagent.domain.itinerary import NormalizedItinerary, RawOffer
+from flightagent.domain.policy import DestinationAnalysis
 from flightagent.domain.run import _ERROR_STATES as _TASK_ERROR_STATES
-from flightagent.domain.run import RunEnvelope, RunMeta, SearchRequest, TaskOutcome
+from flightagent.domain.run import RunEnvelope, RunMeta, SearchRequest, SearchTask, TaskOutcome
 from flightagent.domain.scoring import ScoredItinerary
 from flightagent.domain.validation import ValidationResult
 from flightagent.normalize.builder import build_normalized_itinerary
@@ -90,7 +91,8 @@ from flightagent.normalize.dedup import deduplicate
 from flightagent.observability.events import EventName
 from flightagent.observability.logging import log_event, setup_logging
 from flightagent.orchestration.executor import execute_plan
-from flightagent.orchestration.plan import build_plan_for_origin
+from flightagent.orchestration.plan import build_dual_mode_plan_for_origin
+from flightagent.policy.direct_vs_stop import analyze_destination
 from flightagent.providers.base import CallBudget, FlightProvider
 from flightagent.providers.errors import ProviderNotConfigured
 from flightagent.providers.mock.generator import compute_seed
@@ -476,26 +478,116 @@ def _tzdata_version() -> str:
     return importlib.metadata.version("tzdata")
 
 
+class _DirectVsStopPools(NamedTuple):
+    """One destination's direct-mode and one-stop-mode validated-itinerary
+    pools (D13, Phase 5 T29) -- built so a later task (T31, not built in
+    this task) can compare them per destination without re-deriving which
+    ``task_id`` belongs to which mode.
+
+    ``one_stop`` is already filtered to ``stop_count >= 1``: D13 accepts a
+    direct-shaped itinerary inside a ``max_stops=1`` search, but that
+    itinerary must never be double-counted against the direct pool the
+    ``max_stops=0`` search for the SAME destination already found
+    independently.
+    """
+
+    direct: tuple[NormalizedItinerary, ...] = ()
+    one_stop: tuple[NormalizedItinerary, ...] = ()
+
+
+def _build_direct_vs_stop_pools(
+    tasks: tuple[SearchTask, ...],
+    valid_by_task_id: dict[str, tuple[NormalizedItinerary, ...]],
+) -> dict[str, _DirectVsStopPools]:
+    """Per-destination direct/one-stop pools for Phase 5's later
+    direct-vs-stop policy comparison (T31) -- D13's pool-separation rule,
+    applied at exactly this layer and nowhere else.
+
+    This is a NARROWER, separately-built view. It never touches
+    ``combined_valid_itineraries`` (the main ranked report's own input,
+    built in ``_run_all_destinations`` just above where this is called) --
+    that keeps showing every valid itinerary from BOTH searches, direct
+    and one-stop alike, exactly as it already did, unfiltered.
+    """
+    pools: dict[str, _DirectVsStopPools] = {}
+    for task in tasks:
+        destination = task.request.destination
+        itineraries = valid_by_task_id.get(task.task_id, ())
+        existing = pools.get(destination, _DirectVsStopPools())
+        if task.request.max_stops == 0:
+            pools[destination] = existing._replace(direct=itineraries)
+        else:
+            one_stop_only = tuple(
+                itinerary for itinerary in itineraries if itinerary.stop_count >= 1
+            )
+            pools[destination] = existing._replace(one_stop=one_stop_only)
+    return pools
+
+
+def _analyze_all_destinations(
+    pools_by_destination: dict[str, _DirectVsStopPools], *, settings: FlightAgentSettings
+) -> list[DestinationAnalysis]:
+    """T33: run the D10 direct-vs-stop policy (``policy.direct_vs_stop.analyze_destination``)
+    over every destination in ``pools_by_destination``, one ``DestinationAnalysis``
+    each -- the "Direct Flight Analysis" section's (and the JSON's
+    ``destination_analyses`` array's) entire data source.
+
+    Iterates ``pools_by_destination`` in its own (dict-insertion) order,
+    which ``_build_direct_vs_stop_pools`` builds from ``tasks`` -- direct-mode
+    tasks first, one-stop-mode tasks second, both in registry destination
+    order -- so this always comes out as all 8 registry destinations, in
+    registry order, never re-sorted here and never silently dropping one
+    (D15's amendment: this table is the only per-destination visibility
+    the global top-N ranking cannot provide).
+    """
+    return [
+        analyze_destination(
+            destination,
+            direct_pool=pools.direct,
+            one_stop_pool=pools.one_stop,
+            direct_tier_settings=settings.direct_tier,
+            scoring_settings=settings.scoring,
+            layover_settings=settings.layover,
+        )
+        for destination, pools in pools_by_destination.items()
+    ]
+
+
 def _run_all_destinations(
     *,
     origin: str,
     departure_date: date,
-    stop_mode: StopMode,
     provider_instance: FlightProvider,
     settings: FlightAgentSettings,
 ) -> None:
     """``--all-destinations``: search ``origin`` against every registry
-    destination, finalize the task ledger, and render the no_results/
-    PARTIAL/FAILED status contract (T27, finding 0.5, D19).
+    destination in BOTH ``max_stops`` modes (Phase 5, T29 / Addendum 1),
+    finalize the task ledger, and render the no_results/PARTIAL/FAILED
+    status contract (T27, finding 0.5, D19).
 
-    Pipeline: ``orchestration.plan.build_plan_for_origin`` (T24) ->
-    ``orchestration.executor.execute_plan`` (T24/T25, retry already wired
-    in) -> per successful task, this module's own ``_normalize_and_validate``
-    (reused unchanged) -> finalize every ``TaskOutcome`` (T27's own
-    OK-with-zero-accepted -> ALL_REJECTED upgrade) -> dedup the COMBINED
-    valid itineraries across every destination (T20) -> score (T13) ->
-    rank (T14) -> construct a ``RunEnvelope`` and branch on its
-    ``RunStatus`` (finding 0.5).
+    ``--max-stops`` is NOT consulted here (it still governs the single
+    ``--dest`` pipeline unchanged): Addendum 1 requires searching a
+    destination's direct (``max_stops=0``) AND one-stop (``max_stops=1``)
+    plans unconditionally for the direct-vs-stop policy comparison
+    (D10/T31), so this path always builds and executes both -- 8
+    destinations x 2 modes = 16 tasks (the literal Phase 5 exit criterion).
+
+    Pipeline: ``orchestration.plan.build_dual_mode_plan_for_origin`` (T29)
+    -> ``orchestration.executor.execute_plan`` (T24/T25, retry already
+    wired in) over all 16 tasks -> per successful task, this module's own
+    ``_normalize_and_validate`` (reused unchanged) -> finalize every
+    ``TaskOutcome`` (T27's own OK-with-zero-accepted -> ALL_REJECTED
+    upgrade) -> dedup the COMBINED valid itineraries across every
+    destination AND both modes (T20) -> score (T13) -> rank (T14) ->
+    construct a ``RunEnvelope`` and branch on its ``RunStatus`` (finding
+    0.5). Separately, ``_build_direct_vs_stop_pools`` builds the D13
+    pool-separated per-destination view, and ``_analyze_all_destinations``
+    runs the D10 policy (T31/T33, ``policy.direct_vs_stop.analyze_destination``)
+    over it -- one ``DestinationAnalysis`` per registry destination, fed
+    into both artifacts' "Direct Flight Analysis"/``destination_analyses``
+    output. That pass never feeds the ranked report itself (see
+    ``_build_direct_vs_stop_pools``' own docstring); it is a separate,
+    per-destination view assembled from the same already-validated pools.
 
     Never raises a bare pydantic error for the ordinary cases (COMPLETE,
     PARTIAL, NO_RESULTS, FAILED) -- see ``_compute_run_status`` for the one
@@ -505,13 +597,14 @@ def _run_all_destinations(
     started_at = datetime.now(UTC)
 
     origin_code = origin.upper()
-    tasks = build_plan_for_origin(
-        origin_code, departure_date=departure_date, max_stops=stop_mode, settings=settings
+    tasks = build_dual_mode_plan_for_origin(
+        origin_code, departure_date=departure_date, settings=settings
     )
     execution_results = asyncio.run(execute_plan(tasks, provider_instance, settings=settings))
 
     finalized_outcomes: list[TaskOutcome] = []
     combined_valid_itineraries: list[NormalizedItinerary] = []
+    valid_by_task_id: dict[str, tuple[NormalizedItinerary, ...]] = {}
 
     for task, execution_result in zip(tasks, execution_results, strict=True):
         outcome = execution_result.outcome
@@ -540,8 +633,17 @@ def _run_all_destinations(
             )
         )
         combined_valid_itineraries.extend(valid_itineraries)
+        valid_by_task_id[task.task_id] = tuple(valid_itineraries)
 
     final_task_outcomes = tuple(finalized_outcomes)
+
+    # D13 pool separation (T29) plus the D10 policy comparison itself (T31,
+    # T33): built now so both artifacts below can render the "Direct Flight
+    # Analysis" section -- this pass does not feed the ranked report at all
+    # (see _build_direct_vs_stop_pools' own docstring), it is a separate,
+    # per-destination view assembled from the same already-validated pools.
+    _direct_vs_stop_pools = _build_direct_vs_stop_pools(tasks, valid_by_task_id)
+    destination_analyses = _analyze_all_destinations(_direct_vs_stop_pools, settings=settings)
 
     deduplicated_itineraries = deduplicate(combined_valid_itineraries)
     scored_itineraries = [
@@ -581,7 +683,11 @@ def _run_all_destinations(
         tzdata_version=_tzdata_version(),
     )
 
-    destination_count = len(tasks)
+    # Distinct destinations, not task count: with dual-mode search (T29)
+    # `tasks` holds 16 entries (8 destinations x 2 modes), and every
+    # user-facing message below is about how many DESTINATIONS were
+    # searched, not how many provider calls that took.
+    destination_count = len({task.request.destination for task in tasks})
 
     if envelope.status in (RunStatus.COMPLETE, RunStatus.PARTIAL):
         # T26's Failed Searches section reads task_outcomes itself: it
@@ -596,6 +702,7 @@ def _run_all_destinations(
             generated_at=generated_at,
             data_source="mock",
             task_outcomes=final_task_outcomes,
+            destination_analyses=destination_analyses,
         )
         json_document = build_results_document(
             ranked,
@@ -605,6 +712,7 @@ def _run_all_destinations(
             generated_at=generated_at,
             data_source="mock",
             task_outcomes=final_task_outcomes,
+            destination_analyses=destination_analyses,
         )
         report_path, results_path = write_report_artifacts(
             markdown=markdown,
@@ -672,7 +780,8 @@ def run(
             "--max-stops",
             min=0,
             max=1,
-            help="Maximum stops: 0 (direct only) or 1 (at most one stop, D13).",
+            help="Maximum stops: 0 (direct only) or 1 (at most one stop, D13). Only applies "
+            "to --dest; --all-destinations always searches both modes (T29).",
         ),
     ],
     dest: Annotated[
@@ -716,6 +825,8 @@ def run(
     D19). Exactly one of ``--dest``/``--all-destinations`` must be given --
     both or neither raises ``typer.BadParameter`` (a clean CLI usage error,
     exit code 2) rather than either silently ignoring one or guessing.
+    ``--max-stops`` is NOT consulted for the ``--all-destinations`` path
+    (T29): that path always searches both modes, per Addendum 1.
     """
     if all_destinations and dest is not None:
         raise typer.BadParameter(
@@ -736,7 +847,6 @@ def run(
         _run_all_destinations(
             origin=origin,
             departure_date=departure_date,
-            stop_mode=stop_mode,
             provider_instance=provider_instance,
             settings=settings,
         )
