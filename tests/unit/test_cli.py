@@ -93,6 +93,16 @@ def isolated_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return tmp_path
 
 
+def _parse_log_lines(stderr_text: str) -> list[dict[str, object]]:
+    """Every non-empty line of ``stderr_text`` parsed as one structured log
+    record -- ``observability.logging.RedactingJsonFormatter`` emits exactly
+    one JSON object per line (same helper as ``test_retry.py``'s own, kept
+    local here rather than shared, matching this test suite's existing
+    per-file-helper convention).
+    """
+    return [json.loads(line) for line in stderr_text.splitlines() if line.strip()]
+
+
 class TestTargetInvocation:
     """The literal Phase 2 exit criterion, exercised via the real CLI
     parsing path (``CliRunner`` drives the actual Typer/Click argument
@@ -345,6 +355,83 @@ class TestAllDestinationsSucceeds:
         represented_destinations = {item["destination"] for item in results["top_itineraries"]}
         assert represented_destinations
         assert represented_destinations <= set(_ALL_8_DESTINATIONS)
+
+
+class TestTruncatedDestinationEmitsWarningLog:
+    """Non-blocking gap mitigation (Fix 2): when the global top-N cut
+    (``config.output.top_n_global``, default 10) discards every accepted
+    itinerary for a destination that DID have >=1 valid, accepted
+    itinerary, that destination silently vanishes from the report -- this
+    does not fix that (Phase 5/6 scope), it only makes sure the drop is
+    OBSERVABLE via a ``EventName.RANK_DESTINATION_DROPPED`` WARNING log
+    line.
+
+    Reuses ``TestAllDestinationsSucceeds``'s own scripted double
+    (``Succeed(offer_count=2)`` for all 8 destinations, the SAME
+    deterministic ``generate_offers`` output every other test in this class
+    uses) -- verified empirically (not asserted blind) to produce 11
+    accepted itineraries total, one more than ``top_n_global``'s default of
+    10, with destination ``LKO`` entirely cut from the truncated/shown set.
+    """
+
+    def _succeeding_provider(self) -> InstrumentedProvider:
+        return InstrumentedProvider(
+            scripts={destination: [Succeed(offer_count=2)] for destination in _ALL_8_DESTINATIONS}
+        )
+
+    def test_destination_entirely_cut_by_truncation_logs_a_warning(
+        self, isolated_cwd: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        provider = self._succeeding_provider()
+        monkeypatch.setattr("flightagent.cli._build_provider", lambda name: provider)
+
+        result = runner.invoke(app, _ALL_DESTINATIONS_ARGS)
+
+        assert result.exit_code == 0, result.output
+
+        results_path = isolated_cwd / "out" / "flight_results_2027-07-17.json"
+        results = json.loads(results_path.read_text(encoding="utf-8"))
+        # Ground truth: 11 accepted total, only 10 shown -- LKO has an
+        # accepted itinerary (it is NOT a failed search) but is absent from
+        # every shown destination.
+        assert results["accepted_count"] == 11
+        assert len(results["top_itineraries"]) == 10
+        shown_destinations = {item["destination"] for item in results["top_itineraries"]}
+        assert "LKO" not in shown_destinations
+        failed_destinations = {item["destination"] for item in results["failed_searches"]}
+        assert "LKO" not in failed_destinations
+
+        records = _parse_log_lines(result.stderr)
+        dropped_records = [
+            record for record in records if record.get("event") == "rank.destination_dropped"
+        ]
+        assert len(dropped_records) == 1
+        record = dropped_records[0]
+        assert record["level"] == "warning"
+        assert record["destinations"] == ["LKO"]
+        assert record["total_accepted"] == 11
+        assert record["shown_count"] == 10
+
+    def test_no_warning_when_nothing_is_truncated(
+        self, isolated_cwd: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The mirror case: a run where every destination fits inside
+        ``top_n_global`` untruncated must never emit the warning -- it is
+        not a generic "truncation happened" signal, only a "a destination
+        was entirely erased by it" one."""
+        provider = InstrumentedProvider(
+            scripts={destination: [Succeed(offer_count=1)] for destination in _ALL_8_DESTINATIONS}
+        )
+        monkeypatch.setattr("flightagent.cli._build_provider", lambda name: provider)
+
+        result = runner.invoke(app, _ALL_DESTINATIONS_ARGS)
+
+        assert result.exit_code == 0, result.output
+        records = _parse_log_lines(result.stderr)
+        dropped_records = [
+            record for record in records if record.get("event") == "rank.destination_dropped"
+        ]
+        assert dropped_records == []
 
 
 class TestAllDestinationsFailed:
