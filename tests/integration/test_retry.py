@@ -107,9 +107,14 @@ class TestRetrySucceedsEndToEndThroughTheFullCli:
         result = runner.invoke(app, _ALL_DESTINATIONS_ARGS)
 
         assert result.exit_code == 0, result.output
-        # Three calls: fail, fail, succeed -- the retry loop's own attempt
-        # count, visible from the outside via the provider's call log.
-        assert provider.call_count(_RETRY_DESTINATION) == 3
+        # T29: HYD is now searched at BOTH modes, and InstrumentedProvider
+        # replays the SAME "fail, fail, succeed" script independently per
+        # mode (see its own docstring) -- 3 attempts for the direct search,
+        # 3 more for the one-stop search, 6 total, never cross-contaminated
+        # between the two.
+        assert provider.call_count_for_mode(_RETRY_DESTINATION, 0) == 3
+        assert provider.call_count_for_mode(_RETRY_DESTINATION, 1) == 3
+        assert provider.call_count(_RETRY_DESTINATION) == 6
 
         results_path = isolated_cwd / "out" / "flight_results_2027-07-17.json"
         report_path = isolated_cwd / "out" / "flight_report_2027-07-17.md"
@@ -168,10 +173,12 @@ class TestRetrySucceedsEndToEndThroughTheFullCli:
             and record.get("destination") == _RETRY_DESTINATION
         ]
 
-        # Exactly 2 retries -- one before attempt 2, one before attempt 3
-        # -- matching the "fail, fail, succeed" script exactly.
-        assert len(retry_records) == 2
-        assert sorted(record["attempt"] for record in retry_records) == [2, 3]
+        # T29: HYD's direct AND one-stop tasks each independently replay
+        # "fail, fail, succeed" (InstrumentedProvider's own per-mode
+        # script, see its docstring), so 2 retries per mode -- one before
+        # attempt 2, one before attempt 3 -- times 2 modes = 4 total.
+        assert len(retry_records) == 4
+        assert sorted(record["attempt"] for record in retry_records) == [2, 2, 3, 3]
         assert all(record["reason"] == "ProviderTimeoutError" for record in retry_records)
         assert all(record["origin"] == _ORIGIN for record in retry_records)
         assert all(record["provider"] == "instrumented" for record in retry_records)

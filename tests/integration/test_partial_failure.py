@@ -123,14 +123,19 @@ class TestOneDestinationAlwaysFailsRestSucceed:
         assert "## Recommended Flight" in report_text
 
         # BOM shows up in Failed Searches -- BOTH artifacts, right
-        # error_type -- while the 7 survivors are unaffected.
-        assert results["failed_searches"] == [
-            {
-                "destination": _FAILING_DESTINATION,
-                "error_type": "ProviderTimeoutError",
-                "error_detail": f"{_FAILING_DESTINATION} 503",
-            }
-        ]
+        # error_type -- while the 7 survivors are unaffected. T29: BOM is
+        # now searched at BOTH modes (direct AND one-stop), and this
+        # provider fails BOTH identically ("simulating always 503s"
+        # regardless of max_stops), so BOM contributes TWO entries here
+        # (one per failed task), not one -- each destination's own failed
+        # task, not deduped by destination (reporting.view.failed_task_outcomes
+        # is a per-task view, unchanged by T29).
+        expected_bom_entry = {
+            "destination": _FAILING_DESTINATION,
+            "error_type": "ProviderTimeoutError",
+            "error_detail": f"{_FAILING_DESTINATION} 503",
+        }
+        assert results["failed_searches"] == [expected_bom_entry, expected_bom_entry]
 
         assert "## Failed Searches" in report_text
         failed_section = report_text.split("## Failed Searches", 1)[1]

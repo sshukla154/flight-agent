@@ -62,6 +62,46 @@ def _origin_priority(origin: str) -> int:
     return airport.priority
 
 
+def _build_tasks_for_mode(
+    origin_code: str,
+    *,
+    departure_date: date,
+    max_stops: StopMode,
+    origin_priority: int,
+    layover_min: timedelta,
+    layover_max: timedelta,
+) -> tuple[SearchTask, ...]:
+    """The core per-mode task-building loop, shared by ``build_plan_for_origin``
+    (single mode) and ``build_dual_mode_plan_for_origin`` (T29, both modes).
+
+    Deliberately does NOT emit ``EventName.PLAN_BUILT`` itself -- both
+    public functions below own emitting exactly one such event each, with
+    the ``task_count`` that is actually correct for what THEY return (8 for
+    a single mode, 16 for both) -- calling this helper twice from the
+    dual-mode function must never silently emit two separate 8-task events
+    where callers expect one combined 16-task event.
+    """
+    return tuple(
+        SearchTask(
+            task_id=compute_task_id(origin_code, destination.iata, max_stops),
+            request=SearchRequest(
+                origin=origin_code,
+                destination=destination.iata,
+                departure_date=departure_date,
+                cabin=_DEFAULT_CABIN,
+                max_stops=max_stops,
+                adults=_DEFAULT_ADULTS,
+                currency=_DEFAULT_CURRENCY,
+                layover_min=layover_min,
+                layover_max=layover_max,
+            ),
+            origin_priority=origin_priority,
+            wave=0,
+        )
+        for destination in registry_destinations()
+    )
+
+
 def build_plan_for_origin(
     origin: str,
     *,
@@ -70,7 +110,8 @@ def build_plan_for_origin(
     settings: FlightAgentSettings | None = None,
 ) -> tuple[SearchTask, ...]:
     """Build the ordered tuple of ``SearchTask``s for ``origin`` -> every
-    destination in ``airports.registry.destinations()``.
+    destination in ``airports.registry.destinations()``, at exactly ONE
+    ``max_stops`` mode.
 
     ``settings`` defaults to ``load_config()`` (the real four-layer config)
     when omitted — matching how ``cli.py``'s ``run()`` command resolves
@@ -92,25 +133,71 @@ def build_plan_for_origin(
     layover_min = timedelta(minutes=resolved_settings.layover.layover_min_minutes)
     layover_max = timedelta(minutes=resolved_settings.layover.layover_max_minutes)
 
-    tasks = tuple(
-        SearchTask(
-            task_id=compute_task_id(origin_code, destination.iata, max_stops),
-            request=SearchRequest(
-                origin=origin_code,
-                destination=destination.iata,
-                departure_date=departure_date,
-                cabin=_DEFAULT_CABIN,
-                max_stops=max_stops,
-                adults=_DEFAULT_ADULTS,
-                currency=_DEFAULT_CURRENCY,
-                layover_min=layover_min,
-                layover_max=layover_max,
-            ),
-            origin_priority=origin_priority,
-            wave=0,
-        )
-        for destination in registry_destinations()
+    tasks = _build_tasks_for_mode(
+        origin_code,
+        departure_date=departure_date,
+        max_stops=max_stops,
+        origin_priority=origin_priority,
+        layover_min=layover_min,
+        layover_max=layover_max,
     )
+
+    log_event(EventName.PLAN_BUILT, task_count=len(tasks))
+    return tasks
+
+
+def build_dual_mode_plan_for_origin(
+    origin: str,
+    *,
+    departure_date: date,
+    settings: FlightAgentSettings | None = None,
+) -> tuple[SearchTask, ...]:
+    """Build the ordered tuple of ``SearchTask``s for ``origin`` -> every
+    destination, searched at BOTH ``max_stops`` modes (Phase 5, T29 /
+    Addendum 1): 8 destinations x {0, 1} = 16 tasks, direct-mode tasks
+    first then one-stop-mode tasks.
+
+    Addendum 1 requires searching both a direct-only (``max_stops=0``) and
+    an at-most-one-stop (``max_stops=1``) plan for every destination, so
+    the later direct-vs-stop policy comparison (D10, T31) has both a
+    genuine direct pool and a genuine one-stop pool to compare per
+    destination — a single ``max_stops=1`` search alone cannot supply this,
+    because a provider has no obligation to surface every direct option
+    inside a broader one-stop search (D13 only guarantees the REVERSE: a
+    direct itinerary a ``max_stops=1`` search happens to return is valid,
+    not that every real direct option will turn up unasked).
+
+    Internally calls the same per-mode task-building logic
+    ``build_plan_for_origin`` uses (via ``_build_tasks_for_mode``) once per
+    mode and concatenates the two 8-task tuples — never two separate
+    ``build_plan_for_origin`` calls, which would each emit their own
+    8-task ``PLAN_BUILT`` event. Emits exactly ONE ``EventName.PLAN_BUILT``
+    event for the combined 16-task plan.
+    """
+    resolved_settings = settings if settings is not None else load_config()
+    origin_code = origin.upper()
+    origin_priority = _origin_priority(origin_code)
+
+    layover_min = timedelta(minutes=resolved_settings.layover.layover_min_minutes)
+    layover_max = timedelta(minutes=resolved_settings.layover.layover_max_minutes)
+
+    direct_tasks = _build_tasks_for_mode(
+        origin_code,
+        departure_date=departure_date,
+        max_stops=0,
+        origin_priority=origin_priority,
+        layover_min=layover_min,
+        layover_max=layover_max,
+    )
+    one_stop_tasks = _build_tasks_for_mode(
+        origin_code,
+        departure_date=departure_date,
+        max_stops=1,
+        origin_priority=origin_priority,
+        layover_min=layover_min,
+        layover_max=layover_max,
+    )
+    tasks = direct_tasks + one_stop_tasks
 
     log_event(EventName.PLAN_BUILT, task_count=len(tasks))
     return tasks

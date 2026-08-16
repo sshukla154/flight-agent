@@ -86,11 +86,20 @@ ScriptStep = Succeed | Fail
 
 @dataclass(frozen=True)
 class CallRecord:
-    """One recorded call: which (origin, destination) it searched, and when."""
+    """One recorded call: which (origin, destination, max_stops) it
+    searched, and when.
+
+    ``max_stops`` (Phase 5, T29): with the CLI's ``--all-destinations``
+    path now searching BOTH modes per destination, a call log keyed only
+    by destination could no longer tell two calls to the same destination
+    apart -- this field is what lets a test assert "one direct call and one
+    one-stop call per destination", not just "two calls".
+    """
 
     origin: str
     destination: str
     timestamp: datetime
+    max_stops: int
 
 
 def _offers_for(request: SearchRequest, offer_count: int) -> tuple[RawOffer, ...]:
@@ -98,10 +107,20 @@ def _offers_for(request: SearchRequest, offer_count: int) -> tuple[RawOffer, ...
     ``generate_offers``'s deterministic output so any non-negative count is
     satisfiable regardless of how many offers the generator itself produces
     for a given request shape.
+
+    Some request shapes legitimately generate ZERO offers (Phase 5, T29:
+    ``providers.mock.generator``'s no-direct-service destinations) -- in
+    that case there is nothing to cycle through, so this returns ``()``
+    regardless of ``offer_count`` rather than raising ``ZeroDivisionError``
+    trying to index modulo an empty sequence. A script asking for offers
+    from a request shape the real generator says has none simply gets none;
+    that is the honest answer, not a bug in this double.
     """
     if offer_count <= 0:
         return ()
     generated = generate_offers(request)
+    if not generated:
+        return ()
     return tuple(generated[i % len(generated)] for i in range(offer_count))
 
 
@@ -109,14 +128,29 @@ class InstrumentedProvider:
     """Scriptable, call-recording ``FlightProvider`` test double.
 
     ``scripts`` maps destination IATA code -> an ordered sequence of
-    ``ScriptStep``. The Nth call (0-indexed) to that destination consults
-    ``scripts[destination][N]``; once the script for a destination is
-    exhausted, its LAST step repeats forever -- this is deliberate, not an
-    oversight, so ``scripts={"DEL": [Fail(...)]}`` reads naturally as
-    "DEL always fails" and ``scripts={"DEL": [Fail(...), Fail(...),
-    Succeed(2)]}`` reads as "DEL fails twice then succeeds and keeps
-    succeeding", without a test having to pad either script out to an
+    ``ScriptStep``. The Nth call (0-indexed) to that destination, AT A
+    GIVEN ``max_stops`` MODE, consults ``scripts[destination][N]``; once
+    that mode's own script is exhausted, its LAST step repeats forever --
+    this is deliberate, not an oversight, so ``scripts={"DEL": [Fail(...)]}``
+    reads naturally as "DEL always fails" and ``scripts={"DEL": [Fail(...),
+    Fail(...), Succeed(2)]}`` reads as "DEL fails twice then succeeds and
+    keeps succeeding", without a test having to pad either script out to an
     arbitrary length.
+
+    Phase 5 (T29): the call index is tracked PER ``(destination, max_stops)``
+    pair, not per destination alone. Before dual-mode search existed, a run
+    only ever searched one mode per destination, so the two were
+    equivalent; now that ``--all-destinations`` searches both modes
+    concurrently, sharing one counter across them would make a
+    "fail-twice-then-succeed" script for a destination consumed
+    unpredictably by whichever mode's task happened to call first --
+    genuinely nondeterministic under concurrent dispatch, not merely
+    inconvenient. Each mode instead replays the SAME script independently
+    from its own index 0, so ``scripts={"HYD": [Fail(...), Fail(...),
+    Succeed(2)]}`` means "HYD's direct search fails twice then succeeds,
+    AND, independently, HYD's one-stop search fails twice then succeeds" --
+    deterministic regardless of scheduling order between the two.
+    ``call_count(destination)`` still reports the TOTAL across both modes.
 
     A destination with no script at all defaults to ``Succeed(1)`` on
     every call -- an unconfigured destination just works, which matters
@@ -134,7 +168,7 @@ class InstrumentedProvider:
         self._scripts: dict[str, tuple[ScriptStep, ...]] = {
             destination: tuple(steps) for destination, steps in (scripts or {}).items()
         }
-        self._call_counts: dict[str, int] = {}
+        self._call_counts: dict[tuple[str, int], int] = {}
         self._provider_name = provider_name
         self._call_delay_seconds = call_delay_seconds
         self.call_log: list[CallRecord] = []
@@ -154,11 +188,21 @@ class InstrumentedProvider:
         )
 
     def call_count(self, destination: str) -> int:
-        """How many calls this destination has received so far."""
-        return self._call_counts.get(destination, 0)
+        """How many calls this destination has received so far, summed
+        across BOTH ``max_stops`` modes (Phase 5, T29)."""
+        return sum(
+            count for (dest, _max_stops), count in self._call_counts.items() if dest == destination
+        )
+
+    def call_count_for_mode(self, destination: str, max_stops: int) -> int:
+        """How many calls this destination has received at exactly
+        ``max_stops`` (Phase 5, T29) -- the per-mode counterpart to
+        ``call_count``, for tests that care about one mode specifically."""
+        return self._call_counts.get((destination, max_stops), 0)
 
     def calls_for(self, destination: str) -> tuple[CallRecord, ...]:
-        """Every recorded call for ``destination``, in call order."""
+        """Every recorded call for ``destination``, in call order,
+        across BOTH modes."""
         return tuple(record for record in self.call_log if record.destination == destination)
 
     async def search(self, request: SearchRequest, budget: CallBudget) -> ProviderSearchResult:
@@ -175,13 +219,15 @@ class InstrumentedProvider:
                 # event loop ever switches to a sibling task.
                 await asyncio.sleep(self._call_delay_seconds)
             destination = request.destination
-            call_index = self._call_counts.get(destination, 0)
-            self._call_counts[destination] = call_index + 1
+            mode_key = (destination, request.max_stops)
+            call_index = self._call_counts.get(mode_key, 0)
+            self._call_counts[mode_key] = call_index + 1
             self.call_log.append(
                 CallRecord(
                     origin=request.origin,
                     destination=destination,
                     timestamp=datetime.now(UTC),
+                    max_stops=request.max_stops,
                 )
             )
 
