@@ -283,6 +283,8 @@ Three definitions are binding in both modes:
 
 **Reversal cost.** **Cheap.** Config-level, affecting the writer and the report assembly only.
 
+**Amendment, 2026-08-16 (Phase 4).** The "every other section reads the full set" safety net above assumes the per-destination sections (Direct Flight Analysis, Origin Comparison) already exist — they don't yet, those are Phase 5/6. Until they ship, Phase 4's multi-destination report has **no report-visible** protection against the global top-10 cut silently dropping an entire destination's itineraries (confirmed reproducible: 8 destinations × 2 offers each = 16 accepted, top-10 cut, one destination vanishes entirely from both artifacts, indistinguishable from never having been searched). Mitigated for now with a `RANK_DESTINATION_DROPPED` WARNING-level log event naming the dropped destination(s) — observable in logs, not in the report itself. Do not treat Phase 4's report as complete per-destination coverage; that guarantee only becomes real once Phase 5/6's sections land.
+
 ---
 
 ### D16 — User-facing sort / filter
