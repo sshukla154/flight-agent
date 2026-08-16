@@ -1330,6 +1330,47 @@ class TestFinalSummarySentence:
         assert "9 hours" in line_long
         assert "3 hours" not in line_long
 
+    def test_negative_price_difference_states_cheaper_not_negative_more_expensive(self) -> None:
+        # A direct itinerary CHEAPER than the cheapest one-stop is a real,
+        # RECOMMENDED-tier case (D10's ladder has no abs() -- a negative diff
+        # trivially satisfies "diff <= 100"). "Only €-383.24 more expensive"
+        # is broken English for this case; the sentence must state the real
+        # relationship (cheaper, by the positive magnitude) instead.
+        del_direct = _direct_itinerary(
+            itinerary_id="itin_del_direct_cheaper",
+            price_eur=Decimal("536.76"),
+            carrier="AI",
+            destination="DEL",
+            destination_tz="Asia/Kolkata",
+        )
+        analysis = _destination_analysis(
+            destination="DEL",
+            tier=DirectTier.RECOMMENDED,
+            cheapest_direct=del_direct,
+            cheapest_valid_stop=_second_itinerary(),
+            price_difference=Decimal("-383.24"),
+            relative_difference=Decimal("-0.4166"),
+            time_saved=timedelta(hours=7),
+        )
+        rendered = render_markdown_report(
+            _ranked_pair(),
+            departure_date=_DEPARTURE_DATE,
+            accepted_count=2,
+            generated_at=_GENERATED_AT,
+            destination_analyses=[analysis],
+        )
+        line = _final_summary_line(rendered)
+
+        assert "actually" in line
+        assert "€383.24 cheaper" in line
+        assert "I recommend choosing the direct flight." in line
+        assert "7 hours" in line
+        # Never the raw negative amount, and never the old "more expensive"
+        # phrasing paired with a negative-looking figure.
+        assert "-383.24" not in line
+        assert "€-383.24" not in line
+        assert "only" not in line
+
     def test_summary_omits_hours_saved_clause_when_direct_is_slower(self) -> None:
         del_direct = _direct_itinerary(
             itinerary_id="itin_del_direct_slower",

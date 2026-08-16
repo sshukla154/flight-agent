@@ -62,6 +62,7 @@ from datetime import date, datetime, timedelta
 
 from flightagent.domain.enums import DirectTier
 from flightagent.domain.itinerary import NormalizedItinerary
+from flightagent.domain.money import Money
 from flightagent.domain.policy import DestinationAnalysis
 from flightagent.domain.run import TaskOutcome
 from flightagent.domain.scoring import ScoredItinerary
@@ -337,6 +338,22 @@ def _final_summary_sentence(analysis: DestinationAnalysis) -> str:
         assert analysis.cheapest_direct is not None
         route = route_string(analysis.cheapest_direct)
         time_clause = _hours_saved_clause(analysis.time_saved)
+        if analysis.price_difference.amount < 0:
+            # The direct itinerary is not just tier-recommended but actually
+            # CHEAPER than the one-stop alternative (price_difference has no
+            # abs() by design -- see the module docstring). "Only €-X more
+            # expensive" reads as broken English for a negative diff, so this
+            # branch states the real relationship instead of the magnitude of
+            # a negative number formatted as if it were a surcharge.
+            cheaper_amount = -analysis.price_difference.amount
+            cheaper_text = format_price_eur(
+                Money(amount=cheaper_amount, currency=analysis.price_difference.currency)
+            )
+            return (
+                f"The direct {route} flight is actually {cheaper_text} cheaper than the "
+                f"cheapest valid one-stop option{time_clause}. I recommend choosing the "
+                f"direct flight."
+            )
         return (
             f"The direct {route} flight is only {diff_text} more expensive than the cheapest "
             f"valid one-stop option{time_clause}. I recommend choosing the direct flight."
