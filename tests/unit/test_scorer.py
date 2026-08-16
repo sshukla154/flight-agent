@@ -23,6 +23,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from flightagent.config.loader import load_config
+from flightagent.config.models import LayoverSettings, PenaltyBand
 from flightagent.domain.enums import CabinClass
 from flightagent.domain.itinerary import Leg, NormalizedItinerary
 from flightagent.domain.money import Money
@@ -321,3 +322,143 @@ class TestLayoverPenaltyForMinutesRejectsOutOfBandInput:
     def test_minutes_outside_every_band_raises(self) -> None:
         with pytest.raises(ValueError, match="does not fall within any configured penalty band"):
             layover_penalty_for_minutes(9999, _BANDS)
+
+
+class TestDurationUsesFractionalHoursNotTruncated:
+    """Master plan §10 test-plan item: a fractional-hour duration must
+    contribute its true fractional value (13.75 hours * 3.0 EUR/hour =
+    41.25), not 39.0 (13 hours truncated * 3.0). Proves
+    ``_duration_to_decimal_hours`` carries the fractional remainder into
+    the score rather than integer-dividing it away.
+
+    Uses 13h45m rather than the master plan's illustrative "13h50m": 45
+    minutes is 45/60 = 0.75 hours, which terminates exactly in base-10
+    Decimal, whereas 50/60 = 5/6 is a repeating decimal that even correct
+    Decimal division cannot resolve exactly within Python's default 28
+    significant-digit context (it lands on
+    ``Decimal("41.49999999999999999999999999")``, not literally
+    ``Decimal("41.5")``) — a benign, fully deterministic artifact of
+    representing a repeating base-10 fraction in fixed precision, not a
+    scorer bug, but the wrong choice of minutes for an exact-equality
+    assertion. 45 minutes proves the identical point (fractional, not
+    truncated) without that footnote."""
+
+    def test_duration_uses_fractional_hours_not_truncated(self) -> None:
+        seg = _segment(
+            origin="AMS",
+            destination="SIN",
+            depart_utc=datetime(2027, 7, 17, 8, 0, tzinfo=UTC),
+            arrive_utc=datetime(2027, 7, 17, 21, 45, tzinfo=UTC),
+            flight_number="633",
+        )
+        leg = Leg(segments=(seg,), layovers=())
+        itinerary = _itinerary(
+            legs=(leg,), price_eur=Decimal("500.00"), itinerary_id="itin_frac_hours_0001"
+        )
+        assert itinerary.total_duration == timedelta(hours=13, minutes=45)
+
+        components = score_itinerary(
+            itinerary,
+            scoring_settings=_SETTINGS.scoring,
+            layover_settings=_SETTINGS.layover,
+        )
+
+        assert components.elapsed_time_component == Decimal("41.25")
+        assert components.elapsed_time_component != Decimal("39.0")
+
+
+class TestZeroPriceItinerary:
+    """``fare_eur == 0`` is a legal input (e.g. a fully points-redeemed or
+    comped fare) — the scorer must not divide by it, special-case it away,
+    or otherwise choke on it. The score must equal exactly the duration and
+    layover-penalty components, with nothing contributed by price."""
+
+    def test_zero_price_itinerary_scores_on_duration_alone(self) -> None:
+        direct_legs = _direct_itinerary().legs
+        itinerary = _itinerary(
+            legs=direct_legs, price_eur=Decimal("0"), itinerary_id="itin_zero_price_0001"
+        )
+
+        components = score_itinerary(
+            itinerary,
+            scoring_settings=_SETTINGS.scoring,
+            layover_settings=_SETTINGS.layover,
+        )
+
+        assert components.fare_eur == Decimal("0")
+        # 8 hours (AMS 08:00Z -> DEL 16:00Z) * 3.0 EUR/hour; zero layovers.
+        assert components.elapsed_time_component == Decimal("24.0")
+        assert components.layover_penalty == Decimal("0")
+        assert components.score == components.elapsed_time_component
+
+
+class TestScoringReadsTimeValueFromConfigNotHardcoded:
+    """The module docstring insists ``time_value_eur_per_hour`` is
+    genuinely loaded from config, never a hardcoded ``3.0`` literal — this
+    is the test that would catch a silent regression to a hardcoded value.
+    Overrides it via ``load_config``'s ``env`` layer (the loader's own
+    sanctioned test-substitution mechanism, see ``config.loader``'s
+    docstring), never by mutating ``os.environ`` directly, then confirms
+    the resulting score actually changes."""
+
+    def test_overriding_time_value_eur_per_hour_changes_the_score(self) -> None:
+        overridden_settings = load_config(
+            env={"FLIGHTAGENT__SCORING__TIME_VALUE_EUR_PER_HOUR": "7"}
+        )
+        assert overridden_settings.scoring.time_value_eur_per_hour == Decimal("7")
+        assert (
+            overridden_settings.scoring.time_value_eur_per_hour
+            != _SETTINGS.scoring.time_value_eur_per_hour
+        )
+
+        itinerary = _direct_itinerary()  # AMS->DEL, 8h, zero layovers.
+
+        default_components = score_itinerary(
+            itinerary,
+            scoring_settings=_SETTINGS.scoring,
+            layover_settings=_SETTINGS.layover,
+        )
+        overridden_components = score_itinerary(
+            itinerary,
+            scoring_settings=overridden_settings.scoring,
+            layover_settings=overridden_settings.layover,
+        )
+
+        # 8h * 3.0 vs 8h * 7 — must differ, and match the new weight
+        # exactly, not just differ by some unrelated drift.
+        assert default_components.elapsed_time_component == Decimal("24.0")
+        assert overridden_components.elapsed_time_component == Decimal("56")
+        assert overridden_components.score != default_components.score
+
+
+class TestScoringReadsPenaltyBandsFromConfigNotHardcoded:
+    """Same concern as above, for the D9 penalty band table: constructs a
+    ``LayoverSettings`` with a deliberately different band table (a single
+    band spanning D8's whole [180,360] window at a nonstandard penalty) and
+    confirms ``score_itinerary`` picks up that table rather than any
+    packaged ``config/defaults.toml`` band baked in elsewhere."""
+
+    def test_overriding_penalty_bands_changes_the_layover_penalty(self) -> None:
+        custom_band = PenaltyBand(min_minutes=180, max_minutes=360, penalty_eur=Decimal("999"))
+        custom_layover_settings = LayoverSettings(
+            layover_min_minutes=_SETTINGS.layover.layover_min_minutes,
+            layover_max_minutes=_SETTINGS.layover.layover_max_minutes,
+            penalty_bands=[custom_band],
+        )
+
+        itinerary = _worked_example_itinerary()  # one 210min layover -> [180,240)->0 by default.
+
+        default_components = score_itinerary(
+            itinerary,
+            scoring_settings=_SETTINGS.scoring,
+            layover_settings=_SETTINGS.layover,
+        )
+        overridden_components = score_itinerary(
+            itinerary,
+            scoring_settings=_SETTINGS.scoring,
+            layover_settings=custom_layover_settings,
+        )
+
+        assert default_components.layover_penalty == Decimal("0")
+        assert overridden_components.layover_penalty == Decimal("999")
+        assert overridden_components.layover_penalty != default_components.layover_penalty

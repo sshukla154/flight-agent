@@ -118,7 +118,15 @@ class TestTargetInvocation:
         # stdout is deterministic too (no wall-clock content) -- not
         # required by the exit criterion, but cheap to prove and it is
         # exactly what a human diffing two terminal sessions would expect.
-        assert first.output == second.output
+        # Deliberately ``.stdout``, not ``.output``: since the Phase 3 fix
+        # wired ``setup_logging`` into the CLI's own ``@app.callback()``,
+        # ``.output`` also carries the structured JSON log lines this
+        # command now emits on stderr, and those lines legitimately carry
+        # a real wall-clock ``ts`` field (that is the entire point of a
+        # log timestamp) -- so the combined stream is NOT expected to be
+        # byte-identical across two runs, only the plain-text stdout a
+        # user actually reads is.
+        assert first.stdout == second.stdout
 
 
 class TestUnconfiguredProvider:

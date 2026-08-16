@@ -3,8 +3,17 @@
 This is the literal Phase 2 exit criterion: a single ``flightagent run``
 invocation that builds a ``SearchRequest`` from CLI flags, calls
 ``MockProvider.search()`` (T10), normalizes every returned ``RawOffer``
-(T11), validates each ``NormalizedItinerary`` (T12), scores the valid ones
+(T11), validates each ``NormalizedItinerary`` (T12), deduplicates the valid
+ones by itinerary shape key (T20, finding 0.2), scores the survivors
 (T13), ranks them (T14), and writes both v1 report artifacts (T15).
+
+Master plan S1.4's canonical loop order is "validate -> dedup -> score ->
+rank" -- T20 inserts the dedup step here, between the existing validate and
+score steps, operating only on the itineraries that already passed
+validation. Deduping before scoring means a scored/ranked itinerary's
+``duplicate_count``/``also_offered_by``/``fare_options`` are already final
+by the time scoring sees it, and a codeshare quartet is never scored (and
+never occupies four ranked-list slots) as four separate entries.
 
 **Determinism, not wall-clock, for every timestamp this command emits.**
 ``normalize.builder.build_normalized_itinerary`` requires a caller-supplied
@@ -44,12 +53,18 @@ while filtering (``ValidationResult.rejections``) is not discarded in that
 path; it is summarized (a rejection-code histogram) into the error message
 this command prints, so a human immediately sees *why* nothing validated
 instead of just *that* nothing did.
+
+T19: that same histogram (plus the accepted count) is also emitted as one
+``EventName.VALIDATE_COMPLETED`` structured log line right after the
+normalize+validate step, via ``validation.engine.summarize_validation_results``
+-- unconditionally, whether or not any itinerary ended up valid, so the
+rejection breakdown is queryable from logs even on the zero-valid exit path.
 """
 
 from __future__ import annotations
 
 import asyncio
-from collections import Counter
+import sys
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from typing import Annotated
@@ -57,11 +72,15 @@ from typing import Annotated
 import typer
 
 from flightagent.config.loader import load_config
-from flightagent.domain.enums import CabinClass, RejectionCode, StopMode
+from flightagent.domain.enums import CabinClass, StopMode
 from flightagent.domain.itinerary import NormalizedItinerary, RawOffer
 from flightagent.domain.run import SearchRequest
 from flightagent.domain.scoring import ScoredItinerary
+from flightagent.domain.validation import ValidationResult
 from flightagent.normalize.builder import build_normalized_itinerary
+from flightagent.normalize.dedup import deduplicate
+from flightagent.observability.events import EventName
+from flightagent.observability.logging import log_event, setup_logging
 from flightagent.providers.base import CallBudget, FlightProvider
 from flightagent.providers.errors import ProviderNotConfigured
 from flightagent.providers.mock.generator import compute_seed
@@ -71,7 +90,7 @@ from flightagent.reporting.markdown import render_markdown_report
 from flightagent.reporting.writer import write_report_artifacts
 from flightagent.scoring.ranking import rank_itineraries
 from flightagent.scoring.score import score_itinerary
-from flightagent.validation.engine import validate
+from flightagent.validation.engine import summarize_validation_results, validate
 
 app = typer.Typer(
     name="flightagent",
@@ -102,14 +121,28 @@ _DEFAULT_CURRENCY = "EUR"
 def _callback() -> None:
     """Autonomous flight-search agent (Nieuwegein-area -> India, Phase 2: mock provider only).
 
-    An explicit (empty) Typer callback -- with only one subcommand
-    registered (``run``), Typer would otherwise collapse this app so that
-    subcommand's name is optional (``flightagent --origin ...`` would work
-    without ``run``). Registering ANY callback forces Typer to keep
-    ``run`` as a required, named subcommand, matching the exact target
-    invocation shape (``flightagent run --origin ...``) this phase's exit
-    criterion specifies verbatim.
+    An explicit Typer callback -- with only one subcommand registered
+    (``run``), Typer would otherwise collapse this app so that subcommand's
+    name is optional (``flightagent --origin ...`` would work without
+    ``run``). Registering ANY callback forces Typer to keep ``run`` as a
+    required, named subcommand, matching the exact target invocation shape
+    (``flightagent run --origin ...``) this phase's exit criterion
+    specifies verbatim.
+
+    It also wires up structured logging (T19/Phase 3 gap fix): this
+    callback runs exactly once before any subcommand, so it is the natural
+    place to call ``setup_logging`` for the real CLI -- previously only
+    test code and ``scripts/logging_smoke.py`` ever called it, which meant
+    every ``log_event`` call in this module and in
+    ``normalize.dedup.deduplicate`` logged into a ``"flightagent"`` logger
+    with no attached handler and was silently dropped. Structured JSON
+    lines go to stderr, following ``scripts/logging_smoke.py``'s own
+    precedent of calling ``setup_logging`` with no destination override in
+    a context where stdout is otherwise free -- here stdout is NOT free
+    (the ``run`` command's own plain-text summary line goes there), so
+    stderr is the explicit destination, keeping the two streams separate.
     """
+    setup_logging(stream=sys.stderr)
 
 
 def _to_stop_mode(value: int) -> StopMode:
@@ -203,15 +236,18 @@ def _normalize_and_validate(
     raw_offers: tuple[RawOffer, ...],
     *,
     as_of: datetime,
-) -> tuple[list[NormalizedItinerary], Counter[RejectionCode]]:
+) -> tuple[list[NormalizedItinerary], list[ValidationResult]]:
     """Run every ``RawOffer`` through T11 (normalize) then T12 (validate).
 
-    Returns ``(valid_itineraries, rejection_counts)`` -- the rejection
-    histogram is never discarded even when it ends up empty, so the
-    caller can always explain a zero-valid outcome.
+    Returns ``(valid_itineraries, validation_results)`` -- every
+    ``ValidationResult`` produced is kept, valid AND invalid alike, so the
+    caller can derive both the zero-valid error breakdown and the
+    ``EventName.VALIDATE_COMPLETED`` accepted_count/rejection_counts pair
+    (T19, ``validation.engine.summarize_validation_results``) from one
+    shared pass instead of validating the batch twice.
     """
     valid_itineraries: list[NormalizedItinerary] = []
-    rejection_counts: Counter[RejectionCode] = Counter()
+    validation_results: list[ValidationResult] = []
     for raw_offer in raw_offers:
         itinerary = build_normalized_itinerary(
             raw_offer,
@@ -220,11 +256,10 @@ def _normalize_and_validate(
             fare_as_of=as_of,
         )
         validation_result = validate(itinerary, request)
+        validation_results.append(validation_result)
         if validation_result.is_valid:
             valid_itineraries.append(itinerary)
-        else:
-            rejection_counts.update(rejection.code for rejection in validation_result.rejections)
-    return valid_itineraries, rejection_counts
+    return valid_itineraries, validation_results
 
 
 @app.command()
@@ -252,15 +287,17 @@ def run(
         typer.Option("--provider", help="Provider to search. Only 'mock' works in Phase 2."),
     ] = "mock",
 ) -> None:
-    """Search, validate, score, rank, and report one origin/destination pair.
+    """Search, validate, dedup, score, rank, and report one origin/destination pair.
 
     Pipeline (in order): build a ``SearchRequest`` -> ``MockProvider.search()``
     (T10) -> normalize every offer (T11) -> validate every itinerary,
-    keeping only the valid ones (T12) -> score (T13) -> rank (T14) -> write
-    both artifacts (T15). Exits ``0`` only if at least one itinerary
-    validated and both artifacts were written; exits
-    ``NO_VALID_ITINERARIES_EXIT_CODE`` if zero itineraries validated,
-    writing nothing to ``out/``.
+    keeping only the valid ones (T12) -> deduplicate by itinerary shape key
+    (T20) -> score (T13) -> rank (T14) -> write both artifacts (T15). Exits
+    ``0`` only if at least one itinerary validated and both artifacts were
+    written; exits ``NO_VALID_ITINERARIES_EXIT_CODE`` if zero itineraries
+    validated, writing nothing to ``out/``. Dedup runs on the
+    already-valid set and can only ever reduce or preserve its size, never
+    turn a zero-valid outcome into a non-zero one or vice versa.
     """
     # Resolve the provider FIRST -- a bad --provider value must fail before
     # any config is loaded or any (deterministic, harmless) mock work runs.
@@ -287,17 +324,21 @@ def run(
     search_result = asyncio.run(provider_instance.search(request, CallBudget()))
     total_offers = len(search_result.offers)
 
-    valid_itineraries, rejection_counts = _normalize_and_validate(
+    valid_itineraries, validation_results = _normalize_and_validate(
         request, search_result.offers, as_of=as_of
+    )
+
+    validate_accepted_count, rejection_counts = summarize_validation_results(validation_results)
+    log_event(
+        EventName.VALIDATE_COMPLETED,
+        accepted_count=validate_accepted_count,
+        rejection_counts=rejection_counts,
     )
 
     if not valid_itineraries:
         if rejection_counts:
             breakdown = ", ".join(
-                f"{code.value}={count}"
-                for code, count in sorted(
-                    rejection_counts.items(), key=lambda item: item[0].value
-                )
+                f"{code}={count}" for code, count in sorted(rejection_counts.items())
             )
         else:
             breakdown = "provider returned no offers"
@@ -309,6 +350,8 @@ def run(
         )
         raise typer.Exit(code=NO_VALID_ITINERARIES_EXIT_CODE)
 
+    deduplicated_itineraries = deduplicate(valid_itineraries)
+
     scored_itineraries = [
         ScoredItinerary(
             itinerary=itinerary,
@@ -319,7 +362,7 @@ def run(
             rank_by_total_journey_score=1,
             rank_by_price=1,
         )
-        for itinerary in valid_itineraries
+        for itinerary in deduplicated_itineraries
     ]
 
     ranked = rank_itineraries(scored_itineraries, top_n=settings.output.top_n_global)
