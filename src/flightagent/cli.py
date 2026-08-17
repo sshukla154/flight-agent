@@ -76,22 +76,27 @@ from typing import Annotated, NamedTuple
 
 import typer
 
+from flightagent.airports.registry import destinations as registry_destinations
+from flightagent.airports.registry import get as get_airport
+from flightagent.airports.registry import origins as registry_origins
 from flightagent.config.loader import compute_config_digest, load_config
 from flightagent.config.models import FlightAgentSettings
 from flightagent.domain.enums import CabinClass, RejectionCode, RunStatus, StopMode, TaskState
+from flightagent.domain.ground import GroundLeg
 from flightagent.domain.ids import generate_run_id
 from flightagent.domain.itinerary import NormalizedItinerary, RawOffer
 from flightagent.domain.policy import DestinationAnalysis
 from flightagent.domain.run import _ERROR_STATES as _TASK_ERROR_STATES
 from flightagent.domain.run import RunEnvelope, RunMeta, SearchRequest, SearchTask, TaskOutcome
 from flightagent.domain.scoring import ScoredItinerary
-from flightagent.domain.validation import ValidationResult
+from flightagent.domain.validation import RejectedItinerary, ValidationResult
 from flightagent.normalize.builder import build_normalized_itinerary
 from flightagent.normalize.dedup import deduplicate
 from flightagent.observability.events import EventName
 from flightagent.observability.logging import log_event, setup_logging
 from flightagent.orchestration.executor import execute_plan
-from flightagent.orchestration.plan import build_dual_mode_plan_for_origin
+from flightagent.orchestration.plan import build_dual_mode_plan_for_origin, build_multi_origin_plan
+from flightagent.orchestration.waves import replay_early_stop
 from flightagent.policy.direct_vs_stop import analyze_destination
 from flightagent.providers.base import CallBudget, FlightProvider
 from flightagent.providers.errors import ProviderNotConfigured
@@ -99,9 +104,11 @@ from flightagent.providers.mock.generator import compute_seed
 from flightagent.providers.mock.provider import MockProvider
 from flightagent.reporting.json_report import build_results_document
 from flightagent.reporting.markdown import render_markdown_report
-from flightagent.reporting.view import last_segment
+from flightagent.reporting.view import first_segment, last_segment
 from flightagent.reporting.writer import write_report_artifacts
-from flightagent.scoring.ranking import rank_itineraries
+from flightagent.scoring.ground import apply_ground_overlay
+from flightagent.scoring.origin_summary import summarize_by_origin
+from flightagent.scoring.ranking import rank_itineraries, top_n_by_destination
 from flightagent.scoring.score import score_itinerary
 from flightagent.validation.engine import summarize_validation_results, validate
 
@@ -282,18 +289,30 @@ def _normalize_and_validate(
     raw_offers: tuple[RawOffer, ...],
     *,
     as_of: datetime,
-) -> tuple[list[NormalizedItinerary], list[ValidationResult]]:
+) -> tuple[list[NormalizedItinerary], list[ValidationResult], list[RejectedItinerary]]:
     """Run every ``RawOffer`` through T11 (normalize) then T12 (validate).
 
-    Returns ``(valid_itineraries, validation_results)`` -- every
-    ``ValidationResult`` produced is kept, valid AND invalid alike, so the
-    caller can derive both the zero-valid error breakdown and the
+    Returns ``(valid_itineraries, validation_results, self_transfer_rejections)``
+    -- every ``ValidationResult`` produced is kept, valid AND invalid alike,
+    so the caller can derive both the zero-valid error breakdown and the
     ``EventName.VALIDATE_COMPLETED`` accepted_count/rejection_counts pair
     (T19, ``validation.engine.summarize_validation_results``) from one
     shared pass instead of validating the batch twice.
+
+    ``self_transfer_rejections`` (T41) is the itinerary-level counterpart:
+    ``ValidationResult`` alone never carries the ``NormalizedItinerary``
+    object (only its ``itinerary_id``), so anything that wants to render
+    D5's "Self-transfer, not protected" appendix has to capture the pairing
+    right here, in the one place this function still holds both the
+    itinerary and its rejections in scope -- outside this loop, an invalid
+    itinerary's own data is gone for good. Populated only for itineraries
+    carrying a ``RejectionCode.SELF_TRANSFER`` rejection; an itinerary
+    rejected for any other reason (or several other reasons at once, minus
+    self-transfer) contributes nothing here.
     """
     valid_itineraries: list[NormalizedItinerary] = []
     validation_results: list[ValidationResult] = []
+    self_transfer_rejections: list[RejectedItinerary] = []
     for raw_offer in raw_offers:
         itinerary = build_normalized_itinerary(
             raw_offer,
@@ -305,7 +324,13 @@ def _normalize_and_validate(
         validation_results.append(validation_result)
         if validation_result.is_valid:
             valid_itineraries.append(itinerary)
-    return valid_itineraries, validation_results
+        else:
+            for rejection in validation_result.rejections:
+                if rejection.code == RejectionCode.SELF_TRANSFER:
+                    self_transfer_rejections.append(
+                        RejectedItinerary(itinerary=itinerary, rejection=rejection)
+                    )
+    return valid_itineraries, validation_results, self_transfer_rejections
 
 
 def _to_rejection_code_counts(raw: dict[str, int]) -> dict[RejectionCode, int]:
@@ -508,6 +533,19 @@ def _build_direct_vs_stop_pools(
     built in ``_run_all_destinations`` just above where this is called) --
     that keeps showing every valid itinerary from BOTH searches, direct
     and one-stop alike, exactly as it already did, unfiltered.
+
+    ACCUMULATES (``+=``) rather than overwriting when more than one task
+    shares a destination -- single-origin runs (Phase 5) only ever have one
+    direct task and one one-stop task per destination, so accumulating onto
+    the empty default is byte-identical to the old "set once" behaviour.
+    T37's multi-origin fan-out is the reason accumulation matters: with 10
+    origins, up to 10 direct tasks and 10 one-stop tasks share the SAME
+    destination key, and overwriting would silently keep only the last
+    origin processed (dict iteration order) and discard the other nine --
+    exactly the kind of silent data loss this project's own conventions
+    forbid. The resulting pool is deliberately the cross-origin combined
+    view: "the cheapest direct/one-stop fare to this destination across
+    every origin searched", not scoped to any one origin.
     """
     pools: dict[str, _DirectVsStopPools] = {}
     for task in tasks:
@@ -515,12 +553,12 @@ def _build_direct_vs_stop_pools(
         itineraries = valid_by_task_id.get(task.task_id, ())
         existing = pools.get(destination, _DirectVsStopPools())
         if task.request.max_stops == 0:
-            pools[destination] = existing._replace(direct=itineraries)
+            pools[destination] = existing._replace(direct=existing.direct + itineraries)
         else:
             one_stop_only = tuple(
                 itinerary for itinerary in itineraries if itinerary.stop_count >= 1
             )
-            pools[destination] = existing._replace(one_stop=one_stop_only)
+            pools[destination] = existing._replace(one_stop=existing.one_stop + one_stop_only)
     return pools
 
 
@@ -553,39 +591,61 @@ def _analyze_all_destinations(
     ]
 
 
+def _origin_display(origin_codes: tuple[str, ...]) -> str:
+    """Human-readable origin label for this function's own status/echo
+    lines -- ``origin_codes[0]`` unadorned for the single-origin path
+    (byte-identical to the pre-T37 ``origin_code`` string it replaces), or
+    a count-plus-list for T37's multi-origin fan-out, since there is no
+    single "the origin" to name once more than one is in play.
+    """
+    if len(origin_codes) == 1:
+        return origin_codes[0]
+    return f"{len(origin_codes)} origins ({', '.join(origin_codes)})"
+
+
 def _run_all_destinations(
     *,
     origin: str,
     departure_date: date,
     provider_instance: FlightProvider,
     settings: FlightAgentSettings,
+    all_origins: bool = False,
 ) -> None:
-    """``--all-destinations``: search ``origin`` against every registry
-    destination in BOTH ``max_stops`` modes (Phase 5, T29 / Addendum 1),
-    finalize the task ledger, and render the no_results/PARTIAL/FAILED
-    status contract (T27, finding 0.5, D19).
+    """``--all-destinations``: search ``origin`` (or, with T37's
+    ``all_origins=True``, EVERY registry origin in priority order) against
+    every registry destination in BOTH ``max_stops`` modes (Phase 5, T29 /
+    Addendum 1), finalize the task ledger, and render the
+    no_results/PARTIAL/FAILED status contract (T27, finding 0.5, D19).
 
     ``--max-stops`` is NOT consulted here (it still governs the single
     ``--dest`` pipeline unchanged): Addendum 1 requires searching a
     destination's direct (``max_stops=0``) AND one-stop (``max_stops=1``)
     plans unconditionally for the direct-vs-stop policy comparison
     (D10/T31), so this path always builds and executes both -- 8
-    destinations x 2 modes = 16 tasks (the literal Phase 5 exit criterion).
+    destinations x 2 modes = 16 tasks per origin (the literal Phase 5 exit
+    criterion), or 160 tasks total across all 10 origins when
+    ``all_origins`` is set (T37).
 
-    Pipeline: ``orchestration.plan.build_dual_mode_plan_for_origin`` (T29)
-    -> ``orchestration.executor.execute_plan`` (T24/T25, retry already
-    wired in) over all 16 tasks -> per successful task, this module's own
+    Pipeline: ``orchestration.plan.build_dual_mode_plan_for_origin`` (T29,
+    single origin) or ``orchestration.plan.build_multi_origin_plan`` (T37,
+    all 10 origins) -> ``orchestration.executor.execute_plan`` (T24/T25,
+    retry already wired in) over every planned task, fully concurrent
+    regardless of origin count or ``wave`` (master plan S5's Option B
+    default -- ``wave`` is metadata for a later sequential-priority mode,
+    T39, not consulted here) -> per successful task, this module's own
     ``_normalize_and_validate`` (reused unchanged) -> finalize every
     ``TaskOutcome`` (T27's own OK-with-zero-accepted -> ALL_REJECTED
     upgrade) -> dedup the COMBINED valid itineraries across every
-    destination AND both modes (T20) -> score (T13) -> rank (T14) ->
+    origin, destination, AND mode (T20) -> score (T13) -> rank (T14) ->
     construct a ``RunEnvelope`` and branch on its ``RunStatus`` (finding
     0.5). Separately, ``_build_direct_vs_stop_pools`` builds the D13
-    pool-separated per-destination view, and ``_analyze_all_destinations``
-    runs the D10 policy (T31/T33, ``policy.direct_vs_stop.analyze_destination``)
-    over it -- one ``DestinationAnalysis`` per registry destination, fed
-    into both artifacts' "Direct Flight Analysis"/``destination_analyses``
-    output. That pass never feeds the ranked report itself (see
+    pool-separated per-destination view (accumulated across every origin
+    that searched that destination -- see that function's own docstring),
+    and ``_analyze_all_destinations`` runs the D10 policy (T31/T33,
+    ``policy.direct_vs_stop.analyze_destination``) over it -- one
+    ``DestinationAnalysis`` per registry destination, fed into both
+    artifacts' "Direct Flight Analysis"/``destination_analyses`` output.
+    That pass never feeds the ranked report itself (see
     ``_build_direct_vs_stop_pools``' own docstring); it is a separate,
     per-destination view assembled from the same already-validated pools.
 
@@ -596,15 +656,25 @@ def _run_all_destinations(
     """
     started_at = datetime.now(UTC)
 
-    origin_code = origin.upper()
-    tasks = build_dual_mode_plan_for_origin(
-        origin_code, departure_date=departure_date, settings=settings
-    )
+    if all_origins:
+        # T37: the full 160-task run. `origin` (the single --origin value)
+        # is not consulted at all here -- every registry origin, in
+        # priority order, is searched.
+        origin_codes = tuple(airport.iata for airport in registry_origins())
+        tasks = build_multi_origin_plan(departure_date=departure_date, settings=settings)
+    else:
+        origin_codes = (origin.upper(),)
+        tasks = build_dual_mode_plan_for_origin(
+            origin_codes[0], departure_date=departure_date, settings=settings
+        )
+    origin_display = _origin_display(origin_codes)
+
     execution_results = asyncio.run(execute_plan(tasks, provider_instance, settings=settings))
 
     finalized_outcomes: list[TaskOutcome] = []
     combined_valid_itineraries: list[NormalizedItinerary] = []
     valid_by_task_id: dict[str, tuple[NormalizedItinerary, ...]] = {}
+    self_transfer_rejections: list[RejectedItinerary] = []
 
     for task, execution_result in zip(tasks, execution_results, strict=True):
         outcome = execution_result.outcome
@@ -616,8 +686,8 @@ def _run_all_destinations(
             continue
 
         as_of = _deterministic_as_of(task.request)
-        valid_itineraries, validation_results = _normalize_and_validate(
-            task.request, execution_result.offers, as_of=as_of
+        valid_itineraries, validation_results, task_self_transfer_rejections = (
+            _normalize_and_validate(task.request, execution_result.offers, as_of=as_of)
         )
         raw_accepted_count, raw_rejection_counts = summarize_validation_results(validation_results)
         log_event(
@@ -634,6 +704,7 @@ def _run_all_destinations(
         )
         combined_valid_itineraries.extend(valid_itineraries)
         valid_by_task_id[task.task_id] = tuple(valid_itineraries)
+        self_transfer_rejections.extend(task_self_transfer_rejections)
 
     final_task_outcomes = tuple(finalized_outcomes)
 
@@ -645,9 +716,37 @@ def _run_all_destinations(
     _direct_vs_stop_pools = _build_direct_vs_stop_pools(tasks, valid_by_task_id)
     destination_analyses = _analyze_all_destinations(_direct_vs_stop_pools, settings=settings)
 
+    # T39 (D12, finding 0.7): post-hoc, deterministic replay of the EUR250
+    # early-stop rule over the COMPLETE task/result set built above -- an
+    # annotation only (master plan S5's Option B default), never a
+    # control-flow decision. Read straight off `tasks`/`valid_by_task_id`,
+    # so it never removes, skips, or reorders any task's own results --
+    # `combined_valid_itineraries`/`deduplicated_itineraries` below are
+    # built from the exact same, untouched `valid_by_task_id`.
+    early_stop_evaluations = replay_early_stop(
+        tasks,
+        valid_by_task_id,
+        destinations=tuple(airport.iata for airport in registry_destinations()),
+        threshold_eur=settings.early_stop.threshold_eur,
+    )
+
+    # T38/T41: each origin's GroundLeg, looked up once per origin actually
+    # searched this run (never all 10 registry origins unconditionally --
+    # a single-origin --all-destinations run must not silently apply an
+    # unrelated origin's ground data). `Airport.ground` is always present
+    # here in practice (`origin_codes` only ever names real registry
+    # origins, and `Airport.is_origin` IS "ground is not None"), but the
+    # lookup stays defensive rather than asserting, so a malformed registry
+    # entry degrades to "no ground overlay for this origin" instead of a
+    # crash mid-run.
+    ground_by_origin: dict[str, GroundLeg] = {
+        code: ground for code in origin_codes if (ground := get_airport(code).ground) is not None
+    }
+
     deduplicated_itineraries = deduplicate(combined_valid_itineraries)
-    scored_itineraries = [
-        ScoredItinerary(
+    scored_itineraries: list[ScoredItinerary] = []
+    for itinerary in deduplicated_itineraries:
+        scored = ScoredItinerary(
             itinerary=itinerary,
             components=score_itinerary(
                 itinerary, scoring_settings=settings.scoring, layover_settings=settings.layover
@@ -656,11 +755,29 @@ def _run_all_destinations(
             rank_by_total_journey_score=1,
             rank_by_price=1,
         )
-        for itinerary in deduplicated_itineraries
-    ]
+        ground_leg = ground_by_origin.get(first_segment(itinerary).origin)
+        if ground_leg is not None:
+            scored = apply_ground_overlay(
+                scored, ground_leg=ground_leg, settings=settings.ground_travel
+            )
+        scored_itineraries.append(scored)
+
     ranked = rank_itineraries(scored_itineraries, top_n=settings.output.top_n_global)
     _warn_on_truncated_destinations(scored_itineraries, ranked)
     accepted_count = len(scored_itineraries)
+
+    # T40/T41: the per-origin Origin Comparison view (master plan A2-5c),
+    # computed over the SAME full, untruncated `scored_itineraries` the
+    # global ranking above also reads -- never the already-truncated
+    # `ranked`, which would silently show `best=None` for an origin whose
+    # itineraries simply didn't make the global top-10 cut (see
+    # `summarize_by_origin`'s own docstring). D15's "top 3 per destination"
+    # JSON-only view is the identical pattern, grouped by destination
+    # instead of origin.
+    origin_summaries = summarize_by_origin(scored_itineraries, origins=list(origin_codes))
+    per_destination_top_n = top_n_by_destination(
+        scored_itineraries, top_n=settings.output.top_n_per_destination
+    )
 
     dominant_code = _dominant_rejection_code(final_task_outcomes)
     status = _compute_run_status(final_task_outcomes)
@@ -703,6 +820,9 @@ def _run_all_destinations(
             data_source="mock",
             task_outcomes=final_task_outcomes,
             destination_analyses=destination_analyses,
+            early_stop_evaluations=early_stop_evaluations,
+            origin_summaries=origin_summaries,
+            self_transfer_rejections=self_transfer_rejections,
         )
         json_document = build_results_document(
             ranked,
@@ -713,6 +833,10 @@ def _run_all_destinations(
             data_source="mock",
             task_outcomes=final_task_outcomes,
             destination_analyses=destination_analyses,
+            early_stop_evaluations=early_stop_evaluations,
+            origin_summaries=origin_summaries,
+            self_transfer_rejections=self_transfer_rejections,
+            top_n_by_destination=per_destination_top_n,
         )
         report_path, results_path = write_report_artifacts(
             markdown=markdown,
@@ -722,7 +846,7 @@ def _run_all_destinations(
         )
         typer.echo(
             f"flightagent: {envelope.status.value} -- {accepted_count} valid itinerary(ies) "
-            f"across {destination_count} destination(s) from {origin_code} on "
+            f"across {destination_count} destination(s) from {origin_display} on "
             f"{departure_date.isoformat()}; wrote {report_path} and {results_path}"
         )
         log_event(EventName.RUN_COMPLETED, status=envelope.status.value, duration_ms=duration_ms)
@@ -743,7 +867,7 @@ def _run_all_destinations(
             reason = dominant_code.value if dominant_code is not None else "no valid offers found"
             typer.echo(
                 f"flightagent: no_results -- 0 valid itinerary(ies) across "
-                f"{destination_count} destination(s) from {origin_code} on "
+                f"{destination_count} destination(s) from {origin_display} on "
                 f"{departure_date.isoformat()} -- dominant rejection reason: {reason}. "
                 f"No report written.",
                 err=True,
@@ -756,7 +880,7 @@ def _run_all_destinations(
     # NO_RESULTS's message (that is finding 0.5's whole point): distinct
     # wording, distinct exit code.
     typer.echo(
-        f"flightagent: failed -- every search for {origin_code} across "
+        f"flightagent: failed -- every search for {origin_display} across "
         f"{destination_count} destination(s) on {departure_date.isoformat()} errored; "
         f"the provider was unreachable (or every attempt otherwise failed), not merely "
         f"short of valid itineraries. No report written.",
@@ -804,10 +928,22 @@ def run(
             "of a single --dest. Mutually exclusive with --dest.",
         ),
     ] = False,
+    all_origins: Annotated[
+        bool,
+        typer.Option(
+            "--all-origins",
+            help="Combined with --all-destinations: search ALL 10 registry origins (T37) "
+            "instead of just --origin -- 10 origins x 8 destinations x 2 stop modes = 160 "
+            "tasks, the full Phase 6 fan-out. --origin's value is ignored when this is set. "
+            "Requires --all-destinations; invalid on its own or with --dest.",
+        ),
+    ] = False,
 ) -> None:
     """Search, validate, dedup, score, rank, and report -- either one
-    origin/destination pair (the default) or, with ``--all-destinations``,
-    ``--origin`` against every registry destination at once (T27).
+    origin/destination pair (the default), ``--origin`` against every
+    registry destination at once (``--all-destinations``, T27), or, adding
+    ``--all-origins`` on top of that (T37), every registry origin against
+    every registry destination at once -- the full 160-task run.
 
     Single-destination pipeline (in order, unchanged since Phase 2): build a
     ``SearchRequest`` -> ``MockProvider.search()`` (T10) -> normalize every
@@ -827,7 +963,21 @@ def run(
     exit code 2) rather than either silently ignoring one or guessing.
     ``--max-stops`` is NOT consulted for the ``--all-destinations`` path
     (T29): that path always searches both modes, per Addendum 1.
+
+    ``--all-origins`` (T37) only makes sense layered on top of
+    ``--all-destinations``; given alone, or together with ``--dest``, it is
+    also a ``typer.BadParameter`` usage error. When it IS given, the run
+    is the literal 160-task fan-out (``orchestration.plan.build_multi_origin_plan``)
+    executed fully concurrently (master plan S5's Option B default -- the
+    ``wave`` master plan S5 assigns each task is metadata for a later,
+    separate, flag-gated sequential-priority mode, T39, not consulted by
+    this command). Omitting ``--all-origins`` leaves the single-origin
+    ``--all-destinations`` path byte-for-byte unchanged from before T37.
     """
+    if all_origins and not all_destinations:
+        raise typer.BadParameter(
+            "--all-origins requires --all-destinations -- give both, or neither."
+        )
     if all_destinations and dest is not None:
         raise typer.BadParameter(
             "--dest and --all-destinations are mutually exclusive -- give exactly one."
@@ -849,6 +999,7 @@ def run(
             departure_date=departure_date,
             provider_instance=provider_instance,
             settings=settings,
+            all_origins=all_origins,
         )
         return
 
@@ -875,7 +1026,7 @@ def run(
     search_result = asyncio.run(provider_instance.search(request, CallBudget()))
     total_offers = len(search_result.offers)
 
-    valid_itineraries, validation_results = _normalize_and_validate(
+    valid_itineraries, validation_results, self_transfer_rejections = _normalize_and_validate(
         request, search_result.offers, as_of=as_of
     )
 
@@ -918,6 +1069,9 @@ def run(
 
     ranked = rank_itineraries(scored_itineraries, top_n=settings.output.top_n_global)
     accepted_count = len(scored_itineraries)
+    per_destination_top_n = top_n_by_destination(
+        scored_itineraries, top_n=settings.output.top_n_per_destination
+    )
 
     markdown = render_markdown_report(
         ranked,
@@ -925,6 +1079,7 @@ def run(
         accepted_count=accepted_count,
         generated_at=as_of,
         data_source="mock",
+        self_transfer_rejections=self_transfer_rejections,
     )
     json_document = build_results_document(
         ranked,
@@ -933,6 +1088,8 @@ def run(
         top_n=settings.output.top_n_global,
         generated_at=as_of,
         data_source="mock",
+        self_transfer_rejections=self_transfer_rejections,
+        top_n_by_destination=per_destination_top_n,
     )
 
     report_path, results_path = write_report_artifacts(

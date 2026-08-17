@@ -28,7 +28,7 @@ from decimal import Decimal
 from flightagent.domain.enums import CabinClass
 from flightagent.domain.itinerary import Leg, NormalizedItinerary, RawOffer
 from flightagent.domain.money import Money
-from flightagent.domain.segment import Segment
+from flightagent.domain.segment import Layover, Segment
 from flightagent.normalize.builder import build_normalized_itinerary
 from flightagent.normalize.dedup import deduplicate
 from flightagent.observability.context import run_context
@@ -374,3 +374,150 @@ class TestDedupCompletedEvent:
         assert payload["output_count"] == 3
         assert payload["duplicate_count"] == 1
         assert payload["run_id"] == "dedup-test-run"
+
+
+class TestCrossOriginDedupGuard:
+    """T40 investigation: does the shape-key formula ((segment
+    origin/destination/depart_utc/arrive_utc) tuples, cabin, adults) already
+    prevent two itineraries departing from genuinely different origin
+    airports from ever collapsing into one dedup survivor, now that Phase 6
+    fans a run out across all 10 real origins?
+
+    Finding: YES, structurally, with NO code change needed in `dedup.py`.
+    `normalize.builder.compute_shape_key` hashes each segment's own
+    `origin` field as the first element of that segment's tuple. Two
+    itineraries whose first segments have different `origin` values
+    therefore always hash to different `shape_key`s — this holds
+    regardless of how many segments follow, what carrier operates them, or
+    what price they carry, because `dedup.py` groups by nothing OTHER than
+    the `shape_key` each itinerary already carries (see `deduplicate`'s own
+    docstring: "this module does not compute it; it only groups an
+    already-normalized list by the key each itinerary already carries").
+    There is no separate origin-comparison code path in `dedup.py` for a
+    cross-origin accident to slip through.
+
+    This exact scenario already had a regression test —
+    `TestDistinctShapesStaySeparate.test_different_origin_stays_two_entries`
+    above, added in Phase 3 (commit 92b0db3), whose own docstring says
+    "Guards against a future cross-origin dedup accident once Phase 6
+    introduces multiple origins" — Phase 6 is this task. That test already
+    passes unchanged against the existing code, confirming the finding
+    above. The two tests below EXTEND that existing guard rather than
+    duplicate it: one replaces the two-airport (AMS/LHR) stand-in with the
+    real, full 10-origin Phase 6 set (config/ground_access.yaml) checked
+    pairwise all at once, and one covers a one-stop (2-segment) itinerary,
+    which the existing single-segment test does not exercise — a one-stop
+    shape_key hashes a SECOND segment tuple too, so this proves the
+    never-merge guarantee survives a connection, not just a direct flight.
+
+    No guard code was added to `dedup.py` for this task — there is no gap
+    to close, only more coverage of an already-correct design.
+    """
+
+    def test_every_one_of_the_ten_real_phase6_origins_produces_a_distinct_shape_key(
+        self,
+    ) -> None:
+        """The actual 10-origin set this project searches
+        (config/ground_access.yaml priority order), not just a two-airport
+        stand-in -- every origin's shape_key must be pairwise distinct from
+        every other's, and none may collapse into another's survivor."""
+        origins = ("AMS", "EIN", "RTM", "DUS", "BRU", "NRN", "CGN", "CRL", "MST", "GRQ")
+        itineraries = [
+            _make_itinerary(
+                provider_offer_id=f"from-{origin}",
+                origin=origin,
+                price_eur=Decimal("500.00"),
+                booking_url=f"https://mock.example/book/from-{origin}",
+            )
+            for origin in origins
+        ]
+        # Sanity: ten genuinely distinct shape_keys, not an accidental
+        # collision that would make the assertions below vacuous.
+        shape_keys = {itinerary.shape_key for itinerary in itineraries}
+        assert len(shape_keys) == len(origins)
+
+        result = deduplicate(itineraries)
+
+        assert len(result) == len(origins)
+        assert {itinerary.itinerary_id for itinerary in result} == {
+            itinerary.itinerary_id for itinerary in itineraries
+        }
+        assert all(itinerary.duplicate_count == 1 for itinerary in result)
+
+    def test_one_stop_itineraries_from_different_origins_stay_two_entries(self) -> None:
+        """The existing origin guard only covers a single-segment (direct)
+        itinerary. A one-stop itinerary's shape_key hashes EVERY segment's
+        tuple, not just the first -- this proves the same never-merge
+        guarantee holds with a second, third-airport leg downstream of the
+        differing origin too, at identical connection times and identical
+        price for both origins (the closest a routing coincidence could
+        plausibly get)."""
+        via = "FRA"
+        destination = "DEL"
+        depart_utc = _DEPART
+        via_arrive = depart_utc + timedelta(hours=2)
+        via_depart = via_arrive + timedelta(hours=1, minutes=30)
+        final_arrive = via_depart + timedelta(hours=6)
+
+        def _one_stop_from(origin: str, provider_offer_id: str) -> NormalizedItinerary:
+            first_leg_segment = Segment(
+                segment_id=f"{origin}-{via}-100",
+                origin=origin,
+                destination=via,
+                depart_utc=depart_utc,
+                arrive_utc=via_arrive,
+                depart_local=depart_utc,
+                arrive_local=via_arrive,
+                origin_tz="UTC",
+                destination_tz="UTC",
+                marketing_carrier="LH",
+                flight_number="100",
+                cabin=CabinClass.ECONOMY,
+                duration=via_arrive - depart_utc,
+            )
+            second_leg_segment = Segment(
+                segment_id=f"{via}-{destination}-200",
+                origin=via,
+                destination=destination,
+                depart_utc=via_depart,
+                arrive_utc=final_arrive,
+                depart_local=via_depart,
+                arrive_local=final_arrive,
+                origin_tz="UTC",
+                destination_tz="UTC",
+                marketing_carrier="LH",
+                flight_number="200",
+                cabin=CabinClass.ECONOMY,
+                duration=final_arrive - via_depart,
+            )
+            layover = Layover(
+                airport=via,
+                arrive_utc=via_arrive,
+                depart_utc=via_depart,
+                duration=via_depart - via_arrive,
+                local_window=(via_arrive, via_depart),
+                requires_airport_change=False,
+                requires_terminal_change=False,
+            )
+            leg = Leg(segments=(first_leg_segment, second_leg_segment), layovers=(layover,))
+            price = Money(amount=Decimal("500.00"), currency="EUR")
+            raw_offer = RawOffer(
+                provider="mock",
+                provider_offer_id=provider_offer_id,
+                legs=(leg,),
+                price=price,
+                raw_payload_ref=f"ref:{provider_offer_id}",
+                provider_booking_url=f"https://mock.example/book/{provider_offer_id}",
+            )
+            return build_normalized_itinerary(
+                raw_offer, adults=1, cabin=CabinClass.ECONOMY, fare_as_of=_FARE_AS_OF
+            )
+
+        from_ams = _one_stop_from("AMS", "ams-onestop")
+        from_dus = _one_stop_from("DUS", "dus-onestop")
+        assert from_ams.shape_key != from_dus.shape_key
+
+        result = deduplicate([from_ams, from_dus])
+
+        assert len(result) == 2
+        assert {itinerary.duplicate_count for itinerary in result} == {1}

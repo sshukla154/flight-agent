@@ -17,15 +17,17 @@ is exactly the case this file constructs.
 from __future__ import annotations
 
 import random
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
 from flightagent.domain.enums import CabinClass
+from flightagent.domain.ground import GroundLeg
 from flightagent.domain.itinerary import Leg, NormalizedItinerary
 from flightagent.domain.money import Money
 from flightagent.domain.scoring import ScoreComponents, ScoredItinerary
 from flightagent.domain.segment import Segment
+from flightagent.scoring.origin_summary import summarize_by_origin
 from flightagent.scoring.ranking import rank_itineraries
 
 _PLACEHOLDER_RANK = 1
@@ -112,6 +114,105 @@ def _scored(
     return ScoredItinerary(
         itinerary=itinerary,
         components=components,
+        rank_by_adjusted_score=_PLACEHOLDER_RANK,
+        rank_by_total_journey_score=_PLACEHOLDER_RANK,
+        rank_by_price=_PLACEHOLDER_RANK,
+    )
+
+
+_TEN_ORIGINS = ("AMS", "EIN", "RTM", "DUS", "BRU", "NRN", "CGN", "CRL", "MST", "GRQ")
+"""The real Phase 6 origin set (config/ground_access.yaml priority order) --
+used below instead of an arbitrary shorter stand-in so the "exactly 10
+rows" test actually exercises all 10 configured origins, not a fraction of
+them."""
+
+_EIGHT_DESTINATIONS = ("DEL", "BOM", "BLR", "HYD", "MAA", "CCU", "LKO", "VNS")
+"""The real 8 registry destinations (config/airports.yaml) -- see
+_TEN_ORIGINS above for why the real set is used rather than a shorter one."""
+
+
+def _ground_leg(*, origin: str, minutes: int) -> GroundLeg:
+    """A minimal, valid GroundLeg for test fixtures that need a ScoredItinerary
+    carrying ground data -- values other than `duration` are arbitrary but
+    valid; only `duration` (via `minutes`) is ever asserted on by the tests
+    that use this."""
+    return GroundLeg(
+        from_location="Nieuwegein, Utrecht, NL",
+        to_airport=origin,
+        mode="car",
+        duration=timedelta(minutes=minutes),
+        distance_km=Decimal("50"),
+        cost=Money(amount=Decimal("10.00"), currency="EUR"),
+        source="estimate",
+        as_of=date(2026, 8, 14),
+    )
+
+
+def _itinerary_for_origin(
+    *,
+    itinerary_id: str,
+    origin: str,
+    destination: str,
+    price_eur: Decimal,
+    duration_hours: int = 10,
+) -> NormalizedItinerary:
+    """Like module-level `_itinerary`, but with an origin/destination the
+    caller controls -- `_itinerary` itself hardcodes AMS->DEL, which is not
+    enough for the per-origin grouping tests below, which need itineraries
+    departing from several different origins."""
+    depart_utc = datetime(2027, 7, 17, 8, 0, tzinfo=UTC)
+    arrive_utc = depart_utc + timedelta(hours=duration_hours)
+    segment = _segment(
+        origin=origin, destination=destination, depart_utc=depart_utc, arrive_utc=arrive_utc
+    )
+    leg = Leg(segments=(segment,), layovers=())
+    price = Money(amount=price_eur, currency="EUR")
+    return NormalizedItinerary(
+        itinerary_id=itinerary_id,
+        provider="mock",
+        legs=(leg,),
+        price_original=price,
+        price_eur=price,
+        booking_url_kind="unavailable",
+        shape_key=f"shape-{itinerary_id}",
+        fare_as_of=depart_utc,
+    )
+
+
+def _scored_for_origin(
+    *,
+    itinerary_id: str,
+    origin: str,
+    destination: str = "DEL",
+    adjusted_score: Decimal,
+    price_eur: Decimal,
+    duration_hours: int = 10,
+    ground_minutes: int | None = None,
+) -> ScoredItinerary:
+    """Like module-level `_scored`, but for an itinerary departing from
+    `origin` (any airport, not just AMS) and optionally carrying a
+    `GroundLeg` (`ground_minutes`, D7) -- both needed by the per-origin
+    grouping tests below, neither offered by `_scored` itself."""
+    itinerary = _itinerary_for_origin(
+        itinerary_id=itinerary_id,
+        origin=origin,
+        destination=destination,
+        price_eur=price_eur,
+        duration_hours=duration_hours,
+    )
+    components = ScoreComponents(
+        fare_eur=adjusted_score,
+        elapsed_time_component=Decimal("0"),
+        layover_penalty=Decimal("0"),
+        direct_bonus=Decimal("0"),
+    )
+    ground = (
+        _ground_leg(origin=origin, minutes=ground_minutes) if ground_minutes is not None else None
+    )
+    return ScoredItinerary(
+        itinerary=itinerary,
+        components=components,
+        ground=ground,
         rank_by_adjusted_score=_PLACEHOLDER_RANK,
         rank_by_total_journey_score=_PLACEHOLDER_RANK,
         rank_by_price=_PLACEHOLDER_RANK,
@@ -267,3 +368,217 @@ class TestTopNSlicing:
         ranked = rank_itineraries(items)
 
         assert len(ranked) == 10
+
+
+class TestSummarizeByOriginAtScale:
+    """T40: a 160-itinerary batch (10 origins x 8 destinations x 2 fares --
+    the literal Phase 6 full fan-out shape, master plan S5) must group into
+    EXACTLY 10 OriginSummary rows, one per configured origin, each carrying
+    that origin's own genuine cheapest itinerary."""
+
+    def test_160_itinerary_batch_groups_into_exactly_ten_origin_rows(self) -> None:
+        items = []
+        for origin_index, origin in enumerate(_TEN_ORIGINS):
+            for destination_index, destination in enumerate(_EIGHT_DESTINATIONS):
+                for fare_variant in range(2):
+                    price = Decimal(500 + origin_index * 10 + destination_index + fare_variant * 50)
+                    itinerary_id = f"{origin}-{destination}-{fare_variant}"
+                    items.append(
+                        _scored_for_origin(
+                            itinerary_id=itinerary_id,
+                            origin=origin,
+                            destination=destination,
+                            adjusted_score=price,
+                            price_eur=price,
+                            ground_minutes=30 + origin_index,
+                        )
+                    )
+        assert len(items) == 160
+
+        summaries = summarize_by_origin(items, origins=_TEN_ORIGINS)
+
+        assert len(summaries) == 10
+        assert [summary.origin for summary in summaries] == list(_TEN_ORIGINS)
+        assert all(summary.best is not None for summary in summaries)
+
+        # Each origin's "best" really is the minimum tiebreak_key among
+        # its own 16 itineraries -- not just "some" itinerary from that
+        # origin, and not the global minimum leaking across origins.
+        for origin_index, origin in enumerate(_TEN_ORIGINS):
+            own_items = [
+                item for item in items if item.itinerary.itinerary_id.startswith(f"{origin}-")
+            ]
+            assert len(own_items) == 16
+            expected_best = min(own_items, key=lambda item: item.tiebreak_key)
+            actual_best = summaries[origin_index].best
+            assert actual_best is not None
+            assert actual_best.itinerary.itinerary_id == expected_best.itinerary.itinerary_id
+            assert summaries[origin_index].ground_minutes == 30 + origin_index
+
+
+class TestSummarizeByOriginNeverDropsAnEmptyOrigin:
+    """Acceptance criterion A2-5c: every configured origin gets a row "or
+    an explicit reason for absence" -- an origin with zero itineraries
+    must still appear, with best=None/ground_minutes=None, not vanish from
+    the returned list."""
+
+    def test_origin_with_zero_itineraries_still_gets_a_row_with_best_none(self) -> None:
+        items = [
+            _scored_for_origin(
+                itinerary_id="ams-1",
+                origin="AMS",
+                adjusted_score=Decimal("500"),
+                price_eur=Decimal("500"),
+            )
+        ]
+
+        summaries = summarize_by_origin(items, origins=["AMS", "EIN"])
+
+        assert len(summaries) == 2
+        ams_summary, ein_summary = summaries
+        assert ams_summary.origin == "AMS"
+        assert ams_summary.best is not None
+        assert ein_summary.origin == "EIN"
+        assert ein_summary.best is None
+        assert ein_summary.ground_minutes is None
+
+    def test_empty_input_still_produces_a_row_per_configured_origin(self) -> None:
+        summaries = summarize_by_origin([], origins=_TEN_ORIGINS)
+
+        assert len(summaries) == 10
+        assert all(summary.best is None for summary in summaries)
+        assert all(summary.ground_minutes is None for summary in summaries)
+
+
+class TestOriginSummaryGroundMinutes:
+    def test_ground_minutes_derived_from_best_itinerarys_ground_leg(self) -> None:
+        item = _scored_for_origin(
+            itinerary_id="x",
+            origin="AMS",
+            adjusted_score=Decimal("500"),
+            price_eur=Decimal("500"),
+            ground_minutes=45,
+        )
+
+        summaries = summarize_by_origin([item], origins=["AMS"])
+
+        assert summaries[0].ground_minutes == 45
+
+    def test_ground_minutes_is_none_when_best_itinerary_has_no_ground_leg(self) -> None:
+        item = _scored_for_origin(
+            itinerary_id="x",
+            origin="AMS",
+            adjusted_score=Decimal("500"),
+            price_eur=Decimal("500"),
+        )
+
+        summaries = summarize_by_origin([item], origins=["AMS"])
+
+        assert summaries[0].best is not None
+        assert summaries[0].ground_minutes is None
+
+
+class TestGlobalAndPerOriginViewsAgree:
+    """The global top-10 ranking (`rank_itineraries`, unchanged Phase 2/4
+    behavior) and the per-origin view (`summarize_by_origin`, new T40 work)
+    must both be computable over the SAME underlying `ScoredItinerary` set
+    and never disagree about what a given itinerary's fare is."""
+
+    def test_global_ranking_output_is_identical_whether_or_not_per_origin_view_is_also_built(
+        self,
+    ) -> None:
+        items = [
+            _scored_for_origin(
+                itinerary_id=f"{origin}-item",
+                origin=origin,
+                adjusted_score=Decimal(1000 - index),
+                price_eur=Decimal(1000 - index),
+            )
+            for index, origin in enumerate(("AMS", "EIN", "RTM"))
+        ]
+
+        ranked_alone = rank_itineraries(items, top_n=10)
+        # Building the per-origin view from the SAME list must not mutate
+        # it or leave any state that changes a subsequent ranking call --
+        # every model involved is frozen, but this is the behavioural
+        # property that frozen-ness is supposed to guarantee here.
+        summarize_by_origin(items, origins=("AMS", "EIN", "RTM"))
+        ranked_after = rank_itineraries(items, top_n=10)
+
+        assert [item.itinerary.itinerary_id for item in ranked_alone] == [
+            item.itinerary.itinerary_id for item in ranked_after
+        ]
+        assert [item.rank_by_adjusted_score for item in ranked_alone] == [
+            item.rank_by_adjusted_score for item in ranked_after
+        ]
+
+    def test_global_top_10_winner_is_correctly_attributed_to_its_origin_in_the_per_origin_view(
+        self,
+    ) -> None:
+        items = [
+            _scored_for_origin(
+                itinerary_id="ams-cheap",
+                origin="AMS",
+                adjusted_score=Decimal("400"),
+                price_eur=Decimal("400"),
+            ),
+            _scored_for_origin(
+                itinerary_id="ams-pricier",
+                origin="AMS",
+                adjusted_score=Decimal("600"),
+                price_eur=Decimal("600"),
+            ),
+            _scored_for_origin(
+                itinerary_id="ein-mid",
+                origin="EIN",
+                adjusted_score=Decimal("500"),
+                price_eur=Decimal("500"),
+            ),
+        ]
+
+        global_ranked = rank_itineraries(items, top_n=10)
+        origin_summaries = summarize_by_origin(items, origins=("AMS", "EIN"))
+
+        winner = global_ranked[0]
+        assert winner.itinerary.itinerary_id == "ams-cheap"
+
+        by_origin = {summary.origin: summary for summary in origin_summaries}
+        ams_best = by_origin["AMS"].best
+        assert ams_best is not None
+        assert ams_best.itinerary.itinerary_id == winner.itinerary.itinerary_id
+        assert ams_best.itinerary.price_eur == winner.itinerary.price_eur
+
+    def test_an_origin_truncated_out_of_the_global_top_n_still_gets_its_own_best_here(
+        self,
+    ) -> None:
+        """Proves the module docstring's caveat: `summarize_by_origin` must
+        be called with the FULL, untruncated set to stay meaningful. GRQ's
+        one itinerary here is real and valid, but every AMS fare beats it,
+        so a `top_n=10` global cut with 12 cheaper AMS itineraries pushes
+        GRQ's fare out of the displayed global table entirely -- it must
+        still show up as GRQ's own best in the per-origin view."""
+        cheap_ams_items = [
+            _scored_for_origin(
+                itinerary_id=f"ams-{i}",
+                origin="AMS",
+                adjusted_score=Decimal(100 + i),
+                price_eur=Decimal(100 + i),
+            )
+            for i in range(12)
+        ]
+        grq_item = _scored_for_origin(
+            itinerary_id="grq-1",
+            origin="GRQ",
+            adjusted_score=Decimal("9999"),
+            price_eur=Decimal("9999"),
+        )
+        items = [*cheap_ams_items, grq_item]
+
+        global_top10 = rank_itineraries(items, top_n=10)
+        assert "grq-1" not in {item.itinerary.itinerary_id for item in global_top10}
+
+        origin_summaries = summarize_by_origin(items, origins=("AMS", "GRQ"))
+        by_origin = {summary.origin: summary for summary in origin_summaries}
+        grq_summary = by_origin["GRQ"]
+        assert grq_summary.best is not None
+        assert grq_summary.best.itinerary.itinerary_id == "grq-1"
