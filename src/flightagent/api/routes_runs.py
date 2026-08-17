@@ -21,7 +21,7 @@ from fastapi.responses import PlainTextResponse
 
 from flightagent.api.schemas import HealthResponse, RunSummary
 from flightagent.config.models import FlightAgentSettings
-from flightagent.reporting.run_artifacts import run_artifact_paths
+from flightagent.reporting.run_artifacts import InvalidRunIdError, run_artifact_paths
 
 router = APIRouter()
 
@@ -74,9 +74,17 @@ async def get_run(
     process has ever recorded -- ``routes_search`` writes
     ``run_meta.json`` for EVERY run it creates, valid-itinerary or not, so
     a missing file here means the id itself is unknown, not that the run
-    merely produced no report.
+    merely produced no report. A malformed ``run_id`` (not a UUID4 --
+    ``InvalidRunIdError``, ``reporting.run_artifacts``) gets the SAME 404,
+    never a distinct error, so a caller probing this endpoint cannot tell
+    "malformed" apart from "well-formed but unknown" (see that module's
+    docstring for why this specific unsanitized-path-parameter shape was a
+    real, exploitable path-traversal vector, not a theoretical one).
     """
-    meta_path = run_meta_path(run_id, runs_dir=Path(settings.output.runs_dir))
+    try:
+        meta_path = run_meta_path(run_id, runs_dir=Path(settings.output.runs_dir))
+    except InvalidRunIdError:
+        raise HTTPException(status_code=404, detail=f"run {run_id!r} not found") from None
     if not meta_path.is_file():
         raise HTTPException(status_code=404, detail=f"run {run_id!r} not found")
     data = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -91,12 +99,23 @@ async def get_run_report(
     content-type.
 
     404s (never a 500 or an empty 200) both when ``run_id`` is entirely
-    unknown and when it names a real run that produced zero valid
+    unknown, when it names a real run that produced zero valid
     itineraries (D15's "writes nothing" contract means there is genuinely
-    no report file to serve in that case either) -- either way, "no report
-    exists for this id" is the honest answer.
+    no report file to serve in that case either), and when ``run_id`` is
+    not even a well-formed UUID4 (``InvalidRunIdError`` -- see
+    ``reporting.run_artifacts``'s docstring for why an unsanitized
+    path-parameter join here was a real, exploitable path-traversal
+    vector) -- every case reads "no report exists for this id", never a
+    distinct error a caller could use to fingerprint which case fired.
     """
-    report_path, _results_path = run_artifact_paths(run_id, runs_dir=Path(settings.output.runs_dir))
+    try:
+        report_path, _results_path = run_artifact_paths(
+            run_id, runs_dir=Path(settings.output.runs_dir)
+        )
+    except InvalidRunIdError:
+        raise HTTPException(
+            status_code=404, detail=f"report for run {run_id!r} not found"
+        ) from None
     if not report_path.is_file():
         raise HTTPException(status_code=404, detail=f"report for run {run_id!r} not found")
     return PlainTextResponse(

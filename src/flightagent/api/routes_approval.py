@@ -52,7 +52,7 @@ from flightagent.api.schemas import ApprovalRequestBody, ApprovalResponse
 from flightagent.config.models import FlightAgentSettings
 from flightagent.observability.events import EventName
 from flightagent.observability.logging import log_event
-from flightagent.reporting.run_artifacts import run_artifact_paths
+from flightagent.reporting.run_artifacts import InvalidRunIdError, run_artifact_paths
 from flightagent.reporting.writer import atomic_write_json
 
 router = APIRouter()
@@ -119,7 +119,15 @@ async def approve_run(
     """
     runs_dir = Path(settings.output.runs_dir)
 
-    meta_path = run_meta_path(run_id, runs_dir=runs_dir)
+    try:
+        meta_path = run_meta_path(run_id, runs_dir=runs_dir)
+    except InvalidRunIdError:
+        # A malformed (non-UUID4) run_id gets the SAME "not found" 404 as a
+        # well-formed-but-unknown one -- see run_artifacts.InvalidRunIdError's
+        # docstring for why an unsanitized run_id here was a real,
+        # exploitable path-traversal vector (this route's own
+        # atomic_write_json call below is the WRITE half of that finding).
+        raise HTTPException(status_code=404, detail=f"run {run_id!r} not found") from None
     if not meta_path.is_file():
         raise HTTPException(status_code=404, detail=f"run {run_id!r} not found")
 

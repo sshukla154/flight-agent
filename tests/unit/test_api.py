@@ -70,6 +70,81 @@ _SINGLE_DEST_BODY = {
 }
 
 
+class TestRunIdPathTraversalIsBlocked:
+    """SECURITY regression, not a data-quality nicety (``reporting.run_artifacts``,
+    ``InvalidRunIdError``). An adversarial audit found a real, exploitable
+    path-traversal vector: ``run_id`` reached a filesystem path join
+    completely unsanitized on all three ``{run_id}``-scoped routes.
+    Starlette's router blocks a multi-segment slash-encoded traversal
+    (``..%2f..%2f``) but NOT a backslash-encoded one (``..%5c..%5c``),
+    which stays inside a single ``{run_id}`` path segment past the router
+    and is then honoured as a directory separator by Windows ``pathlib``
+    during the join -- giving arbitrary-directory read AND write on any
+    Windows deployment, not a one-level escape. Every case here plants a
+    secret file OUTSIDE ``runs_dir`` and asserts the response is a plain
+    404 that never contains that secret content -- proving the fix at the
+    real HTTP layer, not just that ``InvalidRunIdError`` can be raised in
+    isolation.
+    """
+
+    def _plant_secret_outside_runs_dir(self, settings: FlightAgentSettings) -> Path:
+        runs_dir = Path(settings.output.runs_dir)
+        secret_dir = runs_dir.parent / "secretdir"
+        secret_dir.mkdir(parents=True, exist_ok=True)
+        (secret_dir / "report.md").write_text("SECRET CONTENT THAT MUST NEVER BE SERVED")
+        (secret_dir / "run_meta.json").write_text(
+            json.dumps({"run_id": "attacker-planted", "status": "complete"})
+        )
+        return secret_dir
+
+    def test_backslash_encoded_traversal_to_report_is_blocked(
+        self, client: TestClient, settings: FlightAgentSettings
+    ) -> None:
+        self._plant_secret_outside_runs_dir(settings)
+        response = client.get("/runs/..%5c..%5csecretdir/report.md")
+        assert response.status_code == 404
+        assert "SECRET CONTENT" not in response.text
+
+    def test_backslash_encoded_traversal_to_run_summary_is_blocked(
+        self, client: TestClient, settings: FlightAgentSettings
+    ) -> None:
+        self._plant_secret_outside_runs_dir(settings)
+        response = client.get("/runs/..%5c..%5csecretdir")
+        assert response.status_code == 404
+        assert "attacker-planted" not in response.text
+
+    def test_dot_encoded_traversal_is_blocked(
+        self, client: TestClient, settings: FlightAgentSettings
+    ) -> None:
+        # A single "%2e%2e" segment decodes to a literal ".." that Starlette's
+        # router lets through as one path segment (the multi-segment
+        # "..%2f..%2f" form IS blocked at the router; this simpler form is
+        # the one that reaches the route handler at all).
+        response = client.get("/runs/%2e%2e/report.md")
+        assert response.status_code == 404
+
+    def test_traversal_write_via_approve_endpoint_is_blocked(
+        self, client: TestClient, settings: FlightAgentSettings
+    ) -> None:
+        """The WRITE half of the same finding: ``POST .../approve`` must not
+        be able to write ``approval.json`` outside ``runs_dir`` either."""
+        secret_dir = self._plant_secret_outside_runs_dir(settings)
+        response = client.post(
+            "/runs/..%5c..%5csecretdir/approve", json={"approved": True}
+        )
+        assert response.status_code == 404
+        assert not (secret_dir / "approval.json").exists()
+
+    def test_a_real_wellformed_but_unknown_uuid4_still_404s_normally(
+        self, client: TestClient
+    ) -> None:
+        """Sanity check: the fix must not change ordinary not-found
+        behaviour for a syntactically valid run_id that simply doesn't
+        exist -- only a MALFORMED run_id gets the new code path."""
+        response = client.get("/runs/00000000-0000-4000-8000-000000000000/report.md")
+        assert response.status_code == 404
+
+
 class TestHealthz:
     def test_healthz_returns_200(self, client: TestClient) -> None:
         response = client.get("/healthz")

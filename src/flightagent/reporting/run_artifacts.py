@@ -41,11 +41,51 @@ D15 artifacts already have, for free.
 
 from __future__ import annotations
 
+import uuid
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 from flightagent.reporting.writer import atomic_write_json, atomic_write_text
+
+
+class InvalidRunIdError(ValueError):
+    """``run_id`` is not the shape ``domain.ids.generate_run_id()`` produces.
+
+    SECURITY, not a data-quality nicety: every one of this module's
+    three call sites (``run_artifact_paths`` here, plus
+    ``api.routes_runs.run_meta_path`` and ``api.routes_approval.approval_path``,
+    both of which call this function rather than re-deriving the
+    ``{runs_dir}/{run_id}/`` join independently) feeds ``run_id`` straight
+    into a filesystem path join. ``run_id`` reaches this function directly
+    from a FastAPI PATH PARAMETER on three routes (``GET /runs/{id}``,
+    ``GET /runs/{id}/report.md``, ``POST /runs/{id}/approve``) — i.e. from
+    the network, unsanitized, before this check existed. An adversarial
+    audit confirmed this was genuinely exploitable: Starlette's router
+    blocks multi-segment slash-encoded traversal (``..%2f..%2f``) but NOT
+    a backslash-encoded single segment (``..%5csecretdir``), which stays
+    inside one ``{run_id}`` path segment past the router and is then
+    honoured as a directory separator by Windows ``pathlib`` during the
+    actual join below — giving arbitrary-directory read (``report.md``/
+    ``run_meta.json``) and write (``approval.json``) on any Windows
+    deployment. Validating that ``run_id`` is exactly a UUID4 — the only
+    shape this codebase ever generates one in — makes every character a
+    path separator could hide (``.``, ``/``, ``\\``, ``%``) categorically
+    impossible to reach the join, rather than attempting to enumerate and
+    block specific encodings, which is exactly the game this bug class
+    already won once.
+    """
+
+
+def _validate_run_id(run_id: str) -> None:
+    try:
+        uuid.UUID(run_id)
+    except ValueError as exc:
+        raise InvalidRunIdError(
+            f"run_id {run_id!r} is not a valid UUID4 — refusing to build a filesystem path "
+            f"from it (see InvalidRunIdError's docstring)"
+        ) from exc
+
 
 DEFAULT_RUNS_DIR = Path("data") / "runs"
 """Matches ``config/defaults.toml``'s ``[output] runs_dir`` default —
@@ -70,6 +110,7 @@ def run_artifact_paths(run_id: str, *, runs_dir: Path = DEFAULT_RUNS_DIR) -> tup
     this to locate a run's files without importing the writer function
     that produces them.
     """
+    _validate_run_id(run_id)
     run_dir = runs_dir / run_id
     return run_dir / RUN_REPORT_FILENAME, run_dir / RUN_RESULTS_FILENAME
 
