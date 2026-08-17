@@ -1,0 +1,42 @@
+# VCS / CI-only
+.git/
+.github/
+
+# Python / tool caches -- never valid build inputs
+__pycache__/
+*.pyc
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage.json
+htmlcov/
+
+# Host virtualenv -- the image builds its OWN venv via uv; a stale host
+# .venv is also not guaranteed to match the image's linux/py3.12 ABI.
+.venv/
+
+# Runtime-writable output (see .gitignore) -- disposable, never a valid
+# build input, and must never leak into a layer.
+out/
+data/
+cache/
+
+# Secrets -- belt-and-suspenders; the Dockerfile never COPYs these, but a
+# future accidental `COPY . .` should still be safe.
+.env
+!.env.example
+
+# This is a runtime CLI image, not a dev/test image. pytest never runs
+# inside `docker build` (the coverage-gated test job runs directly on the
+# CI runner against the raw checkout) -- keeping these out of the build
+# context also means an unrelated test-only change never invalidates the
+# dependency-install layer cache.
+tests/
+scripts/
+spikes/
+samples/
+
+# Docs / planning -- no runtime relevance
+*.md
+.python-version

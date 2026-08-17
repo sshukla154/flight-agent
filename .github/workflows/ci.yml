@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    name: lint, typecheck, test, coverage-gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Install dependencies (incl. dev group)
+        run: uv sync --frozen
+
+      - name: Lint (ruff)
+        run: uv run ruff check .
+
+      - name: Type-check (mypy --strict)
+        run: uv run mypy --strict src
+
+      - name: Run test suite with branch coverage
+        run: uv run pytest --cov=src/flightagent --cov-branch --cov-report=term-missing
+
+      - name: Enforce coverage gate
+        run: uv run python scripts/check_coverage.py
+
+      - name: Upload coverage report (debugging aid)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-json
+          path: coverage.json
+          retention-days: 14
+
+  docker:
+    name: docker-build-and-smoke-test
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the agent image
+        run: docker compose build agent
+
+      - name: Run the full fan-out (docker compose run --rm agent)
+        run: docker compose run --rm agent
+
+      - name: Verify expected artifacts landed on the writable volume
+        run: |
+          docker compose run --rm --entrypoint sh agent -c '
+            test -f /data/out/flight_report_2027-07-17.md &&
+            test -f /data/out/flight_results_2027-07-17.json &&
+            test -d /data/data/runs &&
+            test -f /data/cache/flightagent.sqlite3 &&
+            echo "OK: expected artifacts present"
+          '

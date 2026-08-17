@@ -63,3 +63,9 @@ testpaths = ["tests"]
 
 [tool.coverage.run]
 source = ["src/flightagent"]
+branch = true
+# scripts/check_coverage.py (Phase 8) looks up per-module entries in
+# coverage.json's "files" dict by exact repo-relative path -- without this,
+# keys can come back absolute (varies by OS/invocation dir) and the lookup
+# would need brittle path-suffix guessing instead of an exact match.
+relative_files = true
