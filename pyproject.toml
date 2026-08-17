@@ -5,11 +5,13 @@ description = "Autonomous flight-search agent (Nieuwegein-area -> India, 2027-07
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "aiosqlite>=0.22.1",
+    "fastapi>=0.141.1",
     "pydantic>=2",
     "pydantic-settings>=2",
     "pyyaml>=6",
     "typer>=0.27.1",
     "tzdata>=2026a",
+    "uvicorn>=0.52.3",
 ]
 
 [project.scripts]
@@ -24,6 +26,7 @@ dev = [
     "types-PyYAML",
     "jsonschema",
     "types-jsonschema",
+    "httpx>=0.28.1",
 ]
 
 [build-system]
@@ -42,6 +45,13 @@ extend-exclude = ["spikes"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI's dependency-injection system relies on `Depends(...)` as a
+# parameter default -- B008 otherwise flags every route in api/routes_*.py
+# for a pattern that is FastAPI's own documented usage, not a real
+# mutable-default-argument bug.
+extend-immutable-calls = ["fastapi.Depends"]
 
 [tool.mypy]
 strict = true
