@@ -145,6 +145,14 @@ ttl_minutes_over_180_days = 1440   # 24h
 ttl_minutes_30_to_180_days = 360   # 6h
 ttl_minutes_7_to_30_days = 60      # 1h
 ttl_minutes_under_7_days = 15      # 15min
+# On-disk SQLite file for the two-layer cache (persistence/db.py, T43).
+# Deliberately NOT under out/ -- persistence.db.connect() always creates its
+# parent directory as a side effect of opening, and D15's own contract (see
+# api.routes_approval's docstring) is that a run producing zero itineraries
+# writes NOTHING under out/. A cache db_path under out/ would silently
+# violate that on every run, successful or not, since the cache opens
+# before any report is written.
+db_path = "cache/flightagent.sqlite3"
 # Pagination cap per provider task (master plan §5) — a 160-task run that
 # pages deeply on every task exhausts quota for no ranking benefit.
 max_pages_per_task = 3
@@ -161,3 +169,10 @@ results_path = "out/flight_results_2027-07-17.json"
 # comparison) reads the full set, never the truncated one.
 top_n_global = 10
 top_n_per_destination = 3
+# Per-run artifact directory layout (T45) — additive to, and independent
+# of, the two fixed D15 paths above. Each run additionally writes its own
+# report.md/results.json under runs_dir/<run_id>/, so a single run's
+# artifacts are addressable by run_id (needed by the future FastAPI app's
+# GET /runs/{id}/report.md). "data/" is already gitignored (see
+# .gitignore), matching the master plan §3 persistence layer's own home.
+runs_dir = "data/runs"

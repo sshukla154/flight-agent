@@ -135,15 +135,34 @@ class CacheSettings(BaseSettings):
     ttl_minutes_7_to_30_days: int
     ttl_minutes_under_7_days: int
     max_pages_per_task: int
+    db_path: str
+    """``persistence.db.connect``'s ``db_path`` argument for the real
+    (non-test) ``CacheRepository`` -- a plain config value rather than a
+    hardcoded path inside ``cli.py``. Deliberately NOT under ``out/``
+    (``config/defaults.toml``'s own comment on this key explains why) --
+    ``connect()`` creates this path's parent directory as a side effect of
+    opening, and a FAILED/NO_RESULTS run must write nothing under
+    ``out/`` (D15)."""
 
 
 class OutputSettings(BaseSettings):
-    """``[output]`` — D15: exact output filenames and top-N truncation."""
+    """``[output]`` — D15: exact output filenames and top-N truncation.
+
+    ``runs_dir`` (T45) is a SEPARATE, additive concern from ``report_path``/
+    ``results_path``: those two remain D15's fixed, spec-literal paths and
+    must never be derived from ``runs_dir`` or vice versa. ``runs_dir`` is
+    the parent of the per-run artifact layout
+    (``reporting.run_artifacts``) — ``{runs_dir}/{run_id}/report.md`` and
+    ``{runs_dir}/{run_id}/results.json`` — that exists alongside the fixed
+    D15 paths so one run's own artifacts are addressable by ``run_id``
+    without disturbing D15's own contract at all.
+    """
 
     model_config = SettingsConfigDict(extra="forbid")
 
     report_path: str
     results_path: str
+    runs_dir: str
     top_n_global: int
     top_n_per_destination: int
 

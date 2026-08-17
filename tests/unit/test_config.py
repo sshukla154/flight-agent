@@ -76,6 +76,10 @@ def test_packaged_defaults_match_decisions_register() -> None:
     assert settings.output.top_n_global == 10
     assert settings.output.top_n_per_destination == 3
 
+    # T45: per-run artifact directory layout, additive to the two fixed
+    # D15 paths above -- never derived from them, never overriding them.
+    assert settings.output.runs_dir == "data/runs"
+
 
 def test_unrecognised_toml_key_in_override_file_raises(tmp_path: Path) -> None:
     """A typo'd key in ./config/config.toml is a hard error, not a no-op.

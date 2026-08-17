@@ -72,7 +72,7 @@ import sys
 from collections.abc import Sequence
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
-from typing import Annotated, NamedTuple
+from typing import Annotated, Any, NamedTuple
 
 import typer
 
@@ -97,6 +97,7 @@ from flightagent.observability.logging import log_event, setup_logging
 from flightagent.orchestration.executor import execute_plan
 from flightagent.orchestration.plan import build_dual_mode_plan_for_origin, build_multi_origin_plan
 from flightagent.orchestration.waves import replay_early_stop
+from flightagent.persistence.cache_repo import CacheRepository
 from flightagent.policy.direct_vs_stop import analyze_destination
 from flightagent.providers.base import CallBudget, FlightProvider
 from flightagent.providers.errors import ProviderNotConfigured
@@ -104,6 +105,7 @@ from flightagent.providers.mock.generator import compute_seed
 from flightagent.providers.mock.provider import MockProvider
 from flightagent.reporting.json_report import build_results_document
 from flightagent.reporting.markdown import render_markdown_report
+from flightagent.reporting.run_artifacts import write_run_artifacts
 from flightagent.reporting.view import first_segment, last_segment
 from flightagent.reporting.writer import write_report_artifacts
 from flightagent.scoring.ground import apply_ground_overlay
@@ -331,6 +333,158 @@ def _normalize_and_validate(
                         RejectedItinerary(itinerary=itinerary, rejection=rejection)
                     )
     return valid_itineraries, validation_results, self_transfer_rejections
+
+
+def build_search_request(
+    *,
+    origin: str,
+    destination: str,
+    departure_date: date,
+    max_stops: StopMode,
+    settings: FlightAgentSettings,
+) -> SearchRequest:
+    """Build the single-origin ``SearchRequest`` for the ``--dest`` pipeline.
+
+    Factored out of ``run`` (T46) so this module's own CLI command and the
+    FastAPI ``POST /search`` route (``api.routes_search``) build the
+    IDENTICAL request from the same literal field list, rather than two
+    independently-typed copies that could silently drift apart.
+    """
+    return SearchRequest(
+        origin=origin.upper(),
+        destination=destination.upper(),
+        departure_date=departure_date,
+        cabin=_DEFAULT_CABIN,
+        max_stops=max_stops,
+        adults=_DEFAULT_ADULTS,
+        currency=_DEFAULT_CURRENCY,
+        layover_min=timedelta(minutes=settings.layover.layover_min_minutes),
+        layover_max=timedelta(minutes=settings.layover.layover_max_minutes),
+    )
+
+
+class SingleDestinationPipelineResult(NamedTuple):
+    """Everything downstream of one single-destination provider search.
+
+    Shared, byte-for-byte, between this module's own ``run`` command and
+    T46's FastAPI ``POST /search`` route -- that task's own explicit
+    instruction is one pipeline implementation, never a second copy of the
+    normalize/validate/dedup/score/rank logic.
+
+    ``markdown``/``json_document`` are ``None`` exactly when
+    ``accepted_count`` (post-dedup) is ``0`` -- mirroring this module's own
+    "zero valid itineraries writes nothing" contract. This function itself
+    never prints or writes a file; each caller (the CLI's exit-code/echo
+    logic, the API's HTTP response) decides what to do with a ``None``
+    pair.
+    """
+
+    request: SearchRequest
+    generated_at: datetime
+    total_offers: int
+    validated_accepted_count: int
+    rejection_counts: dict[str, int]
+    accepted_count: int
+    ranked: tuple[ScoredItinerary, ...]
+    markdown: str | None
+    json_document: dict[str, Any] | None
+
+
+async def run_single_destination_pipeline(
+    request: SearchRequest,
+    *,
+    provider_instance: FlightProvider,
+    settings: FlightAgentSettings,
+) -> SingleDestinationPipelineResult:
+    """The Phase 2 single-destination pipeline -- provider search (T10) ->
+    normalize+validate (T11/T12) -> dedup (T20) -> score (T13) -> rank
+    (T14) -> render both v1 artifact bodies (T15) -- extracted verbatim out
+    of this module's own ``run`` command (T46) so the FastAPI
+    ``POST /search`` route calls this SAME implementation instead of a
+    second, independently-maintained copy of it.
+
+    Never writes a file and never prints anything; see
+    ``SingleDestinationPipelineResult``'s own docstring for why.
+    """
+    as_of = _deterministic_as_of(request)
+
+    search_result = await provider_instance.search(request, CallBudget())
+    total_offers = len(search_result.offers)
+
+    valid_itineraries, validation_results, self_transfer_rejections = _normalize_and_validate(
+        request, search_result.offers, as_of=as_of
+    )
+    validated_accepted_count, rejection_counts = summarize_validation_results(validation_results)
+    log_event(
+        EventName.VALIDATE_COMPLETED,
+        accepted_count=validated_accepted_count,
+        rejection_counts=rejection_counts,
+    )
+
+    if not valid_itineraries:
+        return SingleDestinationPipelineResult(
+            request=request,
+            generated_at=as_of,
+            total_offers=total_offers,
+            validated_accepted_count=validated_accepted_count,
+            rejection_counts=rejection_counts,
+            accepted_count=0,
+            ranked=(),
+            markdown=None,
+            json_document=None,
+        )
+
+    deduplicated_itineraries = deduplicate(valid_itineraries)
+
+    scored_itineraries = [
+        ScoredItinerary(
+            itinerary=itinerary,
+            components=score_itinerary(
+                itinerary, scoring_settings=settings.scoring, layover_settings=settings.layover
+            ),
+            rank_by_adjusted_score=1,
+            rank_by_total_journey_score=1,
+            rank_by_price=1,
+        )
+        for itinerary in deduplicated_itineraries
+    ]
+
+    ranked = rank_itineraries(scored_itineraries, top_n=settings.output.top_n_global)
+    accepted_count = len(scored_itineraries)
+    per_destination_top_n = top_n_by_destination(
+        scored_itineraries, top_n=settings.output.top_n_per_destination
+    )
+
+    markdown = render_markdown_report(
+        ranked,
+        departure_date=request.departure_date,
+        accepted_count=accepted_count,
+        generated_at=as_of,
+        data_source="mock",
+        self_transfer_rejections=self_transfer_rejections,
+    )
+    json_document = build_results_document(
+        ranked,
+        departure_date=request.departure_date,
+        accepted_count=accepted_count,
+        top_n=settings.output.top_n_global,
+        generated_at=as_of,
+        data_source="mock",
+        self_transfer_rejections=self_transfer_rejections,
+        top_n_by_destination=per_destination_top_n,
+    )
+
+    return SingleDestinationPipelineResult(
+        request=request,
+        generated_at=as_of,
+        total_offers=total_offers,
+        validated_accepted_count=validated_accepted_count,
+        rejection_counts=rejection_counts,
+        accepted_count=accepted_count,
+        ranked=tuple(ranked),
+        markdown=markdown,
+        json_document=json_document,
+    )
 
 
 def _to_rejection_code_counts(raw: dict[str, int]) -> dict[RejectionCode, int]:
@@ -603,42 +757,74 @@ def _origin_display(origin_codes: tuple[str, ...]) -> str:
     return f"{len(origin_codes)} origins ({', '.join(origin_codes)})"
 
 
-def _run_all_destinations(
+class AllDestinationsPipelineResult(NamedTuple):
+    """Everything downstream of the dual-mode, all-destinations provider
+    fan-out. Shared, byte-for-byte, between this module's own
+    ``_run_all_destinations`` and T46's FastAPI ``POST /search`` route
+    (``all_destinations=True`` branch) -- one pipeline implementation,
+    never a second copy.
+
+    ``markdown``/``json_document``/``generated_at`` are ``None`` exactly
+    when ``envelope.status`` is ``NO_RESULTS`` or ``FAILED`` -- mirroring
+    ``render_markdown_report``'s own requirement of at least one ranked
+    itinerary. This function itself never prints or writes a file.
+
+    ``origin_display`` (T37) is carried through explicitly rather than
+    recomputed by the caller: with ``all_origins=True`` the caller
+    (``_run_all_destinations``) has no other way to know which/how many
+    origins actually searched, since ``origin_codes`` itself is a purely
+    internal detail of this pipeline's own T37 branch.
+    """
+
+    envelope: RunEnvelope
+    ranked: tuple[ScoredItinerary, ...]
+    accepted_count: int
+    destination_count: int
+    dominant_code: RejectionCode | None
+    duration_ms: int
+    generated_at: datetime | None
+    markdown: str | None
+    json_document: dict[str, Any] | None
+    origin_display: str
+
+
+async def run_all_destinations_pipeline(
     *,
     origin: str,
     departure_date: date,
     provider_instance: FlightProvider,
     settings: FlightAgentSettings,
     all_origins: bool = False,
-) -> None:
-    """``--all-destinations``: search ``origin`` (or, with T37's
-    ``all_origins=True``, EVERY registry origin in priority order) against
-    every registry destination in BOTH ``max_stops`` modes (Phase 5, T29 /
-    Addendum 1), finalize the task ledger, and render the
-    no_results/PARTIAL/FAILED status contract (T27, finding 0.5, D19).
+) -> AllDestinationsPipelineResult:
+    """The Phase 5/6/7 dual-mode, all-destinations pipeline -- extracted
+    verbatim out of this module's own ``_run_all_destinations`` (T46) so
+    the FastAPI ``POST /search`` route calls this SAME implementation
+    instead of a second, independently-maintained copy.
 
-    ``--max-stops`` is NOT consulted here (it still governs the single
-    ``--dest`` pipeline unchanged): Addendum 1 requires searching a
+    ``--max-stops`` is NOT consulted here: Addendum 1 requires searching a
     destination's direct (``max_stops=0``) AND one-stop (``max_stops=1``)
     plans unconditionally for the direct-vs-stop policy comparison
     (D10/T31), so this path always builds and executes both -- 8
     destinations x 2 modes = 16 tasks per origin (the literal Phase 5 exit
     criterion), or 160 tasks total across all 10 origins when
-    ``all_origins`` is set (T37).
+    ``all_origins`` is set (T37). ``all_origins`` defaults to ``False`` so
+    the FastAPI route above (whose ``SearchRequestBody`` has no such field
+    yet) keeps calling this unchanged.
 
     Pipeline: ``orchestration.plan.build_dual_mode_plan_for_origin`` (T29,
     single origin) or ``orchestration.plan.build_multi_origin_plan`` (T37,
     all 10 origins) -> ``orchestration.executor.execute_plan`` (T24/T25,
-    retry already wired in) over every planned task, fully concurrent
-    regardless of origin count or ``wave`` (master plan S5's Option B
-    default -- ``wave`` is metadata for a later sequential-priority mode,
-    T39, not consulted here) -> per successful task, this module's own
-    ``_normalize_and_validate`` (reused unchanged) -> finalize every
-    ``TaskOutcome`` (T27's own OK-with-zero-accepted -> ALL_REJECTED
-    upgrade) -> dedup the COMBINED valid itineraries across every
-    origin, destination, AND mode (T20) -> score (T13) -> rank (T14) ->
-    construct a ``RunEnvelope`` and branch on its ``RunStatus`` (finding
-    0.5). Separately, ``_build_direct_vs_stop_pools`` builds the D13
+    retry and, since this fix, cache wiring already built in) over every
+    planned task, fully concurrent regardless of origin count or ``wave``
+    (master plan S5's Option B default -- ``wave`` is metadata for a later
+    sequential-priority mode, T39, not consulted here) -> per successful
+    task, this module's own ``_normalize_and_validate`` (reused unchanged)
+    -> finalize every ``TaskOutcome`` (T27's own OK-with-zero-accepted ->
+    ALL_REJECTED upgrade) -> dedup the COMBINED valid itineraries across
+    every origin, destination, AND mode (T20) -> score (T13), applying
+    T41's ground-travel overlay per origin -> rank (T14) -> construct a
+    ``RunEnvelope`` and branch on its ``RunStatus`` (finding 0.5).
+    Separately, ``_build_direct_vs_stop_pools`` builds the D13
     pool-separated per-destination view (accumulated across every origin
     that searched that destination -- see that function's own docstring),
     and ``_analyze_all_destinations`` runs the D10 policy (T31/T33,
@@ -648,11 +834,19 @@ def _run_all_destinations(
     That pass never feeds the ranked report itself (see
     ``_build_direct_vs_stop_pools``' own docstring); it is a separate,
     per-destination view assembled from the same already-validated pools.
+    T39's early-stop replay and T40/T41's per-origin Origin Comparison view
+    are likewise computed here so both artifacts can render them. Never
+    writes a file and never prints anything; see
+    ``AllDestinationsPipelineResult``'s own docstring for why.
 
-    Never raises a bare pydantic error for the ordinary cases (COMPLETE,
-    PARTIAL, NO_RESULTS, FAILED) -- see ``_compute_run_status`` for the one
-    degenerate task-ledger shape this candidate-status mirror cannot
-    always satisfy.
+    Opens the real on-disk ``CacheRepository`` at ``settings.cache.db_path``
+    for the duration of this one call and passes it (plus this call's own
+    ``started_at`` as the genuine wall-clock ``cache_now``) into
+    ``execute_plan`` -- the executor's cache-aside wiring (see
+    ``orchestration.executor``'s module docstring) is what makes a second
+    identical call to this function a 0-provider-call cache hit rather than
+    a repeat of every live search. Closed in a ``finally`` so a connection
+    is never leaked, including when ``execute_plan`` raises.
     """
     started_at = datetime.now(UTC)
 
@@ -669,7 +863,17 @@ def _run_all_destinations(
         )
     origin_display = _origin_display(origin_codes)
 
-    execution_results = asyncio.run(execute_plan(tasks, provider_instance, settings=settings))
+    cache_repository = CacheRepository.open(settings.cache.db_path)
+    try:
+        execution_results = await execute_plan(
+            tasks,
+            provider_instance,
+            settings=settings,
+            cache=cache_repository,
+            cache_now=started_at,
+        )
+    finally:
+        cache_repository.close()
 
     finalized_outcomes: list[TaskOutcome] = []
     combined_valid_itineraries: list[NormalizedItinerary] = []
@@ -806,6 +1010,9 @@ def _run_all_destinations(
     # searched, not how many provider calls that took.
     destination_count = len({task.request.destination for task in tasks})
 
+    generated_at: datetime | None = None
+    markdown: str | None = None
+    json_document: dict[str, Any] | None = None
     if envelope.status in (RunStatus.COMPLETE, RunStatus.PARTIAL):
         # T26's Failed Searches section reads task_outcomes itself: it
         # naturally renders for PARTIAL (>=1 error-state task) and stays
@@ -838,22 +1045,88 @@ def _run_all_destinations(
             self_transfer_rejections=self_transfer_rejections,
             top_n_by_destination=per_destination_top_n,
         )
+
+    return AllDestinationsPipelineResult(
+        envelope=envelope,
+        ranked=tuple(ranked),
+        accepted_count=accepted_count,
+        destination_count=destination_count,
+        dominant_code=dominant_code,
+        duration_ms=duration_ms,
+        generated_at=generated_at,
+        markdown=markdown,
+        json_document=json_document,
+        origin_display=origin_display,
+    )
+
+
+def _run_all_destinations(
+    *,
+    origin: str,
+    departure_date: date,
+    provider_instance: FlightProvider,
+    settings: FlightAgentSettings,
+    all_origins: bool = False,
+) -> None:
+    """``--all-destinations``: run ``run_all_destinations_pipeline`` (T46)
+    and render the CLI-specific side effects on top of its result --
+    writing both the D15 fixed-path artifacts and the T45 per-run copy,
+    echoing the summary line, and branching exit codes on ``RunStatus``
+    (finding 0.5, D19). All of the actual search/validate/dedup/score/rank
+    work now lives in ``run_all_destinations_pipeline`` itself; see that
+    function's own docstring for the full pipeline description, including
+    ``all_origins`` (T37): every registry origin at once instead of just
+    ``origin``, threaded straight through unchanged.
+
+    Never raises a bare pydantic error for the ordinary cases (COMPLETE,
+    PARTIAL, NO_RESULTS, FAILED) -- see ``_compute_run_status`` for the one
+    degenerate task-ledger shape this candidate-status mirror cannot
+    always satisfy.
+    """
+    result = asyncio.run(
+        run_all_destinations_pipeline(
+            origin=origin,
+            departure_date=departure_date,
+            provider_instance=provider_instance,
+            settings=settings,
+            all_origins=all_origins,
+        )
+    )
+    envelope = result.envelope
+
+    if envelope.status in (RunStatus.COMPLETE, RunStatus.PARTIAL):
+        assert result.markdown is not None
+        assert result.json_document is not None
         report_path, results_path = write_report_artifacts(
-            markdown=markdown,
-            json_data=json_document,
+            markdown=result.markdown,
+            json_data=result.json_document,
             report_path=Path(settings.output.report_path),
             results_path=Path(settings.output.results_path),
         )
-        typer.echo(
-            f"flightagent: {envelope.status.value} -- {accepted_count} valid itinerary(ies) "
-            f"across {destination_count} destination(s) from {origin_display} on "
-            f"{departure_date.isoformat()}; wrote {report_path} and {results_path}"
+        # T45: alongside (never instead of) the D15 fixed-path pair just
+        # written above -- reuses this run's own run_meta.run_id (already
+        # generated for the RunEnvelope, not a second independent id) so
+        # this run's artifacts are individually addressable without
+        # disturbing D15's own fixed-path contract at all.
+        write_run_artifacts(
+            run_id=envelope.run_meta.run_id,
+            markdown=result.markdown,
+            json_data=result.json_document,
+            runs_dir=Path(settings.output.runs_dir),
         )
-        log_event(EventName.RUN_COMPLETED, status=envelope.status.value, duration_ms=duration_ms)
+        typer.echo(
+            f"flightagent: {envelope.status.value} -- {result.accepted_count} valid "
+            f"itinerary(ies) across {result.destination_count} destination(s) from "
+            f"{result.origin_display} on {departure_date.isoformat()}; wrote {report_path} and "
+            f"{results_path}"
+        )
+        log_event(
+            EventName.RUN_COMPLETED, status=envelope.status.value, duration_ms=result.duration_ms
+        )
         return
 
     if envelope.status == RunStatus.NO_RESULTS:
-        if dominant_code in _LAYOVER_REJECTION_CODES:
+        if result.dominant_code in _LAYOVER_REJECTION_CODES:
             # D19 / spec section 9: the ORIGINAL spec's exact hardcoded
             # string, verbatim, and ONLY here -- the one dominant-code case
             # where it happens to be true.
@@ -864,15 +1137,21 @@ def _run_all_destinations(
                 )
             )
         else:
-            reason = dominant_code.value if dominant_code is not None else "no valid offers found"
+            reason = (
+                result.dominant_code.value
+                if result.dominant_code is not None
+                else "no valid offers found"
+            )
             typer.echo(
                 f"flightagent: no_results -- 0 valid itinerary(ies) across "
-                f"{destination_count} destination(s) from {origin_display} on "
+                f"{result.destination_count} destination(s) from {result.origin_display} on "
                 f"{departure_date.isoformat()} -- dominant rejection reason: {reason}. "
                 f"No report written.",
                 err=True,
             )
-        log_event(EventName.RUN_COMPLETED, status=envelope.status.value, duration_ms=duration_ms)
+        log_event(
+            EventName.RUN_COMPLETED, status=envelope.status.value, duration_ms=result.duration_ms
+        )
         raise typer.Exit(code=NO_VALID_ITINERARIES_EXIT_CODE)
 
     # RunStatus.FAILED: every task errored, zero accepted -- finding 0.5's
@@ -880,13 +1159,13 @@ def _run_all_destinations(
     # NO_RESULTS's message (that is finding 0.5's whole point): distinct
     # wording, distinct exit code.
     typer.echo(
-        f"flightagent: failed -- every search for {origin_display} across "
-        f"{destination_count} destination(s) on {departure_date.isoformat()} errored; "
+        f"flightagent: failed -- every search for {result.origin_display} across "
+        f"{result.destination_count} destination(s) on {departure_date.isoformat()} errored; "
         f"the provider was unreachable (or every attempt otherwise failed), not merely "
         f"short of valid itineraries. No report written.",
         err=True,
     )
-    log_event(EventName.RUN_COMPLETED, status=envelope.status.value, duration_ms=duration_ms)
+    log_event(EventName.RUN_COMPLETED, status=envelope.status.value, duration_ms=result.duration_ms)
     raise typer.Exit(code=ALL_DESTINATIONS_FAILED_EXIT_CODE)
 
 
@@ -1009,100 +1288,61 @@ def run(
     # that cross-branch invariant on its own.
     assert dest is not None
 
-    request = SearchRequest(
-        origin=origin.upper(),
-        destination=dest.upper(),
+    request = build_search_request(
+        origin=origin,
+        destination=dest,
         departure_date=departure_date,
-        cabin=_DEFAULT_CABIN,
         max_stops=stop_mode,
-        adults=_DEFAULT_ADULTS,
-        currency=_DEFAULT_CURRENCY,
-        layover_min=timedelta(minutes=settings.layover.layover_min_minutes),
-        layover_max=timedelta(minutes=settings.layover.layover_max_minutes),
+        settings=settings,
     )
 
-    as_of = _deterministic_as_of(request)
-
-    search_result = asyncio.run(provider_instance.search(request, CallBudget()))
-    total_offers = len(search_result.offers)
-
-    valid_itineraries, validation_results, self_transfer_rejections = _normalize_and_validate(
-        request, search_result.offers, as_of=as_of
+    result = asyncio.run(
+        run_single_destination_pipeline(
+            request, provider_instance=provider_instance, settings=settings
+        )
     )
 
-    validate_accepted_count, rejection_counts = summarize_validation_results(validation_results)
-    log_event(
-        EventName.VALIDATE_COMPLETED,
-        accepted_count=validate_accepted_count,
-        rejection_counts=rejection_counts,
-    )
-
-    if not valid_itineraries:
-        if rejection_counts:
+    if result.markdown is None or result.json_document is None:
+        if result.rejection_counts:
             breakdown = ", ".join(
-                f"{code}={count}" for code, count in sorted(rejection_counts.items())
+                f"{code}={count}" for code, count in sorted(result.rejection_counts.items())
             )
         else:
             breakdown = "provider returned no offers"
         typer.echo(
-            f"flightagent: 0 valid itineraries out of {total_offers} offer(s) for "
+            f"flightagent: 0 valid itineraries out of {result.total_offers} offer(s) for "
             f"{request.origin}->{request.destination} on {request.departure_date} "
             f"-- rejections: {breakdown}. No report written.",
             err=True,
         )
         raise typer.Exit(code=NO_VALID_ITINERARIES_EXIT_CODE)
 
-    deduplicated_itineraries = deduplicate(valid_itineraries)
-
-    scored_itineraries = [
-        ScoredItinerary(
-            itinerary=itinerary,
-            components=score_itinerary(
-                itinerary, scoring_settings=settings.scoring, layover_settings=settings.layover
-            ),
-            rank_by_adjusted_score=1,
-            rank_by_total_journey_score=1,
-            rank_by_price=1,
-        )
-        for itinerary in deduplicated_itineraries
-    ]
-
-    ranked = rank_itineraries(scored_itineraries, top_n=settings.output.top_n_global)
-    accepted_count = len(scored_itineraries)
-    per_destination_top_n = top_n_by_destination(
-        scored_itineraries, top_n=settings.output.top_n_per_destination
-    )
-
-    markdown = render_markdown_report(
-        ranked,
-        departure_date=request.departure_date,
-        accepted_count=accepted_count,
-        generated_at=as_of,
-        data_source="mock",
-        self_transfer_rejections=self_transfer_rejections,
-    )
-    json_document = build_results_document(
-        ranked,
-        departure_date=request.departure_date,
-        accepted_count=accepted_count,
-        top_n=settings.output.top_n_global,
-        generated_at=as_of,
-        data_source="mock",
-        self_transfer_rejections=self_transfer_rejections,
-        top_n_by_destination=per_destination_top_n,
-    )
-
     report_path, results_path = write_report_artifacts(
-        markdown=markdown,
-        json_data=json_document,
+        markdown=result.markdown,
+        json_data=result.json_document,
         report_path=Path(settings.output.report_path),
         results_path=Path(settings.output.results_path),
     )
+    # T45: alongside (never instead of) the D15 fixed-path pair just written
+    # above. This single-``--dest`` pipeline never builds a ``RunMeta`` (no
+    # ``RunEnvelope`` exists on this path at all), so a fresh id is
+    # generated here purely to key this run's own artifact directory --
+    # the same ``generate_run_id()`` (UUID4) ``_run_all_destinations`` uses
+    # for its ``RunMeta.run_id``, not a second, independently-invented
+    # convention. The id differs between any two invocations (UUID4), even
+    # though the D15 artifact CONTENT it copies is itself deterministic
+    # (finding 0.3) -- see ``reporting.run_artifacts``'s own docstring.
+    write_run_artifacts(
+        run_id=generate_run_id(),
+        markdown=result.markdown,
+        json_data=result.json_document,
+        runs_dir=Path(settings.output.runs_dir),
+    )
 
     typer.echo(
-        f"flightagent: {accepted_count} valid itinerary(ies) out of {total_offers} offer(s) "
-        f"for {request.origin}->{request.destination} on {request.departure_date}; "
-        f"wrote {report_path} and {results_path}"
+        f"flightagent: {result.accepted_count} valid itinerary(ies) out of "
+        f"{result.total_offers} offer(s) for {request.origin}->{request.destination} on "
+        f"{request.departure_date}; wrote {report_path} and {results_path}"
     )
 
 
