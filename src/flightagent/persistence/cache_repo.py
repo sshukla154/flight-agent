@@ -42,6 +42,25 @@ from flightagent.observability.logging import log_event
 from flightagent.persistence.db import connect
 
 
+def _parse_expires_at(expires_at_raw: str) -> datetime | None:
+    """Best-effort ISO-8601 parse of a stored ``expires_at`` value -- never
+    raises.
+
+    Guards against a corrupted or hand-tampered row (direct SQL against
+    the on-disk file, disk-level bit rot, a manual edit) reaching
+    ``datetime.fromisoformat`` with a value it cannot parse. A row that
+    fails this parse can never be proven live, so ``get_raw``/
+    ``get_normalized`` treat a ``None`` result here exactly like an
+    expired entry -- a miss, never a crash -- and additionally evict the
+    offending row (see ``_delete_raw``/``_delete_normalized``) so the same
+    corrupted value can't repeat the failure on a later lookup.
+    """
+    try:
+        return datetime.fromisoformat(expires_at_raw)
+    except (TypeError, ValueError):
+        return None
+
+
 def resolve_ttl(*, departure_date: date, as_of: date, settings: CacheSettings) -> timedelta:
     """TTL tiered by days-to-departure (master plan S5,
     ``config/defaults.toml``'s ``[cache]`` table): >180d, 30-180d, 7-30d,
@@ -154,7 +173,8 @@ class CacheRepository:
         row = await asyncio.to_thread(self._select_raw, raw_key)
         if row is not None:
             payload, expires_at_raw = row
-            if now < datetime.fromisoformat(expires_at_raw):
+            expires_at = _parse_expires_at(expires_at_raw)
+            if expires_at is not None and now < expires_at:
                 self.counters.raw_hits += 1
                 log_event(
                     EventName.CACHE_HIT,
@@ -165,6 +185,11 @@ class CacheRepository:
                     layer="raw",
                 )
                 return payload
+            if expires_at is None:
+                # Corrupted row: expires_at could not be parsed, so this
+                # row can never be proven live -- evict it rather than
+                # leaving it to fail the same way on every future lookup.
+                await asyncio.to_thread(self._delete_raw, raw_key)
 
         self.counters.raw_misses += 1
         log_event(
@@ -184,6 +209,10 @@ class CacheRepository:
         )
         row = cursor.fetchone()
         return None if row is None else (row[0], row[1])
+
+    def _delete_raw(self, raw_key: str) -> None:
+        self._connection.execute("DELETE FROM raw_payloads WHERE raw_key = ?", (raw_key,))
+        self._connection.commit()
 
     async def put_raw(
         self,
@@ -287,7 +316,8 @@ class CacheRepository:
         row = await asyncio.to_thread(self._select_normalized, normalized_key)
         if row is not None:
             payload, expires_at_raw = row
-            if now < datetime.fromisoformat(expires_at_raw):
+            expires_at = _parse_expires_at(expires_at_raw)
+            if expires_at is not None and now < expires_at:
                 self.counters.normalized_hits += 1
                 log_event(
                     EventName.CACHE_HIT,
@@ -298,6 +328,9 @@ class CacheRepository:
                     layer="normalized",
                 )
                 return payload
+            if expires_at is None:
+                # Corrupted row -- see get_raw's identical guard above.
+                await asyncio.to_thread(self._delete_normalized, normalized_key)
 
         self.counters.normalized_misses += 1
         log_event(
@@ -317,6 +350,12 @@ class CacheRepository:
         )
         row = cursor.fetchone()
         return None if row is None else (row[0], row[1])
+
+    def _delete_normalized(self, normalized_key: str) -> None:
+        self._connection.execute(
+            "DELETE FROM normalized_offers WHERE normalized_key = ?", (normalized_key,)
+        )
+        self._connection.commit()
 
     async def put_normalized(
         self,
