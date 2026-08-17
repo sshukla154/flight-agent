@@ -21,6 +21,8 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
+import pytest
+
 from flightagent.domain.enums import CabinClass
 from flightagent.domain.ground import GroundLeg
 from flightagent.domain.itinerary import Leg, NormalizedItinerary
@@ -352,6 +354,17 @@ class TestTopNSlicing:
 
     def test_empty_input_returns_empty_list_without_error(self) -> None:
         ranked = rank_itineraries([], top_n=10)
+
+        assert ranked == []
+
+    @pytest.mark.parametrize("top_n", [0, -1, -10])
+    def test_top_n_zero_or_negative_returns_empty_list(self, top_n: int) -> None:
+        items = [
+            _scored(itinerary_id=f"itin_{i:03d}", adjusted_score=Decimal(i), price_eur=Decimal(i))
+            for i in range(3)
+        ]
+
+        ranked = rank_itineraries(items, top_n=top_n)
 
         assert ranked == []
 

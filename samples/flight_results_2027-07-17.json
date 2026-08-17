@@ -1,0 +1,85 @@
+{
+  "schema_version": "1.0",
+  "data_source": "mock",
+  "departure_date": "2027-07-17",
+  "generated_at": "2027-05-23T10:46:55+00:00",
+  "accepted_count": 1,
+  "top_n": 10,
+  "top_itineraries": [
+    {
+      "rank_by_adjusted_score": 1,
+      "rank_by_price": 1,
+      "rank_by_total_journey_score": 1,
+      "itinerary_id": "itin_e2b39f1620b88dff784bdce21d6f70ea1b2c826885f0a0c8834b43d708b316ac",
+      "provider": "mock",
+      "airline": "EK",
+      "route": "AMS to DXB to DEL",
+      "origin": "AMS",
+      "destination": "DEL",
+      "stop_count": 1,
+      "departure_utc": "2027-07-17T06:00:00+00:00",
+      "departure_local": "2027-07-17T08:00:00+02:00",
+      "departure_tz": "Europe/Amsterdam",
+      "arrival_utc": "2027-07-17T20:00:00+00:00",
+      "arrival_local": "2027-07-18T01:30:00+05:30",
+      "arrival_tz": "Asia/Kolkata",
+      "layover_minutes": 240,
+      "total_duration_minutes": 840,
+      "price_eur": "812.30",
+      "fare_as_of": "2027-05-23T10:46:55+00:00",
+      "booking_url": "https://mock-booking.example.test/ams-del-valid-4h",
+      "booking_url_kind": "provider_native",
+      "booking_url_valid": true,
+      "score": {
+        "fare_eur": "812.30",
+        "elapsed_time_component": "42.0",
+        "layover_penalty": "10",
+        "direct_bonus": "0",
+        "score": "864.30",
+        "adjusted_score": "864.30"
+      }
+    }
+  ],
+  "failed_searches": [],
+  "destination_analyses": [],
+  "early_stop_analysis": [],
+  "origin_comparison": [],
+  "self_transfer_rejections": [],
+  "top_itineraries_by_destination": {
+    "DEL": [
+      {
+        "rank_by_adjusted_score": 1,
+        "rank_by_price": 1,
+        "rank_by_total_journey_score": 1,
+        "itinerary_id": "itin_e2b39f1620b88dff784bdce21d6f70ea1b2c826885f0a0c8834b43d708b316ac",
+        "provider": "mock",
+        "airline": "EK",
+        "route": "AMS to DXB to DEL",
+        "origin": "AMS",
+        "destination": "DEL",
+        "stop_count": 1,
+        "departure_utc": "2027-07-17T06:00:00+00:00",
+        "departure_local": "2027-07-17T08:00:00+02:00",
+        "departure_tz": "Europe/Amsterdam",
+        "arrival_utc": "2027-07-17T20:00:00+00:00",
+        "arrival_local": "2027-07-18T01:30:00+05:30",
+        "arrival_tz": "Asia/Kolkata",
+        "layover_minutes": 240,
+        "total_duration_minutes": 840,
+        "price_eur": "812.30",
+        "fare_as_of": "2027-05-23T10:46:55+00:00",
+        "booking_url": "https://mock-booking.example.test/ams-del-valid-4h",
+        "booking_url_kind": "provider_native",
+        "booking_url_valid": true,
+        "score": {
+          "fare_eur": "812.30",
+          "elapsed_time_component": "42.0",
+          "layover_penalty": "10",
+          "direct_bonus": "0",
+          "score": "864.30",
+          "adjusted_score": "864.30"
+        }
+      }
+    ]
+  }
+}

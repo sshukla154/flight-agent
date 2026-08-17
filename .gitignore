@@ -5,8 +5,10 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .coverage
+coverage.json
 htmlcov/
 out/
 data/
+cache/
 .env
 !.env.example

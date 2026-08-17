@@ -1,0 +1,32 @@
+services:
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: flightagent:local
+    volumes:
+      - flightagent-data:/data
+    # The image's own CMD already runs the full fan-out; spelled out here
+    # too so this file is self-documenting and `docker compose run --rm
+    # agent <other args>` overrides it cleanly. There is no --all flag on
+    # `flightagent run` -- this is the real flag combination that produces
+    # the same 10-origin x 8-destination x 2-mode (160-task) run.
+    command:
+      - "run"
+      - "--origin"
+      - "AMS"
+      - "--date"
+      - "2027-07-17"
+      - "--max-stops"
+      - "0"
+      - "--all-destinations"
+      - "--all-origins"
+
+volumes:
+  # Named volume, not a host bind mount: a fresh named volume inherits the
+  # Dockerfile's own `chown flightagent /data`, so the non-root user can
+  # write to it with zero host-side permission setup on Windows, macOS, or
+  # a Linux CI runner alike -- a bind mount would hit a real uid-mismatch
+  # risk on Linux (host dir owned by the runner's uid, container writes as
+  # uid 10001) needing extra chmod/user: juggling for no real benefit.
+  flightagent-data:

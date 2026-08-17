@@ -13,7 +13,7 @@
 | `CONFIRMED` | The project owner has explicitly signed this off. |
 | `DEFAULT (unconfirmed)` | A recommended default that work proceeds on so implementation is not blocked. The owner has **not** signed it off. It can change. |
 
-As of 2026-08-16, four decisions are `CONFIRMED`: **D10, D16, D17, D18**. Every other decision in this register — D1 through D9, D11 through D15, and D19 (added 2026-08-16, scoping Phase 4) — is `DEFAULT (unconfirmed)`. That distinction is the whole point of the register — do not quietly promote a default to a confirmation because code now depends on it.
+As of 2026-08-17, five decisions are `CONFIRMED`: **D10, D16, D17, D18, D20**. Every other decision in this register — D1 through D9, D11 through D15, and D19 (added 2026-08-16, scoping Phase 4) — is `DEFAULT (unconfirmed)`. That distinction is the whole point of the register — do not quietly promote a default to a confirmation because code now depends on it.
 
 ---
 
@@ -39,6 +39,7 @@ As of 2026-08-16, four decisions are `CONFIRMED`: **D10, D16, D17, D18**. Every 
   - [D17 — Fare matrix visual: surface](#d17--fare-matrix-visual-surface)
   - [D18 — Fare matrix visual: colour scale](#d18--fare-matrix-visual-colour-scale)
   - [D19 — dominant_rejection_code: how a NO_RESULTS run says why](#d19--dominant_rejection_code-how-a-no_results-run-says-why)
+  - [D20 — Docker packaging scope](#d20--docker-packaging-scope)
 - [Confirm before Phase 5](#confirm-before-phase-5)
 - [Restated acceptance criteria](#restated-acceptance-criteria)
 - [Open questions carried into every report](#open-questions-carried-into-every-report)
@@ -368,6 +369,20 @@ Two template constraints that look cosmetic in review and are not: **never drop 
 **Blast radius.** Phase 4's CLI wiring (T27, the `no_results` contract task), the reporting layer's summary line, Phase 4's integration test asserting the exact spec JSON.
 
 **Reversal cost.** **Cheap.** A pure function over already-modeled data (`TaskOutcome.rejection_counts`); promoting it to a stored field later, if ever needed, is additive.
+
+---
+
+### D20 — Docker packaging scope
+
+**Decision.** Containerize the CLI only. The `Dockerfile`/`docker-compose.yml` package `flightagent run ...` and nothing else — the FastAPI service surface (`src/flightagent/api/app.py`) is deliberately NOT containerized in Phase 8.
+
+**Status.** `CONFIRMED` — decided by the project owner 2026-08-17, scoping Phase 8.
+
+**Rationale.** `api/app.py` hardcodes `DEFAULT_HOST = "127.0.0.1"` and ships with no authentication on any endpoint, with its own module docstring stating plainly this surface is not safe to expose beyond localhost. Wrapping it in a container with a port mapping to make it reachable from outside would mean overriding that safety choice as a side effect of a packaging task — that trade-off belongs to a future phase that also adds real authentication (tracked as "Phase 8b" follow-up work), not to Phase 8.
+
+**Blast radius.** `Dockerfile`, `docker-compose.yml`, `README.md`'s Docker section.
+
+**Reversal cost.** **Moderate.** Adding an API service to compose later means bypassing `serve()`'s hardcoded host (`uvicorn flightagent.api.app:app --host 0.0.0.0`), which should not happen without also landing real auth in the same change.
 
 ---
 
