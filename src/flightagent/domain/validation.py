@@ -15,6 +15,7 @@ from __future__ import annotations
 from pydantic import BaseModel, ConfigDict, computed_field
 
 from flightagent.domain.enums import RejectionCode
+from flightagent.domain.itinerary import NormalizedItinerary
 
 
 class Rejection(BaseModel):
@@ -28,6 +29,26 @@ class Rejection(BaseModel):
     observed: str
     expected: str
     rule_id: str
+
+
+class RejectedItinerary(BaseModel):
+    """One itinerary paired with the ``Rejection`` that excluded it (T41).
+
+    ``ValidationResult`` alone cannot serve a report appendix: it carries
+    only ``itinerary_id`` and ``rejections``, never the ``NormalizedItinerary``
+    object itself (see that class's own docstring), so there is nothing to
+    read a route/price/airline off of. This model exists specifically for
+    call sites (``cli.py``) that still hold the itinerary in scope at the
+    moment ``validate()`` returns a rejection and want to preserve it for
+    later, itinerary-level reporting -- D5's "Self-transfer, not protected"
+    appendix (``reporting.markdown``/``reporting.json_report``, T41) is the
+    first consumer, and is not required to be the only one.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    itinerary: NormalizedItinerary
+    rejection: Rejection
 
 
 class ValidationResult(BaseModel):

@@ -30,13 +30,15 @@ from zoneinfo import ZoneInfo
 import jsonschema
 import pytest
 
-from flightagent.domain.enums import CabinClass, DirectTier, TaskState
+from flightagent.domain.enums import CabinClass, DirectTier, RejectionCode, TaskState
+from flightagent.domain.ground import GroundLeg
 from flightagent.domain.itinerary import Leg, NormalizedItinerary
 from flightagent.domain.money import Money
 from flightagent.domain.policy import DestinationAnalysis
 from flightagent.domain.run import TaskOutcome
-from flightagent.domain.scoring import ScoreComponents, ScoredItinerary
+from flightagent.domain.scoring import OriginSummary, ScoreComponents, ScoredItinerary
 from flightagent.domain.segment import Layover, Segment
+from flightagent.domain.validation import RejectedItinerary, Rejection
 from flightagent.reporting.booking_link import BookingUrlRejected, validate_booking_url
 from flightagent.reporting.json_report import build_results_document
 from flightagent.reporting.markdown import SYNTHETIC_DATA_BANNER, render_markdown_report
@@ -46,6 +48,7 @@ from flightagent.reporting.run_artifacts import (
     write_run_artifacts,
 )
 from flightagent.reporting.writer import atomic_write_text, write_report_artifacts
+from flightagent.scoring.ranking import rank_itineraries, top_n_by_destination
 
 _SCHEMA_PATH = Path(__file__).resolve().parents[2] / "config" / "results.schema.json"
 
@@ -87,7 +90,14 @@ def _segment(
     )
 
 
-def _layover(*, airport: str, arrive_utc: datetime, depart_utc: datetime, tz_name: str) -> Layover:
+def _layover(
+    *,
+    airport: str,
+    arrive_utc: datetime,
+    depart_utc: datetime,
+    tz_name: str,
+    is_self_transfer: bool = False,
+) -> Layover:
     zone = ZoneInfo(tz_name)
     return Layover(
         airport=airport,
@@ -97,6 +107,7 @@ def _layover(*, airport: str, arrive_utc: datetime, depart_utc: datetime, tz_nam
         local_window=(arrive_utc.astimezone(zone), depart_utc.astimezone(zone)),
         requires_airport_change=False,
         requires_terminal_change=False,
+        is_self_transfer=is_self_transfer,
     )
 
 
@@ -110,6 +121,7 @@ def _one_stop_itinerary(
     layover_minutes: int,
     booking_url: str | None,
     booking_url_kind: _BookingUrlKind = "provider_native",
+    is_self_transfer: bool = False,
 ) -> NormalizedItinerary:
     """AMS -(carrier)-> hub -(carrier)-> DEL, one layover of exactly
     ``layover_minutes``. Real IANA zones throughout, matching the shape
@@ -133,7 +145,11 @@ def _one_stop_itinerary(
         flight_number="101",
     )
     layover = _layover(
-        airport=hub, arrive_utc=arrive_utc_hub, depart_utc=depart_utc_hub, tz_name=hub_tz
+        airport=hub,
+        arrive_utc=arrive_utc_hub,
+        depart_utc=depart_utc_hub,
+        tz_name=hub_tz,
+        is_self_transfer=is_self_transfer,
     )
     seg2 = _segment(
         origin=hub,
@@ -224,6 +240,121 @@ def _ranked_pair() -> list[ScoredItinerary]:
         layover_penalty=Decimal("0"),
     )
     return [top, second]
+
+
+def _self_transfer_itinerary(
+    *, itinerary_id: str = "itin_self_transfer_0001", price_eur: Decimal = Decimal("500.00")
+) -> NormalizedItinerary:
+    """AMS -(EY)-> AUH -(EY)-> DEL, one layover flagged ``is_self_transfer``
+    (D5) -- the exact fixture ``validation.rules.check_self_transfer``
+    exists to reject. A distinct hub/carrier/price from every other fixture
+    in this module (``_top_itinerary``/``_second_itinerary`` both use
+    IST/DXB), so a test asserting this itinerary's own text does not appear
+    somewhere it shouldn't can never accidentally match a DIFFERENT,
+    legitimately-ranked itinerary instead.
+    """
+    return _one_stop_itinerary(
+        itinerary_id=itinerary_id,
+        price_eur=price_eur,
+        carrier="EY",
+        hub="AUH",
+        hub_tz="Asia/Dubai",
+        layover_minutes=240,
+        booking_url=None,
+        booking_url_kind="unavailable",
+        is_self_transfer=True,
+    )
+
+
+def _self_transfer_rejection(
+    *, itinerary_id: str = "itin_self_transfer_0001", price_eur: Decimal = Decimal("500.00")
+) -> RejectedItinerary:
+    itinerary = _self_transfer_itinerary(itinerary_id=itinerary_id, price_eur=price_eur)
+    rejection = Rejection(
+        code=RejectionCode.SELF_TRANSFER,
+        message=(
+            "layover at AUH is a self-transfer / separate-ticket connection (D5): excluded "
+            "from the valid ranked set regardless of its 240 minute duration"
+        ),
+        observed="self_transfer",
+        expected="not_self_transfer",
+        rule_id="self_transfer",
+    )
+    return RejectedItinerary(itinerary=itinerary, rejection=rejection)
+
+
+_TEN_ORIGINS = ("AMS", "EIN", "RTM", "DUS", "BRU", "NRN", "CGN", "CRL", "MST", "GRQ")
+"""The real Phase 6 origin set (config/ground_access.yaml priority order),
+matching ``test_ranker.py``'s own module-level constant of the same name --
+used so the "exactly 10 rows" test actually exercises all 10 configured
+origins, not an arbitrary shorter stand-in."""
+
+
+def _itinerary_from_origin(
+    *, itinerary_id: str, origin: str, destination: str = "DEL", price_eur: Decimal
+) -> NormalizedItinerary:
+    """A single-segment, zero-layover ``origin`` -> ``destination``
+    itinerary -- like module-level ``_direct_itinerary``, but with a
+    caller-controlled origin (that one hardcodes AMS), needed by the Origin
+    Comparison / global-top-10-is-genuinely-multi-origin tests below. Plain
+    "UTC" zones throughout -- these tests are about origin/ranking
+    attribution, not timezone correctness (already covered elsewhere)."""
+    depart_utc = datetime(2027, 7, 17, 8, 0, tzinfo=UTC)
+    arrive_utc = depart_utc + timedelta(hours=9)
+    seg = Segment(
+        segment_id=f"{origin}-{destination}-1",
+        origin=origin,
+        destination=destination,
+        depart_utc=depart_utc,
+        arrive_utc=arrive_utc,
+        depart_local=depart_utc.astimezone(UTC),
+        arrive_local=arrive_utc.astimezone(UTC),
+        origin_tz="UTC",
+        destination_tz="UTC",
+        marketing_carrier="KL",
+        flight_number="900",
+        cabin=CabinClass.ECONOMY,
+        duration=arrive_utc - depart_utc,
+    )
+    leg = Leg(segments=(seg,), layovers=())
+    price = Money(amount=price_eur, currency="EUR")
+    return NormalizedItinerary(
+        itinerary_id=itinerary_id,
+        provider="mock",
+        legs=(leg,),
+        price_original=price,
+        price_eur=price,
+        booking_url_kind="unavailable",
+        shape_key=f"shape-{itinerary_id}",
+        fare_as_of=depart_utc,
+    )
+
+
+def _scored_from_origin(
+    *, itinerary_id: str, origin: str, destination: str = "DEL", price_eur: Decimal, rank: int = 1
+) -> ScoredItinerary:
+    """Like module-level ``_scored``, but for an itinerary departing from
+    ``origin`` (any airport, not just AMS) -- ``adjusted_score`` is pinned
+    exactly equal to ``price_eur`` (every other component zeroed) so a
+    test can assert ranking order purely from ``price_eur`` without a
+    second, independent score computation to keep in sync.
+    """
+    itinerary = _itinerary_from_origin(
+        itinerary_id=itinerary_id, origin=origin, destination=destination, price_eur=price_eur
+    )
+    components = ScoreComponents(
+        fare_eur=price_eur,
+        elapsed_time_component=Decimal("0"),
+        layover_penalty=Decimal("0"),
+        direct_bonus=Decimal("0"),
+    )
+    return ScoredItinerary(
+        itinerary=itinerary,
+        components=components,
+        rank_by_adjusted_score=rank,
+        rank_by_total_journey_score=rank,
+        rank_by_price=rank,
+    )
 
 
 def _direct_itinerary(
@@ -1438,6 +1569,517 @@ class TestFinalSummarySentence:
             destination_analyses=_eight_destination_analyses(),
         )
         assert "**Final Summary:**" not in rendered
+
+
+def _ground_leg(*, minutes: int) -> GroundLeg:
+    """A minimal, valid ``GroundLeg`` for tests that need an
+    ``OriginSummary.best`` carrying real T38 ground data -- values other
+    than ``duration`` are arbitrary but valid, matching
+    ``test_ranker.py``'s own identically-named fixture."""
+    return GroundLeg(
+        from_location="Nieuwegein, Utrecht, NL",
+        to_airport="AMS",
+        mode="car",
+        duration=timedelta(minutes=minutes),
+        distance_km=Decimal("50"),
+        cost=Money(amount=Decimal("10.00"), currency="EUR"),
+        source="estimate",
+        as_of=date(2026, 8, 14),
+    )
+
+
+def _origin_comparison_section(rendered: str) -> str:
+    """The "## Origin Comparison" section's own text, up to (not
+    including) the next ``##`` heading or end of document -- mirrors
+    ``_direct_flight_analysis_section``'s identical slicing convention."""
+    start = rendered.index("## Origin Comparison")
+    rest = rendered[start + len("## Origin Comparison") :]
+    next_heading = rest.find("\n## ")
+    tail_length = next_heading if next_heading != -1 else len(rest)
+    end = start + len("## Origin Comparison") + tail_length
+    return rendered[start:end]
+
+
+class TestOriginComparisonMarkdown:
+    """Phase 6, T41 -- master plan acceptance criterion A2-5c: "the origin
+    comparison table lists a cheapest-valid price for all 10 origins ... or
+    an explicit reason for absence"."""
+
+    def test_no_section_when_no_origin_summaries_supplied(self) -> None:
+        rendered = render_markdown_report(
+            _ranked_pair(),
+            departure_date=_DEPARTURE_DATE,
+            accepted_count=2,
+            generated_at=_GENERATED_AT,
+        )
+        assert "## Origin Comparison" not in rendered
+
+    def test_exactly_ten_rows_for_a_full_ten_origin_run(self) -> None:
+        # Nine origins with a real accepted itinerary, one (GRQ) with none
+        # at all -- the row A2-5c requires regardless.
+        summaries = [
+            OriginSummary(
+                origin=origin,
+                best=_scored_from_origin(
+                    itinerary_id=f"itin_{origin.lower()}_0001",
+                    origin=origin,
+                    price_eur=Decimal("700.00"),
+                ),
+            )
+            for origin in _TEN_ORIGINS[:-1]
+        ]
+        summaries.append(OriginSummary(origin="GRQ"))
+
+        rendered = render_markdown_report(
+            _ranked_pair(),
+            departure_date=_DEPARTURE_DATE,
+            accepted_count=2,
+            generated_at=_GENERATED_AT,
+            origin_summaries=summaries,
+            task_outcomes=[_task_outcome(task_id="GRQ-DEL-s1", state=TaskState.NO_OFFERS)],
+        )
+
+        section = _origin_comparison_section(rendered)
+        data_rows = [
+            line
+            for line in section.splitlines()
+            if line.startswith("|") and not line.startswith("|---") and "Origin" not in line
+        ]
+        assert len(data_rows) == 10
+        origins_seen = {line.split("|")[1].strip() for line in data_rows}
+        assert origins_seen == set(_TEN_ORIGINS)
+
+    def test_absent_origin_gets_a_dash_and_an_explicit_reason_not_a_missing_row(self) -> None:
+        summaries = [
+            OriginSummary(
+                origin="AMS",
+                best=_scored_from_origin(
+                    itinerary_id="itin_ams_0001", origin="AMS", price_eur=Decimal("700.00")
+                ),
+            ),
+            OriginSummary(origin="GRQ"),
+        ]
+        rendered = render_markdown_report(
+            _ranked_pair(),
+            departure_date=_DEPARTURE_DATE,
+            accepted_count=2,
+            generated_at=_GENERATED_AT,
+            origin_summaries=summaries,
+            task_outcomes=[_task_outcome(task_id="GRQ-DEL-s1", state=TaskState.NO_OFFERS)],
+        )
+        section = _origin_comparison_section(rendered)
+        row = _table_row(section, "GRQ")
+        assert "–" in row
+        assert "no offers returned" in row
+        # The row must still exist -- never silently dropped.
+        assert "GRQ" in {line.split("|")[1].strip() for line in section.splitlines() if "|" in line}
+
+    def test_provider_error_origin_states_search_failed_not_a_rejection_reason(self) -> None:
+        summaries = [OriginSummary(origin="BRU")]
+        rendered = render_markdown_report(
+            _ranked_pair(),
+            departure_date=_DEPARTURE_DATE,
+            accepted_count=2,
+            generated_at=_GENERATED_AT,
+            origin_summaries=summaries,
+            task_outcomes=[_provider_error_outcome(task_id="BRU-DEL-s1")],
+        )
+        section = _origin_comparison_section(rendered)
+        row = _table_row(section, "BRU")
+        assert "search failed" in row
+
+    def test_ground_access_column_reflects_the_origins_ground_leg(self) -> None:
+        with_ground = _scored_from_origin(
+            itinerary_id="itin_ams_ground", origin="AMS", price_eur=Decimal("700.00")
+        ).model_copy(update={"ground": _ground_leg(minutes=95)})
+        summaries = [OriginSummary(origin="AMS", best=with_ground)]
+
+        rendered = render_markdown_report(
+            _ranked_pair(),
+            departure_date=_DEPARTURE_DATE,
+            accepted_count=2,
+            generated_at=_GENERATED_AT,
+            origin_summaries=summaries,
+        )
+        row = _table_row(_origin_comparison_section(rendered), "AMS")
+        assert "1h 35m" in row
+
+    def test_section_appears_after_other_good_options_before_direct_flight_analysis(self) -> None:
+        summaries = [
+            OriginSummary(
+                origin="AMS",
+                best=_scored_from_origin(
+                    itinerary_id="itin_ams_0001", origin="AMS", price_eur=Decimal("700.00")
+                ),
+            )
+        ]
+        rendered = render_markdown_report(
+            _ranked_pair(),
+            departure_date=_DEPARTURE_DATE,
+            accepted_count=2,
+            generated_at=_GENERATED_AT,
+            origin_summaries=summaries,
+            destination_analyses=_eight_destination_analyses(),
+        )
+        other_options_index = rendered.index("## Other Good Options")
+        origin_comparison_index = rendered.index("## Origin Comparison")
+        direct_analysis_index = rendered.index("## Direct Flight Analysis")
+        assert other_options_index < origin_comparison_index < direct_analysis_index
+
+
+class TestOriginComparisonJson:
+    """Phase 6, T41: the top-level ``origin_comparison`` array."""
+
+    def test_default_origin_comparison_is_present_but_empty(self) -> None:
+        doc = build_results_document(
+            _ranked_pair(),
+            departure_date=_DEPARTURE_DATE,
+            accepted_count=2,
+            top_n=10,
+            generated_at=_GENERATED_AT,
+        )
+        assert doc["origin_comparison"] == []
+
+    def test_present_origin_entry_carries_fare_destination_and_null_reason(self) -> None:
+        summaries = [
+            OriginSummary(
+                origin="AMS",
+                best=_scored_from_origin(
+                    itinerary_id="itin_ams_0001",
+                    origin="AMS",
+                    destination="BOM",
+                    price_eur=Decimal("650.00"),
+                ),
+            )
+        ]
+        doc = build_results_document(
+            _ranked_pair(),
+            departure_date=_DEPARTURE_DATE,
+            accepted_count=2,
+            top_n=10,
+            generated_at=_GENERATED_AT,
+            origin_summaries=summaries,
+        )
+        entry = doc["origin_comparison"][0]
+        assert entry["origin"] == "AMS"
+        assert entry["cheapest_fare_eur"] == "650.00"
+        assert entry["destination"] == "BOM"
+        assert entry["reason"] is None
+
+    def test_absent_origin_entry_has_null_fare_and_a_reason(self) -> None:
+        summaries = [OriginSummary(origin="GRQ")]
+        doc = build_results_document(
+            _ranked_pair(),
+            departure_date=_DEPARTURE_DATE,
+            accepted_count=2,
+            top_n=10,
+            generated_at=_GENERATED_AT,
+            origin_summaries=summaries,
+            task_outcomes=[_provider_error_outcome(task_id="GRQ-DEL-s1")],
+        )
+        entry = doc["origin_comparison"][0]
+        assert entry["cheapest_fare_eur"] is None
+        assert entry["destination"] is None
+        assert entry["reason"] == "search failed for this origin (provider error)"
+
+    def test_document_with_origin_comparison_validates_against_schema(self) -> None:
+        summaries = [
+            OriginSummary(
+                origin="AMS",
+                best=_scored_from_origin(
+                    itinerary_id="itin_ams_0001", origin="AMS", price_eur=Decimal("700.00")
+                ),
+            ),
+            OriginSummary(origin="GRQ"),
+        ]
+        doc = build_results_document(
+            _ranked_pair(),
+            departure_date=_DEPARTURE_DATE,
+            accepted_count=2,
+            top_n=10,
+            generated_at=_GENERATED_AT,
+            origin_summaries=summaries,
+        )
+        schema = json.loads(_SCHEMA_PATH.read_text(encoding="utf-8"))
+        jsonschema.validate(instance=doc, schema=schema)
+
+
+def _self_transfer_appendix_section(rendered: str) -> str:
+    start = rendered.index("## Self-Transfer Itineraries")
+    return rendered[start:]
+
+
+class TestSelfTransferAppendixMarkdown:
+    """D5: "Self-transfer, not protected" appendix (T41) -- separate from
+    the main ranked tables and from "## Failed Searches" (that section is
+    for provider/task-level failures, this one is for an itinerary-level
+    rejection on a specific rule)."""
+
+    def test_no_section_when_nothing_rejected(self) -> None:
+        rendered = render_markdown_report(
+            _ranked_pair(),
+            departure_date=_DEPARTURE_DATE,
+            accepted_count=2,
+            generated_at=_GENERATED_AT,
+        )
+        assert "Self-Transfer" not in rendered
+
+    def test_default_self_transfer_rejections_also_renders_no_section(self) -> None:
+        # No self_transfer_rejections argument at all -- the pre-T41 call shape.
+        rendered = render_markdown_report(
+            _ranked_pair(),
+            departure_date=_DEPARTURE_DATE,
+            accepted_count=2,
+            generated_at=_GENERATED_AT,
+            task_outcomes=[_ok_outcome()],
+            destination_analyses=_eight_destination_analyses(),
+        )
+        assert "Self-Transfer" not in rendered
+
+    def test_rejected_itinerary_renders_with_route_price_and_transfer_point(self) -> None:
+        rejected = _self_transfer_rejection()
+        rendered = render_markdown_report(
+            _ranked_pair(),
+            departure_date=_DEPARTURE_DATE,
+            accepted_count=2,
+            generated_at=_GENERATED_AT,
+            self_transfer_rejections=[rejected],
+        )
+        assert "## Self-Transfer Itineraries" in rendered
+        appendix = _self_transfer_appendix_section(rendered)
+        assert "AMS to AUH to DEL" in appendix
+        assert "€500.00" in appendix
+        assert "AUH" in appendix
+
+    def test_rejected_itinerary_never_appears_in_recommended_flight_or_other_good_options(
+        self,
+    ) -> None:
+        rejected = _self_transfer_rejection()
+        rendered = render_markdown_report(
+            _ranked_pair(),
+            departure_date=_DEPARTURE_DATE,
+            accepted_count=2,
+            generated_at=_GENERATED_AT,
+            self_transfer_rejections=[rejected],
+        )
+        above_appendix = rendered[: rendered.index("## Self-Transfer Itineraries")]
+        # This fixture's own distinctive fare/hub -- neither belongs to any
+        # legitimately-ranked itinerary in _ranked_pair().
+        assert "€500.00" not in above_appendix
+        assert "AUH" not in above_appendix
+
+    def test_section_appears_after_early_stop_analysis_before_summary(self) -> None:
+        rejected = _self_transfer_rejection()
+        rendered = render_markdown_report(
+            _ranked_pair(),
+            departure_date=_DEPARTURE_DATE,
+            accepted_count=2,
+            generated_at=_GENERATED_AT,
+            self_transfer_rejections=[rejected],
+            early_stop_evaluations={},
+            task_outcomes=[_provider_error_outcome()],
+        )
+        failed_index = rendered.index("## Failed Searches")
+        appendix_index = rendered.index("## Self-Transfer Itineraries")
+        summary_index = rendered.index("**Summary:**")
+        assert failed_index < appendix_index < summary_index
+
+
+class TestSelfTransferRejectionsJson:
+    """Phase 6, T41, D5: the top-level ``self_transfer_rejections`` array."""
+
+    def test_default_self_transfer_rejections_is_present_but_empty(self) -> None:
+        doc = build_results_document(
+            _ranked_pair(),
+            departure_date=_DEPARTURE_DATE,
+            accepted_count=2,
+            top_n=10,
+            generated_at=_GENERATED_AT,
+        )
+        assert doc["self_transfer_rejections"] == []
+
+    def test_rejected_itinerary_carries_route_price_transfer_point_and_reason(self) -> None:
+        rejected = _self_transfer_rejection()
+        doc = build_results_document(
+            _ranked_pair(),
+            departure_date=_DEPARTURE_DATE,
+            accepted_count=2,
+            top_n=10,
+            generated_at=_GENERATED_AT,
+            self_transfer_rejections=[rejected],
+        )
+        entries = doc["self_transfer_rejections"]
+        assert len(entries) == 1
+        entry = entries[0]
+        assert entry["route"] == "AMS to AUH to DEL"
+        assert entry["price_eur"] == "500.00"
+        assert entry["self_transfer_airports"] == ["AUH"]
+        assert entry["reason"] == rejected.rejection.message
+
+    def test_rejected_itinerary_never_appears_in_top_itineraries(self) -> None:
+        rejected = _self_transfer_rejection()
+        doc = build_results_document(
+            _ranked_pair(),
+            departure_date=_DEPARTURE_DATE,
+            accepted_count=2,
+            top_n=10,
+            generated_at=_GENERATED_AT,
+            self_transfer_rejections=[rejected],
+        )
+        top_ids = {entry["itinerary_id"] for entry in doc["top_itineraries"]}
+        assert rejected.itinerary.itinerary_id not in top_ids
+
+    def test_document_with_self_transfer_rejections_validates_against_schema(self) -> None:
+        rejected = _self_transfer_rejection()
+        doc = build_results_document(
+            _ranked_pair(),
+            departure_date=_DEPARTURE_DATE,
+            accepted_count=2,
+            top_n=10,
+            generated_at=_GENERATED_AT,
+            self_transfer_rejections=[rejected],
+        )
+        schema = json.loads(_SCHEMA_PATH.read_text(encoding="utf-8"))
+        jsonschema.validate(instance=doc, schema=schema)
+
+
+class TestTopItinerariesByDestinationJson:
+    """Phase 6, T41, D15: "top 3 per destination additionally in the JSON"
+    -- deliberately JSON-only (D15's own wording), never rendered in
+    Markdown (see ``TestTopItinerariesByDestinationNotInMarkdown`` below)."""
+
+    def _multi_destination_scored(self) -> list[ScoredItinerary]:
+        del_items = [
+            _scored(
+                _direct_itinerary(
+                    itinerary_id=f"itin_del_{i}",
+                    price_eur=Decimal(f"{700 + i}.00"),
+                    carrier="KL",
+                    destination="DEL",
+                    destination_tz="Asia/Kolkata",
+                ),
+                rank=1,
+                fare_component=Decimal(f"{700 + i}.00"),
+            )
+            for i in range(4)
+        ]
+        bom_item = _scored(
+            _direct_itinerary(
+                itinerary_id="itin_bom_1",
+                price_eur=Decimal("650.00"),
+                carrier="AI",
+                destination="BOM",
+                destination_tz="Asia/Kolkata",
+            ),
+            rank=1,
+            fare_component=Decimal("650.00"),
+        )
+        return [*del_items, bom_item]
+
+    def test_default_is_present_but_empty(self) -> None:
+        doc = build_results_document(
+            _ranked_pair(),
+            departure_date=_DEPARTURE_DATE,
+            accepted_count=2,
+            top_n=10,
+            generated_at=_GENERATED_AT,
+        )
+        assert doc["top_itineraries_by_destination"] == {}
+
+    def test_keys_are_sorted_destinations_and_groups_capped_at_top_n(self) -> None:
+        grouped_input = top_n_by_destination(self._multi_destination_scored(), top_n=3)
+        doc = build_results_document(
+            _ranked_pair(),
+            departure_date=_DEPARTURE_DATE,
+            accepted_count=2,
+            top_n=10,
+            generated_at=_GENERATED_AT,
+            top_n_by_destination=grouped_input,
+        )
+        grouped = doc["top_itineraries_by_destination"]
+        assert list(grouped.keys()) == ["BOM", "DEL"]  # alphabetical, not insertion order
+        assert len(grouped["DEL"]) == 3  # capped even though 4 DEL itineraries exist
+        assert len(grouped["BOM"]) == 1
+        assert grouped["DEL"][0]["price_eur"] == "700.00"  # cheapest DEL wins the group
+
+    def test_document_with_top_itineraries_by_destination_validates_against_schema(self) -> None:
+        grouped_input = top_n_by_destination(self._multi_destination_scored(), top_n=3)
+        doc = build_results_document(
+            _ranked_pair(),
+            departure_date=_DEPARTURE_DATE,
+            accepted_count=2,
+            top_n=10,
+            generated_at=_GENERATED_AT,
+            top_n_by_destination=grouped_input,
+        )
+        schema = json.loads(_SCHEMA_PATH.read_text(encoding="utf-8"))
+        jsonschema.validate(instance=doc, schema=schema)
+
+
+class TestTopItinerariesByDestinationNotInMarkdown:
+    def test_markdown_never_renders_a_top_n_by_destination_heading(self) -> None:
+        rendered = render_markdown_report(
+            _ranked_pair(),
+            departure_date=_DEPARTURE_DATE,
+            accepted_count=2,
+            generated_at=_GENERATED_AT,
+        )
+        assert "top_itineraries_by_destination" not in rendered
+
+
+class TestGlobalTopTenReflectsMultiOrigin:
+    """Master plan acceptance criterion A2-5(a): "the global ranking is a
+    total order over all valid itineraries from all 10 origins with no
+    origin silently dropped" -- proved at the report layer (T15/T41's own
+    consumer), not just inside ``scoring.ranking`` (covered separately in
+    ``test_ranker.py``): feed both artifacts a ``ranked`` list built by
+    ``rank_itineraries`` from >=3 distinct origins and confirm the cheapest
+    one wins regardless of which origin it departs from, and that no
+    origin's itinerary silently vanishes from the output.
+    """
+
+    def _ranked_from_three_origins(self) -> list[ScoredItinerary]:
+        # MST's fare is cheapest despite being neither the first nor the
+        # last origin considered -- a ranker accidentally scoped to a
+        # single origin (or to arrival/completion order) would get this
+        # wrong in a way a 2-origin fixture could hide.
+        ams_item = _scored_from_origin(
+            itinerary_id="itin_ams_0001", origin="AMS", price_eur=Decimal("900.00")
+        )
+        mst_item = _scored_from_origin(
+            itinerary_id="itin_mst_0001", origin="MST", price_eur=Decimal("650.00")
+        )
+        grq_item = _scored_from_origin(
+            itinerary_id="itin_grq_0001", origin="GRQ", price_eur=Decimal("800.00")
+        )
+        return rank_itineraries([ams_item, mst_item, grq_item], top_n=10)
+
+    def test_recommended_flight_is_the_cheapest_itinerary_from_the_cheapest_origin(self) -> None:
+        ranked = self._ranked_from_three_origins()
+        rendered = render_markdown_report(
+            ranked, departure_date=_DEPARTURE_DATE, accepted_count=3, generated_at=_GENERATED_AT
+        )
+        block = rendered[
+            rendered.index("## Recommended Flight") : rendered.index("## Other Good Options")
+        ]
+        assert "€650.00" in block
+        assert "MST" in block
+
+    def test_json_top_itineraries_ranks_mst_first_and_drops_no_origin(self) -> None:
+        ranked = self._ranked_from_three_origins()
+        doc = build_results_document(
+            ranked,
+            departure_date=_DEPARTURE_DATE,
+            accepted_count=3,
+            top_n=10,
+            generated_at=_GENERATED_AT,
+        )
+        entries = doc["top_itineraries"]
+        assert entries[0]["origin"] == "MST"
+        assert entries[0]["price_eur"] == "650.00"
+
+        origins_present = {entry["origin"] for entry in entries}
+        assert origins_present == {"AMS", "MST", "GRQ"}
 
 
 class TestAtomicWriter:

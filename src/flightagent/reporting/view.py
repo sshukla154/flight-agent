@@ -15,7 +15,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from datetime import timedelta
 
-from flightagent.domain.enums import DirectTier
+from flightagent.domain.enums import DirectTier, RejectionCode
 from flightagent.domain.itinerary import NormalizedItinerary
 from flightagent.domain.money import Money
 from flightagent.domain.run import _ERROR_STATES as _TASK_ERROR_STATES
@@ -129,6 +129,22 @@ def destination_from_task_id(task_id: str) -> str:
     return parts[1]
 
 
+def origin_from_task_id(task_id: str) -> str:
+    """The origin IATA code embedded in a ``task_id`` -- ``destination_from_task_id``'s
+    mirror image, reading the FIRST field of the same ``"{origin}-{destination}-s{max_stops}"``
+    shape instead of the middle one (T41's Origin Comparison table needs to
+    scope a run's ``TaskOutcome``s down to one origin's own tasks; nothing
+    before it needed the inverse this function provides)."""
+    parts = task_id.split("-")
+    if len(parts) != 3:
+        raise ValueError(
+            f"task_id {task_id!r} does not match the "
+            "'{origin}-{destination}-s{max_stops}' shape produced by "
+            "domain.ids.compute_task_id"
+        )
+    return parts[0]
+
+
 def direct_tier_recommendation_label(tier: DirectTier) -> str:
     """Addendum 1's exact Recommendation-column text for one ``DirectTier``
     (D10, T33) -- shared by ``reporting.markdown`` (which additionally
@@ -151,3 +167,54 @@ def failed_task_outcomes(task_outcomes: Sequence[TaskOutcome]) -> list[TaskOutco
     (Phase 4, T26).
     """
     return [outcome for outcome in task_outcomes if outcome.state in _TASK_ERROR_STATES]
+
+
+def self_transfer_airports(itinerary: NormalizedItinerary) -> list[str]:
+    """IATA code(s) of every layover in ``itinerary`` flagged
+    ``Layover.is_self_transfer`` (D5, T18) -- computed directly from the
+    itinerary's own layovers, in leg/segment order, rather than parsed out
+    of a ``Rejection``'s free-form ``message`` string, so the Self-Transfer
+    appendix (T41) never depends on that message's exact wording staying
+    stable. Usually a single entry (one self-transfer connection), but D2's
+    multi-leg ``legs`` shape leaves room for more than one.
+    """
+    return [
+        layover.airport
+        for leg in itinerary.legs
+        for layover in leg.layovers
+        if layover.is_self_transfer
+    ]
+
+
+def origin_absence_reason(origin: str, task_outcomes: Sequence[TaskOutcome]) -> str:
+    """Human-readable reason an ``OriginSummary.best`` is ``None`` for
+    ``origin`` (T41, master plan acceptance criterion A2-5c: "... or an
+    explicit reason for absence") -- scoped to the subset of
+    ``task_outcomes`` whose ``task_id`` names this origin
+    (``origin_from_task_id``), mirroring ``cli._dominant_rejection_code``'s
+    own combine-then-pick-the-max logic but at one origin's scope instead
+    of the whole run's.
+
+    Ordered checks, most specific first: an origin with no task in the
+    ledger at all was never searched this run; an origin with >=1
+    error-state task failed outright, before any rejection reasoning is
+    even meaningful; otherwise the origin's most frequent ``RejectionCode``
+    (combined across every one of its tasks) is named; and an origin with
+    tasks but zero offers and zero rejections simply returned nothing.
+    """
+    origin_outcomes = [
+        outcome for outcome in task_outcomes if origin_from_task_id(outcome.task_id) == origin
+    ]
+    if not origin_outcomes:
+        return "origin not searched in this run"
+    if any(outcome.state in _TASK_ERROR_STATES for outcome in origin_outcomes):
+        return "search failed for this origin (provider error)"
+
+    totals: dict[RejectionCode, int] = {}
+    for outcome in origin_outcomes:
+        for code, count in outcome.rejection_counts.items():
+            totals[code] = totals.get(code, 0) + count
+    if totals:
+        dominant = max(totals.items(), key=lambda item: (item[1], item[0].value))[0]
+        return f"no valid itineraries (dominant rejection: {dominant.value})"
+    return "no offers returned for this origin"
