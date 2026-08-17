@@ -33,6 +33,7 @@ positions. It never mutates its input.
 
 from __future__ import annotations
 
+from collections import defaultdict
 from collections.abc import Sequence
 from decimal import Decimal
 
@@ -121,3 +122,54 @@ def rank_itineraries(
     if top_n <= 0:
         return []
     return ranked[:top_n]
+
+
+def _destination(item: ScoredItinerary) -> str:
+    """The itinerary's arrival airport -- its last leg's last segment's
+    destination. Inlined rather than imported from ``reporting.view``:
+    module boundaries (master plan S3) restrict ``scoring`` to importing
+    ``domain`` + ``config`` only, the identical reasoning
+    ``scoring.origin_summary``'s own ``_origin`` helper already documents.
+    """
+    return item.itinerary.legs[-1].segments[-1].destination
+
+
+def top_n_by_destination(
+    itineraries: Sequence[ScoredItinerary], *, top_n: int = 3
+) -> dict[str, list[ScoredItinerary]]:
+    """Group ``itineraries`` by arrival airport and reduce each group to its
+    own top ``top_n``, ordered by the identical ``tiebreak_key`` the global
+    ranking uses (D16) -- D15's "top 3 per destination additionally in the
+    JSON" requirement (T41), ``settings.output.top_n_per_destination``'s
+    consumer.
+
+    A SEPARATE reduction from ``rank_itineraries``'s global top-N, not a
+    filter over it, a re-ranking of it, or scoped to whatever the global
+    ranking already truncated to -- exactly the relationship
+    ``scoring.origin_summary.summarize_by_origin`` documents for its own
+    per-origin reduction. A caller wanting both the global top-10 and this
+    per-destination view passes the SAME full, untruncated ``itineraries``
+    sequence to both.
+
+    Does not renumber ``rank_by_*`` -- every returned item keeps whatever
+    its caller already computed for it globally (e.g. via a prior
+    ``rank_itineraries`` call over the same full set), matching
+    ``summarize_by_origin``'s identical "does not mutate or re-rank its
+    input" contract.
+
+    A destination with zero itineraries in ``itineraries`` is simply absent
+    from the returned mapping -- there is nothing to rank for it. Unlike
+    ``summarize_by_origin``'s "every origin gets a row even when empty"
+    contract (A2-5c), D15 does not ask for an explicit reason-for-absence
+    entry here; a destination's visibility gap is already covered by the
+    Direct Flight Analysis table (T33, every registry destination
+    unconditionally) and the ``RANK_DESTINATION_DROPPED`` log event.
+    """
+    by_destination: dict[str, list[ScoredItinerary]] = defaultdict(list)
+    for item in itineraries:
+        by_destination[_destination(item)].append(item)
+
+    return {
+        destination: sorted(group, key=lambda item: item.tiebreak_key)[:top_n]
+        for destination, group in by_destination.items()
+    }

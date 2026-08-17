@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://flightagent.invalid/schemas/results.schema.json",
   "title": "flight-agent results artifact (v1)",
-  "description": "Schema for out/flight_results_2027-07-17.json (D15), as produced by flightagent.reporting.json_report.build_results_document. v1 scope plus Phase 4's T26 failed_searches -- grow this schema alongside the writer, never ahead of it. data_source is a structural top-level field per master plan S8.6.",
+  "description": "Schema for out/flight_results_2027-07-17.json (D15), as produced by flightagent.reporting.json_report.build_results_document. v1 scope plus Phase 4's T26 failed_searches, Phase 5's T33 destination_analyses, Phase 6's T39 early_stop_analysis and T41's origin_comparison/self_transfer_rejections/top_itineraries_by_destination -- grow this schema alongside the writer, never ahead of it. data_source is a structural top-level field per master plan S8.6.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -15,7 +15,10 @@
     "top_itineraries",
     "failed_searches",
     "destination_analyses",
-    "early_stop_analysis"
+    "early_stop_analysis",
+    "origin_comparison",
+    "self_transfer_rejections",
+    "top_itineraries_by_destination"
   ],
   "properties": {
     "schema_version": {
@@ -61,6 +64,27 @@
       "description": "Phase 6 (T39), D12: one entry per destination -- the post-hoc, deterministic replay of the EUR-threshold early-stop rule (flightagent.orchestration.waves.replay_early_stop). Purely an annotation; never changes top_itineraries or accepted_count. Always present; empty when not computed (e.g. the single --dest pipeline).",
       "type": "array",
       "items": { "$ref": "#/$defs/earlyStopEvaluation" }
+    },
+    "origin_comparison": {
+      "description": "Phase 6 (T41), master plan acceptance criterion A2-5c: one entry per configured origin (flightagent.scoring.origin_summary.summarize_by_origin). An origin with zero accepted itineraries still gets an entry, with cheapest_fare_eur/destination/itinerary_id null and reason naming why -- never a silently missing entry. Always present; empty for the single --dest/--origin pipeline, which never computes it.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/originComparisonEntry" }
+    },
+    "self_transfer_rejections": {
+      "description": "Phase 6 (T41), D5: one entry per itinerary excluded specifically for a RejectionCode.SELF_TRANSFER rejection -- never present in top_itineraries (D5 excludes these from the valid ranked set entirely). Always present, empty when none occurred.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/selfTransferRejection" }
+    },
+    "top_itineraries_by_destination": {
+      "description": "Phase 6 (T41), D15: 'top 3 per destination additionally in the JSON' (top_n from settings.output.top_n_per_destination). Keyed by destination IATA code, sorted alphabetically for determinism (finding 0.3); each value is a list of the same per-itinerary shape top_itineraries uses. Always present; an empty object when none were computed.",
+      "type": "object",
+      "patternProperties": {
+        "^[A-Z]{3}$": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/rankedItinerary" }
+        }
+      },
+      "additionalProperties": false
     }
   },
   "$defs": {
@@ -261,6 +285,74 @@
         },
         "mode": {
           "enum": ["enforced", "advisory"]
+        }
+      }
+    },
+    "originComparisonEntry": {
+      "description": "domain.scoring.OriginSummary, shaped for JSON (Phase 6, T41, master plan A2-5c). cheapest_fare_eur/destination/itinerary_id are null exactly when this origin produced zero accepted itineraries, in which case reason names why (flightagent.reporting.view.origin_absence_reason); reason is null whenever a real fare is present.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "origin",
+        "ground_minutes",
+        "cheapest_fare_eur",
+        "destination",
+        "itinerary_id",
+        "reason"
+      ],
+      "properties": {
+        "origin": { "type": "string", "pattern": "^[A-Z]{3}$" },
+        "ground_minutes": {
+          "description": "Whole minutes from OriginSummary.ground_minutes -- null when this origin has no accepted itinerary carrying a GroundLeg to read a duration off of.",
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "cheapest_fare_eur": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9]+\\.[0-9]{2}$"
+        },
+        "destination": {
+          "description": "The destination this origin's cheapest itinerary flies to -- not a fixed target, since OriginSummary picks the single overall cheapest itinerary across every destination.",
+          "type": ["string", "null"],
+          "pattern": "^[A-Z]{3}$"
+        },
+        "itinerary_id": { "type": ["string", "null"], "minLength": 1 },
+        "reason": { "type": ["string", "null"], "minLength": 1 }
+      }
+    },
+    "selfTransferRejection": {
+      "description": "One D5 self-transfer / separate-ticket itinerary excluded from the valid ranked set (Phase 6, T41) -- domain.validation.RejectedItinerary, shaped for JSON.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "itinerary_id",
+        "origin",
+        "destination",
+        "airline",
+        "route",
+        "price_eur",
+        "self_transfer_airports",
+        "reason"
+      ],
+      "properties": {
+        "itinerary_id": { "type": "string", "minLength": 1 },
+        "origin": { "type": "string", "pattern": "^[A-Z]{3}$" },
+        "destination": { "type": "string", "pattern": "^[A-Z]{3}$" },
+        "airline": { "type": "string" },
+        "route": { "type": "string" },
+        "price_eur": {
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]{2}$"
+        },
+        "self_transfer_airports": {
+          "description": "IATA code(s) of every layover in this itinerary flagged Layover.is_self_transfer -- usually one entry, but D2's multi-leg shape leaves room for more.",
+          "type": "array",
+          "items": { "type": "string", "pattern": "^[A-Z]{3}$" }
+        },
+        "reason": {
+          "description": "The Rejection.message that excluded this itinerary (rule_id='self_transfer').",
+          "type": "string",
+          "minLength": 1
         }
       }
     }

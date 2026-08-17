@@ -77,17 +77,19 @@ from typing import Annotated, NamedTuple
 import typer
 
 from flightagent.airports.registry import destinations as registry_destinations
+from flightagent.airports.registry import get as get_airport
 from flightagent.airports.registry import origins as registry_origins
 from flightagent.config.loader import compute_config_digest, load_config
 from flightagent.config.models import FlightAgentSettings
 from flightagent.domain.enums import CabinClass, RejectionCode, RunStatus, StopMode, TaskState
+from flightagent.domain.ground import GroundLeg
 from flightagent.domain.ids import generate_run_id
 from flightagent.domain.itinerary import NormalizedItinerary, RawOffer
 from flightagent.domain.policy import DestinationAnalysis
 from flightagent.domain.run import _ERROR_STATES as _TASK_ERROR_STATES
 from flightagent.domain.run import RunEnvelope, RunMeta, SearchRequest, SearchTask, TaskOutcome
 from flightagent.domain.scoring import ScoredItinerary
-from flightagent.domain.validation import ValidationResult
+from flightagent.domain.validation import RejectedItinerary, ValidationResult
 from flightagent.normalize.builder import build_normalized_itinerary
 from flightagent.normalize.dedup import deduplicate
 from flightagent.observability.events import EventName
@@ -102,9 +104,11 @@ from flightagent.providers.mock.generator import compute_seed
 from flightagent.providers.mock.provider import MockProvider
 from flightagent.reporting.json_report import build_results_document
 from flightagent.reporting.markdown import render_markdown_report
-from flightagent.reporting.view import last_segment
+from flightagent.reporting.view import first_segment, last_segment
 from flightagent.reporting.writer import write_report_artifacts
-from flightagent.scoring.ranking import rank_itineraries
+from flightagent.scoring.ground import apply_ground_overlay
+from flightagent.scoring.origin_summary import summarize_by_origin
+from flightagent.scoring.ranking import rank_itineraries, top_n_by_destination
 from flightagent.scoring.score import score_itinerary
 from flightagent.validation.engine import summarize_validation_results, validate
 
@@ -285,18 +289,30 @@ def _normalize_and_validate(
     raw_offers: tuple[RawOffer, ...],
     *,
     as_of: datetime,
-) -> tuple[list[NormalizedItinerary], list[ValidationResult]]:
+) -> tuple[list[NormalizedItinerary], list[ValidationResult], list[RejectedItinerary]]:
     """Run every ``RawOffer`` through T11 (normalize) then T12 (validate).
 
-    Returns ``(valid_itineraries, validation_results)`` -- every
-    ``ValidationResult`` produced is kept, valid AND invalid alike, so the
-    caller can derive both the zero-valid error breakdown and the
+    Returns ``(valid_itineraries, validation_results, self_transfer_rejections)``
+    -- every ``ValidationResult`` produced is kept, valid AND invalid alike,
+    so the caller can derive both the zero-valid error breakdown and the
     ``EventName.VALIDATE_COMPLETED`` accepted_count/rejection_counts pair
     (T19, ``validation.engine.summarize_validation_results``) from one
     shared pass instead of validating the batch twice.
+
+    ``self_transfer_rejections`` (T41) is the itinerary-level counterpart:
+    ``ValidationResult`` alone never carries the ``NormalizedItinerary``
+    object (only its ``itinerary_id``), so anything that wants to render
+    D5's "Self-transfer, not protected" appendix has to capture the pairing
+    right here, in the one place this function still holds both the
+    itinerary and its rejections in scope -- outside this loop, an invalid
+    itinerary's own data is gone for good. Populated only for itineraries
+    carrying a ``RejectionCode.SELF_TRANSFER`` rejection; an itinerary
+    rejected for any other reason (or several other reasons at once, minus
+    self-transfer) contributes nothing here.
     """
     valid_itineraries: list[NormalizedItinerary] = []
     validation_results: list[ValidationResult] = []
+    self_transfer_rejections: list[RejectedItinerary] = []
     for raw_offer in raw_offers:
         itinerary = build_normalized_itinerary(
             raw_offer,
@@ -308,7 +324,13 @@ def _normalize_and_validate(
         validation_results.append(validation_result)
         if validation_result.is_valid:
             valid_itineraries.append(itinerary)
-    return valid_itineraries, validation_results
+        else:
+            for rejection in validation_result.rejections:
+                if rejection.code == RejectionCode.SELF_TRANSFER:
+                    self_transfer_rejections.append(
+                        RejectedItinerary(itinerary=itinerary, rejection=rejection)
+                    )
+    return valid_itineraries, validation_results, self_transfer_rejections
 
 
 def _to_rejection_code_counts(raw: dict[str, int]) -> dict[RejectionCode, int]:
@@ -652,6 +674,7 @@ def _run_all_destinations(
     finalized_outcomes: list[TaskOutcome] = []
     combined_valid_itineraries: list[NormalizedItinerary] = []
     valid_by_task_id: dict[str, tuple[NormalizedItinerary, ...]] = {}
+    self_transfer_rejections: list[RejectedItinerary] = []
 
     for task, execution_result in zip(tasks, execution_results, strict=True):
         outcome = execution_result.outcome
@@ -663,8 +686,8 @@ def _run_all_destinations(
             continue
 
         as_of = _deterministic_as_of(task.request)
-        valid_itineraries, validation_results = _normalize_and_validate(
-            task.request, execution_result.offers, as_of=as_of
+        valid_itineraries, validation_results, task_self_transfer_rejections = (
+            _normalize_and_validate(task.request, execution_result.offers, as_of=as_of)
         )
         raw_accepted_count, raw_rejection_counts = summarize_validation_results(validation_results)
         log_event(
@@ -681,6 +704,7 @@ def _run_all_destinations(
         )
         combined_valid_itineraries.extend(valid_itineraries)
         valid_by_task_id[task.task_id] = tuple(valid_itineraries)
+        self_transfer_rejections.extend(task_self_transfer_rejections)
 
     final_task_outcomes = tuple(finalized_outcomes)
 
@@ -706,9 +730,23 @@ def _run_all_destinations(
         threshold_eur=settings.early_stop.threshold_eur,
     )
 
+    # T38/T41: each origin's GroundLeg, looked up once per origin actually
+    # searched this run (never all 10 registry origins unconditionally --
+    # a single-origin --all-destinations run must not silently apply an
+    # unrelated origin's ground data). `Airport.ground` is always present
+    # here in practice (`origin_codes` only ever names real registry
+    # origins, and `Airport.is_origin` IS "ground is not None"), but the
+    # lookup stays defensive rather than asserting, so a malformed registry
+    # entry degrades to "no ground overlay for this origin" instead of a
+    # crash mid-run.
+    ground_by_origin: dict[str, GroundLeg] = {
+        code: ground for code in origin_codes if (ground := get_airport(code).ground) is not None
+    }
+
     deduplicated_itineraries = deduplicate(combined_valid_itineraries)
-    scored_itineraries = [
-        ScoredItinerary(
+    scored_itineraries: list[ScoredItinerary] = []
+    for itinerary in deduplicated_itineraries:
+        scored = ScoredItinerary(
             itinerary=itinerary,
             components=score_itinerary(
                 itinerary, scoring_settings=settings.scoring, layover_settings=settings.layover
@@ -717,11 +755,29 @@ def _run_all_destinations(
             rank_by_total_journey_score=1,
             rank_by_price=1,
         )
-        for itinerary in deduplicated_itineraries
-    ]
+        ground_leg = ground_by_origin.get(first_segment(itinerary).origin)
+        if ground_leg is not None:
+            scored = apply_ground_overlay(
+                scored, ground_leg=ground_leg, settings=settings.ground_travel
+            )
+        scored_itineraries.append(scored)
+
     ranked = rank_itineraries(scored_itineraries, top_n=settings.output.top_n_global)
     _warn_on_truncated_destinations(scored_itineraries, ranked)
     accepted_count = len(scored_itineraries)
+
+    # T40/T41: the per-origin Origin Comparison view (master plan A2-5c),
+    # computed over the SAME full, untruncated `scored_itineraries` the
+    # global ranking above also reads -- never the already-truncated
+    # `ranked`, which would silently show `best=None` for an origin whose
+    # itineraries simply didn't make the global top-10 cut (see
+    # `summarize_by_origin`'s own docstring). D15's "top 3 per destination"
+    # JSON-only view is the identical pattern, grouped by destination
+    # instead of origin.
+    origin_summaries = summarize_by_origin(scored_itineraries, origins=list(origin_codes))
+    per_destination_top_n = top_n_by_destination(
+        scored_itineraries, top_n=settings.output.top_n_per_destination
+    )
 
     dominant_code = _dominant_rejection_code(final_task_outcomes)
     status = _compute_run_status(final_task_outcomes)
@@ -765,6 +821,8 @@ def _run_all_destinations(
             task_outcomes=final_task_outcomes,
             destination_analyses=destination_analyses,
             early_stop_evaluations=early_stop_evaluations,
+            origin_summaries=origin_summaries,
+            self_transfer_rejections=self_transfer_rejections,
         )
         json_document = build_results_document(
             ranked,
@@ -776,6 +834,9 @@ def _run_all_destinations(
             task_outcomes=final_task_outcomes,
             destination_analyses=destination_analyses,
             early_stop_evaluations=early_stop_evaluations,
+            origin_summaries=origin_summaries,
+            self_transfer_rejections=self_transfer_rejections,
+            top_n_by_destination=per_destination_top_n,
         )
         report_path, results_path = write_report_artifacts(
             markdown=markdown,
@@ -965,7 +1026,7 @@ def run(
     search_result = asyncio.run(provider_instance.search(request, CallBudget()))
     total_offers = len(search_result.offers)
 
-    valid_itineraries, validation_results = _normalize_and_validate(
+    valid_itineraries, validation_results, self_transfer_rejections = _normalize_and_validate(
         request, search_result.offers, as_of=as_of
     )
 
@@ -1008,6 +1069,9 @@ def run(
 
     ranked = rank_itineraries(scored_itineraries, top_n=settings.output.top_n_global)
     accepted_count = len(scored_itineraries)
+    per_destination_top_n = top_n_by_destination(
+        scored_itineraries, top_n=settings.output.top_n_per_destination
+    )
 
     markdown = render_markdown_report(
         ranked,
@@ -1015,6 +1079,7 @@ def run(
         accepted_count=accepted_count,
         generated_at=as_of,
         data_source="mock",
+        self_transfer_rejections=self_transfer_rejections,
     )
     json_document = build_results_document(
         ranked,
@@ -1023,6 +1088,8 @@ def run(
         top_n=settings.output.top_n_global,
         generated_at=as_of,
         data_source="mock",
+        self_transfer_rejections=self_transfer_rejections,
+        top_n_by_destination=per_destination_top_n,
     )
 
     report_path, results_path = write_report_artifacts(

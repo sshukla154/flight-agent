@@ -17,12 +17,28 @@ top-N ranking has truncated the main list. Rendered whenever the caller
 supplies at least one ``DestinationAnalysis``; empty (the pre-Phase-5
 default) renders no such section, matching every pre-Phase-5 call site.
 
-Scope note (v1, per this task's brief): the "Origin Comparison" table
-(Phase 6, T41) is deliberately NOT built here -- its underlying data (the
-multi-origin fan-out) doesn't exist until that phase. ``render_markdown_report``
-therefore still requires at least one ranked itinerary; the empty/no-results
-report path (finding 0.5's NO_RESULTS/FAILED ``RunStatus`` values) remains
-out of this function's scope.
+``render_markdown_report`` still requires at least one ranked itinerary;
+the empty/no-results report path (finding 0.5's NO_RESULTS/FAILED
+``RunStatus`` values) remains out of this function's scope.
+
+Phase 6 (T41) adds three more sections, all optional and additive like
+every other post-v1 section documented above:
+
+- "Origin Comparison" (master plan acceptance criterion A2-5c): one row
+  per ``OriginSummary`` (T40, ``scoring.origin_summary.summarize_by_origin``),
+  rendered whenever the caller supplies a non-empty ``origin_summaries``.
+  An origin with no accepted itinerary still gets a row -- a dash plus an
+  explicit reason (``reporting.view.origin_absence_reason``, read off
+  ``task_outcomes``), never a silently missing row.
+- "Self-Transfer Itineraries" (D5): one row per ``RejectedItinerary``
+  carrying a ``RejectionCode.SELF_TRANSFER`` rejection, rendered whenever
+  the caller supplies a non-empty ``self_transfer_rejections`` -- these
+  never appear in "Recommended Flight"/"Other Good Options" (D5 excludes
+  them from the valid ranked set entirely), visible here for audit only.
+- D15's "top 3 per destination" is deliberately NOT rendered here -- D15's
+  own wording scopes it to "additionally in the JSON"
+  (``reporting.json_report``'s ``top_itineraries_by_destination``), not the
+  Markdown report.
 
 Phase 4 (T26) adds the "Failed Searches" section: rendered only when at
 least one ``TaskOutcome`` in the run's ledger is in an error state
@@ -73,7 +89,8 @@ from flightagent.domain.itinerary import NormalizedItinerary
 from flightagent.domain.money import Money
 from flightagent.domain.policy import DestinationAnalysis, EarlyStopEvaluation
 from flightagent.domain.run import TaskOutcome
-from flightagent.domain.scoring import ScoredItinerary
+from flightagent.domain.scoring import OriginSummary, ScoredItinerary
+from flightagent.domain.validation import RejectedItinerary
 from flightagent.reporting.booking_link import (
     BookingUrlRejected,
     DataSource,
@@ -89,7 +106,9 @@ from flightagent.reporting.view import (
     format_layover,
     format_price_eur,
     last_segment,
+    origin_absence_reason,
     route_string,
+    self_transfer_airports,
     total_layover_minutes,
 )
 
@@ -284,6 +303,84 @@ def _failed_searches_table(failed: Sequence[TaskOutcome]) -> str:
     return "\n".join(lines)
 
 
+def _format_ground_minutes(minutes: int | None) -> str:
+    """``"45m"``/``"2h 5m"`` for a known ground-access duration, or the
+    shared "no value" dash when ``minutes`` is ``None`` (``OriginSummary.ground_minutes``
+    is ``None`` whenever that origin has no accepted itinerary to read a
+    ``GroundLeg`` off of -- see that computed field's own docstring).
+    Deliberately NOT ``reporting.view.format_layover``: that function's
+    ``0 -> "Direct (no layover)"`` special case is about a FLIGHT layover,
+    not ground-access time, and would misrepresent a (hypothetical)
+    zero-minute ground leg as if it meant "no ground leg at all".
+    """
+    if minutes is None:
+        return _NO_DIRECT_ITINERARY_TEXT
+    hours, mins = divmod(minutes, 60)
+    return f"{hours}h {mins}m" if hours else f"{mins}m"
+
+
+def _origin_comparison_table(
+    summaries: Sequence[OriginSummary], *, task_outcomes: Sequence[TaskOutcome]
+) -> str:
+    """Master plan acceptance criterion A2-5c: one row per ``OriginSummary``
+    (T40), in the order given -- ALL of them, matching
+    ``scoring.origin_summary.summarize_by_origin``'s own "every origin gets
+    a row, even an empty one" contract. An origin with no accepted
+    itinerary (``summary.best is None``) still gets a row: the "Cheapest
+    Fare" cell carries the shared dash placeholder plus an explicit,
+    human-readable reason (``reporting.view.origin_absence_reason``, read
+    off ``task_outcomes``) inline in that same cell -- never a silently
+    missing row, and never a bare dash with no reason attached.
+    """
+    lines = [
+        "## Origin Comparison",
+        "",
+        "| Origin | Ground Access | Cheapest Fare | Destination |",
+        "|---|---|---|---|",
+    ]
+    for summary in summaries:
+        ground = _format_ground_minutes(summary.ground_minutes)
+        if summary.best is not None:
+            fare = format_price_eur(summary.best.itinerary.price_eur)
+            destination = last_segment(summary.best.itinerary).destination
+        else:
+            reason = origin_absence_reason(summary.origin, task_outcomes)
+            fare = f"{_NO_DIRECT_ITINERARY_TEXT} ({reason})"
+            destination = _NO_DIRECT_ITINERARY_TEXT
+        lines.append(f"| {summary.origin} | {ground} | {fare} | {destination} |")
+    return "\n".join(lines)
+
+
+def _self_transfer_appendix_table(rejected: Sequence[RejectedItinerary]) -> str:
+    """D5's "Self-transfer, not protected" appendix (T41): one row per
+    ``RejectedItinerary`` carrying a ``RejectionCode.SELF_TRANSFER``
+    rejection, in the order given. These itineraries are excluded from the
+    valid ranked set entirely (D5) -- this table is the ONLY place one of
+    them appears anywhere in the report, never the "Recommended
+    Flight"/"Other Good Options" sections above.
+    """
+    lines = [
+        "## Self-Transfer Itineraries (Excluded, Not Ranked)",
+        "",
+        "*Excluded from the valid ranked set (D5): a self-transfer / separate-ticket "
+        "connection is not a protected itinerary, regardless of how generous its layover "
+        "looks -- nothing protects the traveller if the first ticket runs late. Listed here "
+        "for visibility only.*",
+        "",
+        "| Airline | Route | Price | Self-Transfer At | Reason |",
+        "|---|---|---|---|---|",
+    ]
+    for entry in rejected:
+        itinerary = entry.itinerary
+        transfer_points = ", ".join(self_transfer_airports(itinerary))
+        lines.append(
+            f"| {airline_string(itinerary)} | {route_string(itinerary)} | "
+            f"{format_price_eur(itinerary.price_eur)} | {transfer_points} | "
+            f"{_escape_table_cell(entry.rejection.message)} |"
+        )
+    return "\n".join(lines)
+
+
 _NOT_EVALUABLE_TEXT = "not yet evaluable (fewer than 2 prior origins)"
 """D12 rule 1 / finding 0.7: the rule needs >=2 prior origins with a valid
 fare before it can compare anything at all. Rendered instead of a fake
@@ -464,6 +561,8 @@ def render_markdown_report(
     task_outcomes: Sequence[TaskOutcome] = (),
     destination_analyses: Sequence[DestinationAnalysis] = (),
     early_stop_evaluations: Mapping[str, EarlyStopEvaluation] = MappingProxyType({}),
+    origin_summaries: Sequence[OriginSummary] = (),
+    self_transfer_rejections: Sequence[RejectedItinerary] = (),
 ) -> str:
     """Render the full v1 Markdown report.
 
@@ -508,6 +607,24 @@ def render_markdown_report(
     never changes ``ranked``/``accepted_count`` or anything else in this
     report.
 
+    ``origin_summaries`` is T40's per-origin reduction
+    (``scoring.origin_summary.summarize_by_origin``), one entry per
+    configured origin -- rendered as the "## Origin Comparison" section
+    (T41, master plan A2-5c) whenever this sequence is non-empty. Passing
+    nothing (the default) renders no such section, matching every
+    pre-Phase-6 call site.
+
+    ``self_transfer_rejections`` is D5's excluded-itinerary set (T41): every
+    itinerary rejected specifically for ``RejectionCode.SELF_TRANSFER``,
+    paired with the ``Rejection`` that excluded it. Rendered as the
+    "## Self-Transfer Itineraries" appendix whenever this sequence is
+    non-empty -- separate from "## Failed Searches" (that section is for
+    provider/task-level failures; this one is for an itinerary-level
+    rejection on a specific rule). These itineraries never appear in
+    "Recommended Flight"/"Other Good Options" regardless of this
+    parameter -- D5 excludes them from ``ranked`` upstream, long before
+    this function ever sees them.
+
     Raises ``ValueError`` if ``ranked`` is empty: the empty/no-results
     report path is Phase 4 scope, not this task's (see module docstring).
     """
@@ -536,6 +653,10 @@ def render_markdown_report(
         sections.append(_other_good_options_table(others))
         sections.append("")
 
+    if origin_summaries:
+        sections.append(_origin_comparison_table(origin_summaries, task_outcomes=task_outcomes))
+        sections.append("")
+
     if destination_analyses:
         sections.append(_direct_flight_analysis_table(destination_analyses))
         sections.append("")
@@ -546,6 +667,10 @@ def render_markdown_report(
 
     if early_stop_evaluations:
         sections.append(_early_stop_table(early_stop_evaluations))
+        sections.append("")
+
+    if self_transfer_rejections:
+        sections.append(_self_transfer_appendix_table(self_transfer_rejections))
         sections.append("")
 
     sections.append(

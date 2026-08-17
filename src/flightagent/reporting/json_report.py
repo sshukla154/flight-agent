@@ -34,6 +34,24 @@ top-level ``early_stop_analysis`` array -- empty, never omitted, when none
 were computed. Purely additive/informational: computing it never changes
 ``top_itineraries`` or ``accepted_count``.
 
+Phase 6 (T41) adds three more top-level arrays/objects, each following the
+identical "always present, empty when nothing was computed" convention
+every field above already sets:
+
+- ``origin_comparison``: one entry per ``OriginSummary`` (T40, master plan
+  A2-5c) -- an origin with no accepted itinerary still gets an entry, with
+  ``cheapest_fare_eur``/``destination`` null and ``reason`` naming why.
+- ``self_transfer_rejections``: one entry per ``RejectedItinerary`` (D5) --
+  every itinerary excluded specifically for a ``RejectionCode.SELF_TRANSFER``
+  rejection, never present in ``top_itineraries``.
+- ``top_itineraries_by_destination``: D15's "top 3 per destination
+  additionally in the JSON" (D15's own wording scopes this to the JSON
+  artifact only -- ``reporting.markdown`` does not render it). Keyed by
+  destination IATA code, sorted alphabetically for determinism (finding
+  0.3) rather than left in whatever order the input/grouping happened to
+  produce; each value is a list of the SAME per-itinerary shape
+  ``top_itineraries`` entries use.
+
 All money and score values are emitted as **decimal-shaped strings**, never
 JSON numbers -- JSON has no decimal type, and round-tripping a ``Decimal``
 through a JSON float would reintroduce exactly the float-nondeterminism
@@ -56,7 +74,8 @@ from typing import Any
 from flightagent.domain.itinerary import NormalizedItinerary
 from flightagent.domain.policy import DestinationAnalysis, EarlyStopEvaluation
 from flightagent.domain.run import TaskOutcome
-from flightagent.domain.scoring import ScoreComponents, ScoredItinerary
+from flightagent.domain.scoring import OriginSummary, ScoreComponents, ScoredItinerary
+from flightagent.domain.validation import RejectedItinerary
 from flightagent.reporting.booking_link import BookingUrlRejected, DataSource, validate_booking_url
 from flightagent.reporting.view import (
     airline_string,
@@ -65,7 +84,9 @@ from flightagent.reporting.view import (
     failed_task_outcomes,
     first_segment,
     last_segment,
+    origin_absence_reason,
     route_string,
+    self_transfer_airports,
     total_duration_minutes,
     total_layover_minutes,
 )
@@ -198,6 +219,57 @@ def _early_stop_evaluation_to_json(
     }
 
 
+def _origin_summary_to_json(
+    summary: OriginSummary, *, task_outcomes: Sequence[TaskOutcome]
+) -> dict[str, Any]:
+    """One "Origin Comparison" entry (Phase 6, T41, master plan A2-5c).
+
+    ``cheapest_fare_eur``/``destination``/``itinerary_id`` are ``None``
+    exactly when ``summary.best`` is ``None`` (this origin produced zero
+    accepted itineraries) -- ``reason`` is populated in that same case,
+    read off ``task_outcomes`` (``reporting.view.origin_absence_reason``),
+    and ``None`` otherwise (a real fare needs no absence explanation).
+    """
+    if summary.best is not None:
+        itinerary = summary.best.itinerary
+        return {
+            "origin": str(summary.origin),
+            "ground_minutes": summary.ground_minutes,
+            "cheapest_fare_eur": f"{itinerary.price_eur.amount:.2f}",
+            "destination": last_segment(itinerary).destination,
+            "itinerary_id": itinerary.itinerary_id,
+            "reason": None,
+        }
+    return {
+        "origin": str(summary.origin),
+        "ground_minutes": summary.ground_minutes,
+        "cheapest_fare_eur": None,
+        "destination": None,
+        "itinerary_id": None,
+        "reason": origin_absence_reason(summary.origin, task_outcomes),
+    }
+
+
+def _rejected_self_transfer_to_json(rejected: RejectedItinerary) -> dict[str, Any]:
+    """One "Self-Transfer Itineraries" appendix entry (D5, T41) -- enough to
+    audit the exclusion without re-running validation: which itinerary,
+    which airport(s) triggered it, and the exact ``Rejection.message``.
+    """
+    itinerary = rejected.itinerary
+    departure_segment = first_segment(itinerary)
+    arrival_segment = last_segment(itinerary)
+    return {
+        "itinerary_id": itinerary.itinerary_id,
+        "origin": departure_segment.origin,
+        "destination": arrival_segment.destination,
+        "airline": airline_string(itinerary),
+        "route": route_string(itinerary),
+        "price_eur": f"{itinerary.price_eur.amount:.2f}",
+        "self_transfer_airports": self_transfer_airports(itinerary),
+        "reason": rejected.rejection.message,
+    }
+
+
 def _itinerary_to_json(item: ScoredItinerary, *, data_source: DataSource) -> dict[str, Any]:
     itinerary = item.itinerary
     departure_segment = first_segment(itinerary)
@@ -243,6 +315,9 @@ def build_results_document(
     task_outcomes: Sequence[TaskOutcome] = (),
     destination_analyses: Sequence[DestinationAnalysis] = (),
     early_stop_evaluations: Mapping[str, EarlyStopEvaluation] = MappingProxyType({}),
+    origin_summaries: Sequence[OriginSummary] = (),
+    self_transfer_rejections: Sequence[RejectedItinerary] = (),
+    top_n_by_destination: Mapping[str, Sequence[ScoredItinerary]] = MappingProxyType({}),
 ) -> dict[str, Any]:
     """Build the v1 JSON results document (not yet written to disk -- see
     ``reporting.writer``).
@@ -279,6 +354,27 @@ def build_results_document(
     is. Purely an annotation: it never removes or reorders anything in
     ``top_itineraries`` -- see ``orchestration.waves``' own docstring.
 
+    ``origin_summaries`` is T40's per-origin reduction
+    (``scoring.origin_summary.summarize_by_origin``) and becomes the
+    top-level ``origin_comparison`` array verbatim, in the order given --
+    always present, empty when none were supplied (including the default),
+    never omitted, for the same reason ``failed_searches`` never is.
+
+    ``self_transfer_rejections`` is D5's excluded-itinerary set (T41) and
+    becomes the top-level ``self_transfer_rejections`` array verbatim, in
+    the order given -- always present, empty when none were supplied
+    (including the default), for the same reason as every array above.
+    None of these itineraries appear in ``top_itineraries`` -- D5 excludes
+    them from the valid ranked set entirely, upstream of this function.
+
+    ``top_n_by_destination`` is D15's "top 3 per destination" reduction
+    (``scoring.ranking.top_n_by_destination``), keyed by destination --
+    becomes the top-level ``top_itineraries_by_destination`` OBJECT (not an
+    array, since it is keyed), sorted by destination for determinism
+    (finding 0.3) rather than left in the mapping's own iteration order.
+    Always present, an empty object when none were supplied (including the
+    default).
+
     Raises ``ValueError`` if ``accepted_count`` is smaller than
     ``len(ranked)`` -- truncation can only ever shrink what is *shown*,
     never invent itineraries that were not actually accepted.
@@ -308,4 +404,18 @@ def build_results_document(
             _early_stop_evaluation_to_json(destination, evaluation)
             for destination, evaluation in early_stop_evaluations.items()
         ],
+        "origin_comparison": [
+            _origin_summary_to_json(summary, task_outcomes=task_outcomes)
+            for summary in origin_summaries
+        ],
+        "self_transfer_rejections": [
+            _rejected_self_transfer_to_json(rejected) for rejected in self_transfer_rejections
+        ],
+        "top_itineraries_by_destination": {
+            destination: [
+                _itinerary_to_json(item, data_source=data_source)
+                for item in top_n_by_destination[destination]
+            ]
+            for destination in sorted(top_n_by_destination)
+        },
     }
