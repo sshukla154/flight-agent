@@ -26,7 +26,6 @@ from datetime import date, timedelta
 from flightagent.airports.registry import UnknownAirportError
 from flightagent.airports.registry import destinations as registry_destinations
 from flightagent.airports.registry import get as get_airport
-from flightagent.airports.registry import origins as registry_origins
 from flightagent.config.loader import load_config
 from flightagent.config.models import FlightAgentSettings
 from flightagent.domain.enums import CabinClass, StopMode
@@ -34,6 +33,7 @@ from flightagent.domain.ids import compute_task_id
 from flightagent.domain.run import SearchRequest, SearchTask
 from flightagent.observability.events import EventName
 from flightagent.observability.logging import log_event
+from flightagent.orchestration.ground_filter import plannable_origins
 
 _DEFAULT_ADULTS = 1
 """D3: 1 adult, 0 children, 0 infants — matches ``cli.py``'s own constant."""
@@ -271,11 +271,26 @@ def build_multi_origin_plan(
     tasks each, via the reused per-origin builder) rather than one combined
     160-task event — a direct consequence of reusing that builder unchanged
     per origin instead of duplicating its event-emission logic here.
+
+    D7's ground-travel filter (``orchestration.ground_filter.plannable_origins``,
+    T38) is applied HERE, before any origin's tasks are built — master plan
+    S6, verbatim: "evaluated per origin before any task for that origin is
+    planned." All 10 of today's configured origins are within the default
+    150-minute limit, so this is a no-op against the current roster (as
+    ``ground_filter``'s own module docstring says it should be) — but a
+    future 11th origin, or a stricter config value, is now genuinely
+    excluded from planning rather than silently still searched. Excluded
+    origins' ``Rejection`` records are discarded at this call site rather
+    than threaded through this function's return type — a caller that
+    needs them can call ``plannable_origins()`` directly, which already
+    returns them; this function's contract (a flat ``SearchTask`` tuple)
+    is unchanged so no existing caller breaks.
     """
     resolved_settings = settings if settings is not None else load_config()
+    plannable, _excluded = plannable_origins(settings=resolved_settings)
 
     tasks: list[SearchTask] = []
-    for origin_airport in registry_origins():
+    for origin_airport in plannable:
         # origins() only ever returns airports carrying ground/priority
         # data (see Airport.is_origin) — this assert documents that
         # invariant for mypy rather than re-deriving it via

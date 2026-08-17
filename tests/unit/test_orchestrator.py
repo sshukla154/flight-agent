@@ -219,6 +219,40 @@ class TestBuildMultiOriginPlan:
             origin_tasks = [task for task in tasks if task.request.origin == origin]
             assert len(origin_tasks) == 16
 
+    def test_ground_travel_filter_is_genuinely_wired_into_the_real_planning_path(self) -> None:
+        """Phase 6's own dual verify pass caught this as a real gap:
+        ``ground_filter.plannable_origins`` was correctly built and unit
+        tested in isolation, but ``build_multi_origin_plan`` called
+        ``registry.origins()`` directly, unfiltered -- so a real
+        ``flightagent run --all-origins`` invocation would still search an
+        over-threshold origin even with a stricter ``max_ground_travel_minutes``.
+        This test proves the fix at the ACTUAL PRODUCTION ENTRY POINT this
+        gap was found in, not just at ``ground_filter``'s own unit level
+        (that coverage already existed and already passed -- it never
+        caught this, because the bug was in a caller, not in this module).
+        """
+        settings = load_config()
+        # BRU/CGN/MST are 120 min, CRL is 140, GRQ is 130 -- all real,
+        # configured origins that exceed a 100-minute limit. Lowering the
+        # threshold below AMS/EIN/RTM/DUS/NRN's real ground times (45-90
+        # min) while still passing them is what proves this is a genuine
+        # filter, not an accidental full exclusion or full pass-through.
+        overridden_settings = settings.model_copy(
+            update={
+                "ground_travel": settings.ground_travel.model_copy(
+                    update={"max_ground_travel_minutes": 100}
+                )
+            }
+        )
+
+        tasks = build_multi_origin_plan(
+            departure_date=_departure_date(), settings=overridden_settings
+        )
+        origins_planned = {task.request.origin for task in tasks}
+
+        assert origins_planned == {"AMS", "EIN", "RTM", "DUS", "NRN"}
+        assert len(tasks) == 5 * 16  # 5 plannable origins x 16 tasks each, not 160
+
     def test_every_task_carries_its_own_origins_registry_priority(self) -> None:
         tasks = build_multi_origin_plan(departure_date=_departure_date())
         for task in tasks:
