@@ -92,6 +92,7 @@ from flightagent.observability.events import EventName
 from flightagent.observability.logging import log_event, setup_logging
 from flightagent.orchestration.executor import execute_plan
 from flightagent.orchestration.plan import build_dual_mode_plan_for_origin
+from flightagent.persistence.cache_repo import CacheRepository
 from flightagent.policy.direct_vs_stop import analyze_destination
 from flightagent.providers.base import CallBudget, FlightProvider
 from flightagent.providers.errors import ProviderNotConfigured
@@ -755,6 +756,15 @@ async def run_all_destinations_pipeline(
     runs the D10 policy (T31/T33, ``policy.direct_vs_stop.analyze_destination``)
     over it. Never writes a file and never prints anything; see
     ``AllDestinationsPipelineResult``'s own docstring for why.
+
+    Opens the real on-disk ``CacheRepository`` at ``settings.cache.db_path``
+    for the duration of this one call and passes it (plus this call's own
+    ``started_at`` as the genuine wall-clock ``cache_now``) into
+    ``execute_plan`` -- the executor's cache-aside wiring (see
+    ``orchestration.executor``'s module docstring) is what makes a second
+    identical call to this function a 0-provider-call cache hit rather than
+    a repeat of every live search. Closed in a ``finally`` so a connection
+    is never leaked, including when ``execute_plan`` raises.
     """
     started_at = datetime.now(UTC)
 
@@ -762,7 +772,17 @@ async def run_all_destinations_pipeline(
     tasks = build_dual_mode_plan_for_origin(
         origin_code, departure_date=departure_date, settings=settings
     )
-    execution_results = await execute_plan(tasks, provider_instance, settings=settings)
+    cache_repository = CacheRepository.open(settings.cache.db_path)
+    try:
+        execution_results = await execute_plan(
+            tasks,
+            provider_instance,
+            settings=settings,
+            cache=cache_repository,
+            cache_now=started_at,
+        )
+    finally:
+        cache_repository.close()
 
     finalized_outcomes: list[TaskOutcome] = []
     combined_valid_itineraries: list[NormalizedItinerary] = []

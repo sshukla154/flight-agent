@@ -135,6 +135,14 @@ class CacheSettings(BaseSettings):
     ttl_minutes_7_to_30_days: int
     ttl_minutes_under_7_days: int
     max_pages_per_task: int
+    db_path: str
+    """``persistence.db.connect``'s ``db_path`` argument for the real
+    (non-test) ``CacheRepository`` -- a plain config value rather than a
+    hardcoded path inside ``cli.py``. Deliberately NOT under ``out/``
+    (``config/defaults.toml``'s own comment on this key explains why) --
+    ``connect()`` creates this path's parent directory as a side effect of
+    opening, and a FAILED/NO_RESULTS run must write nothing under
+    ``out/`` (D15)."""
 
 
 class OutputSettings(BaseSettings):

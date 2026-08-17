@@ -108,6 +108,7 @@ def _make_cache_settings(
         ttl_minutes_7_to_30_days=seven_to_30,
         ttl_minutes_under_7_days=under_7,
         max_pages_per_task=3,
+        db_path="cache/flightagent.sqlite3",
     )
 
 

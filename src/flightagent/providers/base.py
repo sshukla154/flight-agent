@@ -24,8 +24,9 @@ breaking change when that infrastructure lands.
 
 from __future__ import annotations
 
+import json
 from datetime import timedelta
-from typing import Literal, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -108,6 +109,61 @@ class ProviderSearchResult(BaseModel):
     http_calls: int = Field(ge=0)
     raw_payload_refs: tuple[str, ...] = ()
     provider_warnings: tuple[str, ...] = ()
+
+
+_LEG_COMPUTED_FIELDS = ("total_duration", "connection_count", "technical_stop_count")
+_SEGMENT_COMPUTED_FIELDS = ("ambiguous_local_time",)
+"""The exact, closed set of ``@computed_field``s reachable from
+``ProviderSearchResult.offers`` -- ``Leg``'s three (``domain/itinerary.py``)
+and ``Segment``'s one (``domain/segment.py``). ``RawOffer`` and ``Layover``
+have none. Confirmed by direct inspection, not guessed -- see
+``deserialize_cached_search_result``'s docstring for why this fixed list
+exists at all rather than a generic "strip every computed field"
+walker."""
+
+
+def deserialize_cached_search_result(payload: str) -> ProviderSearchResult:
+    """Reconstruct a ``ProviderSearchResult`` from a ``payload`` string
+    previously produced by ``result.model_dump_json()`` on THIS SAME model
+    -- the shape ``persistence.cache_repo.CacheRepository`` stores verbatim
+    in ``raw_payloads.payload`` (master plan S5's two-layer cache).
+
+    ``ProviderSearchResult.model_validate_json(payload)`` on its own
+    output does NOT round-trip: ``Leg``/``Segment`` mix ``@computed_field``
+    with ``model_config = ConfigDict(extra="forbid")`` (both, deliberately
+    -- master plan S4's "derive the total from endpoints, then ASSERT the
+    sum matches" invariant needs ``total_duration`` computed, never an
+    independently-settable input field a caller could get out of sync).
+    ``model_dump_json()`` includes computed-field values in its output (so
+    a reader can see them without recomputing); ``model_validate_json()``
+    then rejects those SAME keys as unrecognised extra input. This is a
+    real, structural pydantic-modeling property of those two models, not a
+    bug to patch there -- fixing it at the model level would mean
+    loosening ``extra="forbid"`` (or dropping the computed fields
+    entirely) on models dozens of already-passing tests depend on for
+    exactly the opposite guarantee, for the sake of ONE caller (this cache
+    round trip) that can solve its own problem locally instead.
+
+    This function strips the known, closed set of computed-field keys
+    (``_LEG_COMPUTED_FIELDS``/``_SEGMENT_COMPUTED_FIELDS`` above) from the
+    parsed JSON before validating -- ``Leg``/``Segment`` recompute them
+    from the remaining stored fields exactly as they would for freshly-
+    provider-returned data, so the reconstructed object is byte-identical
+    to what a live call would have produced, never a lossy approximation.
+    Raises the same ``pydantic.ValidationError`` as ``model_validate_json``
+    for any OTHER malformation -- this function only teaches validation to
+    ignore the specific extra keys it itself is responsible for having
+    added on the write side, nothing more.
+    """
+    data: dict[str, Any] = json.loads(payload)
+    for offer in data.get("offers", ()):
+        for leg in offer.get("legs", ()):
+            for field_name in _LEG_COMPUTED_FIELDS:
+                leg.pop(field_name, None)
+            for segment in leg.get("segments", ()):
+                for field_name in _SEGMENT_COMPUTED_FIELDS:
+                    segment.pop(field_name, None)
+    return ProviderSearchResult.model_validate(data)
 
 
 @runtime_checkable

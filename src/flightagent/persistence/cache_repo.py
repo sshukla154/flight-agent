@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import threading
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -130,10 +131,29 @@ class CacheRepository:
     on-disk file -- WAL mode (``db.connect``) is what makes concurrent
     *readers* safe there; this class itself does no cross-instance
     coordination beyond what SQLite's own WAL journal provides.
+
+    ``_lock`` (a plain ``threading.Lock``, not ``asyncio.Lock``) serializes
+    every actual ``self._connection`` call. Each public method dispatches
+    its blocking work to ``asyncio.to_thread``, whose default executor is a
+    thread POOL -- once ``orchestration.executor.execute_plan`` started
+    driving this class under its real concurrent (semaphore-bounded)
+    fan-out, two ``put_raw`` calls landing on two different pool threads at
+    the same moment produced a reproducible native access violation
+    (Windows, CPython 3.12.13) inside ``_upsert_raw``. ``sqlite3.threadsafety``
+    reports ``3`` ("serialized") on this build, which was expected to make
+    exactly this safe without an extra lock -- it did not, in practice.
+    ``asyncio.Lock`` would not have fixed this: it only orders coroutines on
+    one event-loop thread, and every caller here is already a *worker*
+    thread, not the event loop thread. A plain ``threading.Lock`` is the
+    correct primitive and costs nothing extra -- SQLite already serializes
+    disk access on one file internally, so forcing Python-level
+    serialization here removes a real crash, not a real amount of
+    concurrency.
     """
 
     def __init__(self, connection: sqlite3.Connection) -> None:
         self._connection = connection
+        self._lock = threading.Lock()
         self.counters = CacheCounters()
 
     @classmethod
@@ -203,16 +223,18 @@ class CacheRepository:
         return None
 
     def _select_raw(self, raw_key: str) -> tuple[str, str] | None:
-        cursor = self._connection.execute(
-            "SELECT payload, expires_at FROM raw_payloads WHERE raw_key = ?",
-            (raw_key,),
-        )
-        row = cursor.fetchone()
+        with self._lock:
+            cursor = self._connection.execute(
+                "SELECT payload, expires_at FROM raw_payloads WHERE raw_key = ?",
+                (raw_key,),
+            )
+            row = cursor.fetchone()
         return None if row is None else (row[0], row[1])
 
     def _delete_raw(self, raw_key: str) -> None:
-        self._connection.execute("DELETE FROM raw_payloads WHERE raw_key = ?", (raw_key,))
-        self._connection.commit()
+        with self._lock:
+            self._connection.execute("DELETE FROM raw_payloads WHERE raw_key = ?", (raw_key,))
+            self._connection.commit()
 
     async def put_raw(
         self,
@@ -271,31 +293,32 @@ class CacheRepository:
         retrieved_at_iso: str,
         expires_at_iso: str,
     ) -> None:
-        self._connection.execute(
-            """
-            INSERT INTO raw_payloads
-                (raw_key, provider, api_version, origin, destination,
-                 departure_date, payload, retrieved_at, expires_at, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(raw_key) DO UPDATE SET
-                payload = excluded.payload,
-                retrieved_at = excluded.retrieved_at,
-                expires_at = excluded.expires_at
-            """,
-            (
-                raw_key,
-                provider,
-                api_version,
-                origin,
-                destination,
-                departure_date_iso,
-                payload,
-                retrieved_at_iso,
-                expires_at_iso,
-                retrieved_at_iso,
-            ),
-        )
-        self._connection.commit()
+        with self._lock:
+            self._connection.execute(
+                """
+                INSERT INTO raw_payloads
+                    (raw_key, provider, api_version, origin, destination,
+                     departure_date, payload, retrieved_at, expires_at, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(raw_key) DO UPDATE SET
+                    payload = excluded.payload,
+                    retrieved_at = excluded.retrieved_at,
+                    expires_at = excluded.expires_at
+                """,
+                (
+                    raw_key,
+                    provider,
+                    api_version,
+                    origin,
+                    destination,
+                    departure_date_iso,
+                    payload,
+                    retrieved_at_iso,
+                    expires_at_iso,
+                    retrieved_at_iso,
+                ),
+            )
+            self._connection.commit()
 
     # -- normalized layer ---------------------------------------------------
 
@@ -344,18 +367,20 @@ class CacheRepository:
         return None
 
     def _select_normalized(self, normalized_key: str) -> tuple[str, str] | None:
-        cursor = self._connection.execute(
-            "SELECT payload, expires_at FROM normalized_offers WHERE normalized_key = ?",
-            (normalized_key,),
-        )
-        row = cursor.fetchone()
+        with self._lock:
+            cursor = self._connection.execute(
+                "SELECT payload, expires_at FROM normalized_offers WHERE normalized_key = ?",
+                (normalized_key,),
+            )
+            row = cursor.fetchone()
         return None if row is None else (row[0], row[1])
 
     def _delete_normalized(self, normalized_key: str) -> None:
-        self._connection.execute(
-            "DELETE FROM normalized_offers WHERE normalized_key = ?", (normalized_key,)
-        )
-        self._connection.commit()
+        with self._lock:
+            self._connection.execute(
+                "DELETE FROM normalized_offers WHERE normalized_key = ?", (normalized_key,)
+            )
+            self._connection.commit()
 
     async def put_normalized(
         self,
@@ -404,29 +429,30 @@ class CacheRepository:
         retrieved_at_iso: str,
         expires_at_iso: str,
     ) -> None:
-        self._connection.execute(
-            """
-            INSERT INTO normalized_offers
-                (normalized_key, raw_key, normalizer_version, fx_source_id,
-                 payload, retrieved_at, expires_at, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(normalized_key) DO UPDATE SET
-                payload = excluded.payload,
-                retrieved_at = excluded.retrieved_at,
-                expires_at = excluded.expires_at
-            """,
-            (
-                normalized_key,
-                raw_key,
-                normalizer_version,
-                fx_source_id,
-                payload,
-                retrieved_at_iso,
-                expires_at_iso,
-                retrieved_at_iso,
-            ),
-        )
-        self._connection.commit()
+        with self._lock:
+            self._connection.execute(
+                """
+                INSERT INTO normalized_offers
+                    (normalized_key, raw_key, normalizer_version, fx_source_id,
+                     payload, retrieved_at, expires_at, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(normalized_key) DO UPDATE SET
+                    payload = excluded.payload,
+                    retrieved_at = excluded.retrieved_at,
+                    expires_at = excluded.expires_at
+                """,
+                (
+                    normalized_key,
+                    raw_key,
+                    normalizer_version,
+                    fx_source_id,
+                    payload,
+                    retrieved_at_iso,
+                    expires_at_iso,
+                    retrieved_at_iso,
+                ),
+            )
+            self._connection.commit()
 
 
 __all__ = ["CacheCounters", "CacheRepository", "resolve_ttl"]

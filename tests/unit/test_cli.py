@@ -264,6 +264,73 @@ class TestRunArtifactDirectory:
         assert run_results == fixed_results
 
 
+class TestCacheWiring:
+    """Phase 7's own literal completion bar (master plan, closing the dual
+    verify pass's CRITICAL finding that ``persistence.cache_repo.CacheRepository``
+    was built in T43/T44 but never called by anything): "second identical
+    run issues 0 provider calls, logs cache_hit for all keys."
+
+    ``InstrumentedProvider.call_log`` is asserted directly rather than via
+    script exhaustion -- a single-``Succeed`` script per destination
+    replays its last step forever (see that class's own docstring), so an
+    un-cached second run would NOT raise or fail on its own; it would just
+    silently make 16 more live calls. Only counting ``call_log`` catches
+    that regression.
+    """
+
+    def test_second_identical_run_makes_zero_provider_calls(
+        self, isolated_cwd: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        provider = InstrumentedProvider(
+            scripts={destination: [Succeed(offer_count=2)] for destination in _ALL_8_DESTINATIONS}
+        )
+        monkeypatch.setattr("flightagent.cli._build_provider", lambda name: provider)
+
+        first = runner.invoke(app, _ALL_DESTINATIONS_ARGS)
+        assert first.exit_code == 0, first.output
+        # 8 destinations x 2 modes (direct + one-stop, T29) = 16 live calls.
+        calls_after_first_run = len(provider.call_log)
+        assert calls_after_first_run == 16
+
+        second = runner.invoke(app, _ALL_DESTINATIONS_ARGS)
+        assert second.exit_code == 0, second.output
+        assert len(provider.call_log) == calls_after_first_run, (
+            "second identical run must hit the cache for every task and make "
+            "zero additional provider calls"
+        )
+
+        cache_db_path = isolated_cwd / "cache" / "flightagent.sqlite3"
+        assert cache_db_path.is_file()
+
+        # The cache-hit path must reconstruct the exact same offers a live
+        # call would have -- not just "some" report, the byte-identical one.
+        results_path = isolated_cwd / "out" / "flight_results_2027-07-17.json"
+        first_results = json.loads(results_path.read_text(encoding="utf-8"))
+        assert first.stdout == second.stdout
+        assert json.loads(results_path.read_text(encoding="utf-8")) == first_results
+
+    def test_second_run_cache_hits_are_logged(
+        self, isolated_cwd: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        provider = InstrumentedProvider(
+            scripts={destination: [Succeed(offer_count=2)] for destination in _ALL_8_DESTINATIONS}
+        )
+        monkeypatch.setattr("flightagent.cli._build_provider", lambda name: provider)
+
+        first = runner.invoke(app, _ALL_DESTINATIONS_ARGS)
+        assert first.exit_code == 0, first.output
+
+        second = runner.invoke(app, _ALL_DESTINATIONS_ARGS)
+        assert second.exit_code == 0, second.output
+
+        cache_hit_lines = [
+            record
+            for record in _parse_log_lines(second.stderr)
+            if record.get("event") == "cache.hit" and record.get("layer") == "raw"
+        ]
+        assert len(cache_hit_lines) == 16
+
+
 class TestUnconfiguredProvider:
     """D6 / T9: a provider other than ``mock`` must raise
     ``ProviderNotConfigured`` and must never silently search with the mock
