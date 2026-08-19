@@ -54,12 +54,16 @@ import types
 from pathlib import Path
 from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
 
 import flightagent.tools as tools_pkg
 from flightagent.api.app import create_app
+from flightagent.api.auth import API_KEY_ENV_VAR
 from flightagent.config.loader import load_config
 from flightagent.config.models import FlightAgentSettings
+
+_TEST_API_KEY = "test-api-key-not-a-real-secret"
 
 # ---------------------------------------------------------------------------
 # Shared paths / helpers
@@ -131,7 +135,9 @@ def _registered_tool_names() -> set[str]:
     }
 
 
-def test_registered_tool_and_endpoint_set_matches_exact_spec_list(tmp_path: Path) -> None:
+def test_registered_tool_and_endpoint_set_matches_exact_spec_list(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # --- Tool registry ----------------------------------------------------
     public_callables = _registered_tool_names()
     assert public_callables == set(tools_pkg.__all__), (
@@ -148,6 +154,11 @@ def test_registered_tool_and_endpoint_set_matches_exact_spec_list(tmp_path: Path
     assert public_callables == {"airport_info", "save_json"}
 
     # --- HTTP endpoint registry --------------------------------------------
+    # create_app() now requires FLIGHTAGENT_API_KEY (Phase 8b, api.auth) --
+    # only needed here to let app creation itself succeed; this test never
+    # issues a real request (app.openapi() is pure route introspection),
+    # so no X-Api-Key header is needed.
+    monkeypatch.setenv(API_KEY_ENV_VAR, _TEST_API_KEY)
     app = create_app(settings=_isolated_settings(tmp_path))
     schema = app.openapi()
     actual_endpoints = {
@@ -419,7 +430,9 @@ def _parse_routes_approval() -> ast.Module:
     return ast.parse(source, filename=str(_ROUTES_APPROVAL_PATH))
 
 
-def test_approval_endpoint_cannot_trigger_any_external_action(tmp_path: Path) -> None:
+def test_approval_endpoint_cannot_trigger_any_external_action(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Independent re-verification of T47's own claim (this task's brief:
     "should be re-verified independently here as the dedicated
     safety-guard suite's own check, not just trusted from T47's report").
@@ -497,7 +510,8 @@ def test_approval_endpoint_cannot_trigger_any_external_action(tmp_path: Path) ->
 
     # --- 3. Runtime filesystem-delta check -----------------------------------
     settings = _isolated_settings(tmp_path)
-    client = TestClient(create_app(settings=settings))
+    monkeypatch.setenv(API_KEY_ENV_VAR, _TEST_API_KEY)
+    client = TestClient(create_app(settings=settings), headers={"X-Api-Key": _TEST_API_KEY})
 
     created = client.post("/search", json=_SEARCH_BODY)
     assert created.status_code == 200, created.text

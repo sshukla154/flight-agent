@@ -270,11 +270,19 @@ def _rejected_self_transfer_to_json(rejected: RejectedItinerary) -> dict[str, An
     }
 
 
-def _itinerary_to_json(item: ScoredItinerary, *, data_source: DataSource) -> dict[str, Any]:
+def _itinerary_to_json(item: ScoredItinerary) -> dict[str, Any]:
+    """Master plan S8.6: the booking-URL validation policy (``DataSource``)
+    is derived from THIS itinerary's own ``provider`` field, never from a
+    single value shared across the whole document -- destinations are
+    searched concurrently and can legitimately differ in data source
+    within one run, so one document-level policy applied uniformly would
+    silently misvalidate any itinerary that didn't come from that source.
+    """
     itinerary = item.itinerary
     departure_segment = first_segment(itinerary)
     arrival_segment = last_segment(itinerary)
-    booking_url, booking_url_valid = _booking_json(itinerary, data_source=data_source)
+    booking_data_source: DataSource = "mock" if itinerary.provider == "mock" else "live"
+    booking_url, booking_url_valid = _booking_json(itinerary, data_source=booking_data_source)
 
     return {
         "rank_by_adjusted_score": item.rank_by_adjusted_score,
@@ -393,7 +401,7 @@ def build_results_document(
         "generated_at": generated_at.isoformat(),
         "accepted_count": accepted_count,
         "top_n": top_n,
-        "top_itineraries": [_itinerary_to_json(item, data_source=data_source) for item in ranked],
+        "top_itineraries": [_itinerary_to_json(item) for item in ranked],
         "failed_searches": [
             _failed_search_to_json(outcome) for outcome in failed_task_outcomes(task_outcomes)
         ],
@@ -413,8 +421,7 @@ def build_results_document(
         ],
         "top_itineraries_by_destination": {
             destination: [
-                _itinerary_to_json(item, data_source=data_source)
-                for item in top_n_by_destination[destination]
+                _itinerary_to_json(item) for item in top_n_by_destination[destination]
             ]
             for destination in sorted(top_n_by_destination)
         },

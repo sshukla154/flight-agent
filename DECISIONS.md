@@ -13,7 +13,7 @@
 | `CONFIRMED` | The project owner has explicitly signed this off. |
 | `DEFAULT (unconfirmed)` | A recommended default that work proceeds on so implementation is not blocked. The owner has **not** signed it off. It can change. |
 
-As of 2026-08-17, five decisions are `CONFIRMED`: **D10, D16, D17, D18, D20**. Every other decision in this register — D1 through D9, D11 through D15, and D19 (added 2026-08-16, scoping Phase 4) — is `DEFAULT (unconfirmed)`. That distinction is the whole point of the register — do not quietly promote a default to a confirmation because code now depends on it.
+As of 2026-08-17, seven decisions are `CONFIRMED`: **D10, D16, D17, D18, D20, D21, D22**. Every other decision in this register — D1 through D9, D11 through D15, and D19 (added 2026-08-16, scoping Phase 4) — is `DEFAULT (unconfirmed)`. That distinction is the whole point of the register — do not quietly promote a default to a confirmation because code now depends on it.
 
 ---
 
@@ -40,6 +40,8 @@ As of 2026-08-17, five decisions are `CONFIRMED`: **D10, D16, D17, D18, D20**. E
   - [D18 — Fare matrix visual: colour scale](#d18--fare-matrix-visual-colour-scale)
   - [D19 — dominant_rejection_code: how a NO_RESULTS run says why](#d19--dominant_rejection_code-how-a-no_results-run-says-why)
   - [D20 — Docker packaging scope](#d20--docker-packaging-scope)
+  - [D21 — Approval-gate design is documented and signed off](#d21--approval-gate-design-is-documented-and-signed-off)
+  - [D22 — API-key auth scope for the FastAPI service](#d22--api-key-auth-scope-for-the-fastapi-service)
 - [Confirm before Phase 5](#confirm-before-phase-5)
 - [Restated acceptance criteria](#restated-acceptance-criteria)
 - [Open questions carried into every report](#open-questions-carried-into-every-report)
@@ -383,6 +385,34 @@ Two template constraints that look cosmetic in review and are not: **never drop 
 **Blast radius.** `Dockerfile`, `docker-compose.yml`, `README.md`'s Docker section.
 
 **Reversal cost.** **Moderate.** Adding an API service to compose later means bypassing `serve()`'s hardcoded host (`uvicorn flightagent.api.app:app --host 0.0.0.0`), which should not happen without also landing real auth in the same change.
+
+---
+
+### D21 — Approval-gate design is documented and signed off
+
+**Decision.** The approval-gate design already built in `src/flightagent/api/routes_approval.py` (T47) — an honest, audit-only record with no capability to authorize any real action, since no booking tool exists in this codebase's closed tool registry — is the accepted design for this phase. Master plan §8.4's fuller design (HMAC capability tokens, fail-closed expiry, an authenticated-not-self-asserted identity, an itinerary-snapshot hash) remains explicitly out of scope, reserved for whenever a real booking tool is ever added, at which point it gets its own dedicated security review per §8.4's own words — never bundled into a routine feature PR.
+
+**Status.** `CONFIRMED` — decided by the project owner 2026-08-17, scoping Phase 8b (master plan §8.8 checklist item: "Approval-gate design documented and signed off *before* any booking tool is added").
+
+**Rationale.** §8.4's own reasoning already fully justifies this in `routes_approval.py`'s module docstring and is re-verified by `tests/unit/test_approval.py`'s AST-based regression guard (parses that module's own imports, fails the build if anything booking/payment-shaped is ever added). This entry exists so that reasoning has the same register entry every other decision in this project gets, rather than living only in source comments — closing the checklist item with zero new code.
+
+**Blast radius.** None — documentation only.
+
+**Reversal cost.** **Cheap.** Nothing to reverse; a real booking tool arriving later triggers §8.4's own fuller design as a separate, dedicated change.
+
+---
+
+### D22 — API-key auth scope for the FastAPI service
+
+**Decision.** Every FastAPI route (including `/healthz`) requires a matching `X-Api-Key` header, checked against `FLIGHTAGENT_API_KEY` (`src/flightagent/api/auth.py`). This is **defense in depth on top of** the existing `127.0.0.1`-only bind (`api/app.py`), never a replacement for it — the bind address stays the primary control, and this key does not make it safe to expose the service beyond localhost (no reverse proxy, no `0.0.0.0` container port mapping, no load balancer, on the strength of the key alone). `create_app()` fails closed: it raises immediately if `FLIGHTAGENT_API_KEY` is unset, rather than silently serving any request unauthenticated.
+
+**Status.** `CONFIRMED` — decided by the project owner 2026-08-17, scoping Phase 8b (master plan §8.7: "AuthN on every endpoint").
+
+**Rationale.** §8.7's own checklist item asks for authentication on every endpoint; this is the smallest slice that satisfies it without building the much larger §8.4 capability-token design a real booking tool would eventually need (there is still no booking tool to protect). A plain, constant-time-compared API key read directly from the environment (never through `config.loader`'s TOML/env layering, matching the exact convention `providers.amadeus`/`providers.duffel` already use for real credentials) is proportionate to what this service surface actually is today: a personal, localhost-only demo, not a multi-tenant production API.
+
+**Blast radius.** `src/flightagent/api/app.py`, new `src/flightagent/api/auth.py`, every FastAPI test file's `TestClient` construction (`tests/unit/test_api.py`, `test_approval.py`, `test_safety.py`), `.env.example`.
+
+**Reversal cost.** **Cheap.** Removing `dependencies=[Depends(require_api_key)]` and the startup check reverts to Phase 7's exact prior behavior; nothing else in the codebase depends on this key existing.
 
 ---
 

@@ -1,0 +1,11 @@
+# Phase 8b (master plan §8.5): secret scanning before a commit ever
+# lands, not just a CI check after the fact -- gitleaks catches a real
+# key BEFORE it enters git history at all, which a post-commit CI scan
+# structurally cannot (the commit already exists by then).
+#
+# One-time setup: `uv run pre-commit install`
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.21.2
+    hooks:
+      - id: gitleaks
