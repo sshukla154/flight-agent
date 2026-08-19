@@ -20,6 +20,7 @@ done yet" below.
 
 ```bash
 uv sync
+uv run pre-commit install  # one-time: activates the gitleaks secret-scan hook
 uv run flightagent run --origin AMS --dest DEL --date 2027-07-17 --max-stops 1 --provider mock
 ```
 
@@ -59,6 +60,18 @@ Override the command to run a single pair instead:
 docker compose run --rm agent run --origin AMS --dest DEL --date 2027-07-17 --max-stops 1
 ```
 
+## Running the API surface (local only)
+
+```bash
+export FLIGHTAGENT_API_KEY=<pick-a-key>   # required -- create_app() refuses to start without it
+uv run python -m flightagent.api.app
+curl -H "X-Api-Key: <same-key>" http://127.0.0.1:8000/healthz
+```
+
+Every endpoint requires the `X-Api-Key` header (D22) — this is defense in
+depth on top of the hardcoded `127.0.0.1` bind, not a replacement for it.
+Not run inside Docker (see D20 above).
+
 ## Where output lands
 
 - `out/flight_report_2027-07-17.md` / `out/flight_results_2027-07-17.json`
@@ -89,13 +102,17 @@ radius, and reversal cost in [`DECISIONS.md`](./DECISIONS.md).
   uncredentialed; `--provider amadeus`/`--provider duffel` raise
   `ProviderNotConfigured` at runtime (D6, by design, not a bug).
   `.env.example` documents the variable names only.
-- **FastAPI authentication.** The service surface ships with no auth on
-  any endpoint — acceptable only because it's bound to `127.0.0.1` by
-  hardcoded default.
-- **Remaining security-checklist items** (master plan §8.8, tracked as a
-  follow-up "Phase 8b"): a `gitleaks`/secret-scan pre-commit hook,
-  Markdown-link-escaping adversarial test fixtures, per-itinerary
-  `retrieved_at`/`data_source` fields (currently run-level only),
-  booking-URL validation at provider-ingestion time (currently render-time
-  only), `pip-audit` wired into CI, and sensitive-query-key rejection in
-  the booking-URL validator.
+- **Booking-URL validation at provider-ingestion time.** Still render-time
+  only (`markdown.py`/`json_report.py`) — no real adapter exists to call
+  it at ingestion (D6), so there's nothing to ingest from yet.
+- **A real per-provider PSL host allowlist** for `data_source="live"`
+  booking URLs (would need `tldextract`) — deferred for the same reason:
+  no live provider ever produces a URL to allowlist against today.
+
+Phase 8b (2026-08-17) closed the rest of master plan §8.8's checklist:
+gitleaks pre-commit hook, `pip-audit` in CI (advisory), Markdown-escaping
+and booking-URL adversarial tests (`javascript:`, homograph, sensitive
+query keys, backticks), per-itinerary booking-link validation policy
+(derived from each itinerary's own `provider`, not one document-wide
+value), API-key auth on every endpoint (D22), and the approval-gate
+sign-off entry (D21).

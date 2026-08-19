@@ -24,8 +24,11 @@ from fastapi.testclient import TestClient
 
 from flightagent.api import app as api_app
 from flightagent.api.app import create_app
+from flightagent.api.auth import API_KEY_ENV_VAR
 from flightagent.config.loader import load_config
 from flightagent.config.models import FlightAgentSettings
+
+_TEST_API_KEY = "test-api-key-not-a-real-secret"
 
 
 def _isolated_settings(tmp_path: Path) -> FlightAgentSettings:
@@ -52,13 +55,23 @@ def settings(tmp_path: Path) -> FlightAgentSettings:
 
 
 @pytest.fixture
-def client(settings: FlightAgentSettings) -> TestClient:
+def client(
+    settings: FlightAgentSettings, monkeypatch: pytest.MonkeyPatch
+) -> TestClient:
     """A ``TestClient`` bound to an app built with pre-loaded settings --
     ``create_app(settings=...)`` skips the startup lifespan's own
     ``load_config()`` call entirely, so this never reads the real
     packaged/``./config`` layers.
+
+    ``create_app()`` now refuses to run without ``FLIGHTAGENT_API_KEY``
+    set (Phase 8b, ``api.auth``) -- set here via ``monkeypatch`` so it's
+    unset again after each test, and the returned client's own default
+    ``headers`` carry the matching ``X-Api-Key`` so every request every
+    test in this file makes passes auth without touching the ~15
+    individual test functions below.
     """
-    return TestClient(create_app(settings=settings))
+    monkeypatch.setenv(API_KEY_ENV_VAR, _TEST_API_KEY)
+    return TestClient(create_app(settings=settings), headers={"X-Api-Key": _TEST_API_KEY})
 
 
 _SINGLE_DEST_BODY = {

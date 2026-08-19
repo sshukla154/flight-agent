@@ -39,7 +39,12 @@ from flightagent.domain.run import TaskOutcome
 from flightagent.domain.scoring import OriginSummary, ScoreComponents, ScoredItinerary
 from flightagent.domain.segment import Layover, Segment
 from flightagent.domain.validation import RejectedItinerary, Rejection
-from flightagent.reporting.booking_link import BookingUrlRejected, validate_booking_url
+from flightagent.reporting.booking_link import (
+    BookingUrlRejected,
+    escape_markdown_link_text,
+    markdown_link,
+    validate_booking_url,
+)
 from flightagent.reporting.json_report import build_results_document
 from flightagent.reporting.markdown import SYNTHETIC_DATA_BANNER, render_markdown_report
 from flightagent.reporting.run_artifacts import (
@@ -122,6 +127,7 @@ def _one_stop_itinerary(
     booking_url: str | None,
     booking_url_kind: _BookingUrlKind = "provider_native",
     is_self_transfer: bool = False,
+    provider: str = "mock",
 ) -> NormalizedItinerary:
     """AMS -(carrier)-> hub -(carrier)-> DEL, one layover of exactly
     ``layover_minutes``. Real IANA zones throughout, matching the shape
@@ -166,7 +172,7 @@ def _one_stop_itinerary(
 
     return NormalizedItinerary(
         itinerary_id=itinerary_id,
-        provider="mock",
+        provider=provider,
         legs=(leg,),
         price_original=price,
         price_eur=price,
@@ -739,6 +745,89 @@ class TestBookingUrlValidator:
             validate_booking_url(oversized, data_source="mock")
         assert exc_info.value.reason == "url_too_long"
 
+    def test_rejects_javascript_scheme(self) -> None:
+        with pytest.raises(BookingUrlRejected) as exc_info:
+            validate_booking_url("javascript:alert(1)", data_source="mock")
+        assert exc_info.value.reason == "non_https_scheme"
+
+    def test_rejects_homograph_non_ascii_host(self) -> None:
+        # Cyrillic "а" (U+0430) standing in for Latin "a" -- a classic
+        # homograph attack, not just "a weird string".
+        with pytest.raises(BookingUrlRejected) as exc_info:
+            validate_booking_url("https://аpple.mock.flightagent.invalid/x", data_source="mock")
+        assert exc_info.value.reason == "non_ascii_host"
+
+    @pytest.mark.parametrize(
+        "sensitive_key",
+        ["password", "token", "session", "api_key", "passport", "dob", "card", "cvv"],
+    )
+    def test_rejects_sensitive_query_string_keys(self, sensitive_key: str) -> None:
+        url = f"https://mock.flightagent.invalid/booking?{sensitive_key}=secret123"
+        with pytest.raises(BookingUrlRejected) as exc_info:
+            validate_booking_url(url, data_source="mock")
+        assert exc_info.value.reason == "sensitive_query_param"
+
+    def test_sensitive_query_key_check_is_case_insensitive(self) -> None:
+        with pytest.raises(BookingUrlRejected) as exc_info:
+            validate_booking_url(
+                "https://mock.flightagent.invalid/booking?API_KEY=secret123", data_source="mock"
+            )
+        assert exc_info.value.reason == "sensitive_query_param"
+
+    def test_ordinary_query_string_keys_are_not_rejected(self) -> None:
+        # A guard against an over-broad match -- an ordinary booking
+        # reference param must not collide with the sensitive-key check.
+        result = validate_booking_url(
+            f"{_MOCK_BOOKING_URL}?fare_class=Y&adults=1", data_source="mock"
+        )
+        assert result.url.endswith("?fare_class=Y&adults=1")
+
+
+class TestMarkdownLinkEscaping:
+    """Master plan S8.2/S8.8 checklist item 8 -- the escaping helper
+    itself, exercised directly with adversarial link text. Never
+    exercised by the real rendering pipeline today (airline codes are
+    IATA-pattern-constrained upstream), but the helper's OWN behavior
+    must still be correct and tested independently of that fact.
+    """
+
+    def test_escapes_bracket_break_out_attempt(self) -> None:
+        # Master plan S8.2's own example: a crafted airline name must not
+        # be able to close the [...] bracket early and redefine the link
+        # target. Escaping the "]" alone is sufficient -- an unescaped "("
+        # right after it has no special meaning to a Markdown parser
+        # unless it immediately follows an UNESCAPED "]".
+        rendered = markdown_link("Air India](https://evil.example.com \"", _MOCK_BOOKING_URL)
+        assert rendered == f'[Air India\\](https://evil.example.com "]({_MOCK_BOOKING_URL})'
+        # Only ONE unescaped "]" exists in the whole rendered link -- the
+        # one that legitimately closes OUR link text, immediately
+        # followed by "(" and the real, validated URL.
+        first_unescaped_bracket = rendered.index("]")
+        assert rendered[first_unescaped_bracket - 1] == "\\"
+        real_bracket = rendered.rindex("](")
+        assert rendered[real_bracket - 1] != "\\"
+
+    def test_escapes_backtick_in_link_text(self) -> None:
+        # A raw backtick can open an inline code span that some Markdown
+        # renderers let override normal link-syntax parsing -- not just
+        # a cosmetic character.
+        assert escape_markdown_link_text("`") == "\\`"
+        rendered = markdown_link("Air `India`", _MOCK_BOOKING_URL)
+        assert rendered == f"[Air \\`India\\`]({_MOCK_BOOKING_URL})"
+
+    def test_escapes_bare_closing_paren_in_link_text(self) -> None:
+        # A bare ")" in TEXT (not the target) is not itself unsafe --
+        # Markdown link-text parsing ends at the matching "]", not ")" --
+        # but backslash/bracket escaping must still round-trip correctly
+        # alongside one.
+        rendered = markdown_link("Air (India)", _MOCK_BOOKING_URL)
+        assert rendered == f"[Air (India)]({_MOCK_BOOKING_URL})"
+
+    def test_markdown_link_rejects_unsafe_target(self) -> None:
+        with pytest.raises(BookingUrlRejected) as exc_info:
+            markdown_link("Air India", "https://mock.flightagent.invalid/x)y")
+        assert exc_info.value.reason == "unsafe_link_target"
+
 
 class TestRenderedBookingLinkSafety:
     """The load-bearing property: an unsafe URL must never reach the
@@ -765,6 +854,39 @@ class TestRenderedBookingLinkSafety:
         assert "http://" not in rendered
         assert "insecure.example.com" not in rendered
         assert "booking link withheld" in rendered
+
+    def test_booking_link_policy_is_derived_per_itinerary_not_document_wide(self) -> None:
+        """Master plan S8.6: destinations are searched concurrently and
+        can legitimately differ in data source within one run -- a
+        single document-level policy applied to every itinerary would
+        silently misvalidate whichever ones didn't come from that
+        source. A "live"-provider itinerary with a real (non-mock-
+        reserved) https host must render its link normally, in the SAME
+        report as a "mock"-provider itinerary that still requires the
+        mock-reserved-suffix check.
+        """
+        live_url = "https://booking.some-real-airline.example.com/itin/123"
+        live_itinerary = _one_stop_itinerary(
+            itinerary_id="itin_live_0001",
+            price_eur=Decimal("650.00"),
+            carrier="LH",
+            hub="FRA",
+            hub_tz="Europe/Berlin",
+            layover_minutes=240,
+            booking_url=live_url,
+            provider="amadeus",
+        )
+        live_scored = _scored(live_itinerary, rank=1, fare_component=Decimal("650.00"))
+
+        rendered = render_markdown_report(
+            [live_scored],
+            departure_date=_DEPARTURE_DATE,
+            accepted_count=1,
+            generated_at=_GENERATED_AT,
+        )
+
+        assert f"]({live_url})" in rendered
+        assert "booking link withheld" not in rendered
 
     def test_missing_booking_url_renders_unavailable_not_a_broken_link(self) -> None:
         no_link = _one_stop_itinerary(

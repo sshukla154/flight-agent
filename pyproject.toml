@@ -27,6 +27,8 @@ dev = [
     "jsonschema",
     "types-jsonschema",
     "httpx>=0.28.1",
+    "pip-audit",
+    "pre-commit",
 ]
 
 [build-system]

@@ -26,9 +26,12 @@ from fastapi.testclient import TestClient
 
 from flightagent.api import routes_approval
 from flightagent.api.app import create_app
+from flightagent.api.auth import API_KEY_ENV_VAR
 from flightagent.api.routes_approval import approval_path, render_approval_prompt
 from flightagent.config.loader import load_config
 from flightagent.config.models import FlightAgentSettings
+
+_TEST_API_KEY = "test-api-key-not-a-real-secret"
 
 
 def _isolated_settings(tmp_path: Path) -> FlightAgentSettings:
@@ -54,8 +57,13 @@ def settings(tmp_path: Path) -> FlightAgentSettings:
 
 
 @pytest.fixture
-def client(settings: FlightAgentSettings) -> TestClient:
-    return TestClient(create_app(settings=settings))
+def client(
+    settings: FlightAgentSettings, monkeypatch: pytest.MonkeyPatch
+) -> TestClient:
+    """See ``test_api.py``'s identical fixture docstring -- ``create_app()``
+    now requires ``FLIGHTAGENT_API_KEY`` (Phase 8b, ``api.auth``)."""
+    monkeypatch.setenv(API_KEY_ENV_VAR, _TEST_API_KEY)
+    return TestClient(create_app(settings=settings), headers={"X-Api-Key": _TEST_API_KEY})
 
 
 _SEARCH_BODY = {

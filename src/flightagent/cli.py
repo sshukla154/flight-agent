@@ -460,7 +460,6 @@ async def run_single_destination_pipeline(
         departure_date=request.departure_date,
         accepted_count=accepted_count,
         generated_at=as_of,
-        data_source="mock",
         self_transfer_rejections=self_transfer_rejections,
     )
     json_document = build_results_document(
@@ -1024,7 +1023,6 @@ async def run_all_destinations_pipeline(
             departure_date=departure_date,
             accepted_count=accepted_count,
             generated_at=generated_at,
-            data_source="mock",
             task_outcomes=final_task_outcomes,
             destination_analyses=destination_analyses,
             early_stop_evaluations=early_stop_evaluations,

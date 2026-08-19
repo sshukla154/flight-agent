@@ -22,6 +22,17 @@ jobs:
       - name: Install dependencies (incl. dev group)
         run: uv sync --frozen
 
+      - name: Dependency vulnerability scan (advisory)
+        # The one step in this job with a genuine external-network
+        # dependency (PyPI/OSV advisory lookup) -- unlike every other
+        # step here, which only touches the already-checked-out repo and
+        # locally-synced packages. continue-on-error so a transient
+        # lookup failure or a newly-published advisory on an unrelated
+        # dependency doesn't block a merge the way a real test/lint/
+        # coverage failure does; findings still show up in the log.
+        continue-on-error: true
+        run: uv run pip-audit
+
       - name: Lint (ruff)
         run: uv run ruff check .
 

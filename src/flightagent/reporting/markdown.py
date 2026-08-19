@@ -131,14 +131,25 @@ def _format_local(local_dt: datetime, tz_name: str) -> str:
     return f"{local_dt.strftime('%Y-%m-%d %H:%M %Z')} ({tz_name})"
 
 
-def _booking_field(itinerary: NormalizedItinerary, *, data_source: DataSource) -> str:
+def _booking_field(itinerary: NormalizedItinerary) -> str:
     """The "Booking" field's rendered value -- never a raw, unvalidated
     URL (master plan S8.2: the booking-link validator is called at both
     ingestion, out of scope here, and render, which is exactly this
     function).
+
+    The validation policy (``DataSource``) is derived from THIS
+    itinerary's own ``provider`` field, never from a single value shared
+    across the whole report -- master plan S8.6: "destinations are
+    searched concurrently... and can legitimately differ... in data
+    source within one run." Applying one document-level policy to every
+    itinerary regardless of which provider actually produced it would
+    silently apply the wrong safety check (e.g. requiring a mock-reserved
+    domain, or skipping that check) to an itinerary that didn't come from
+    that provider.
     """
     if itinerary.booking_url is None:
         return _NO_BOOKING_LINK_TEXT
+    data_source: DataSource = "mock" if itinerary.provider == "mock" else "live"
     try:
         validated = validate_booking_url(str(itinerary.booking_url), data_source=data_source)
         link_text = f"Book with {airline_string(itinerary)}"
@@ -147,7 +158,7 @@ def _booking_field(itinerary: NormalizedItinerary, *, data_source: DataSource) -
         return _WITHHELD_BOOKING_LINK_TEXT
 
 
-def _recommended_flight_block(item: ScoredItinerary, *, data_source: DataSource) -> str:
+def _recommended_flight_block(item: ScoredItinerary) -> str:
     itinerary = item.itinerary
     departure_segment = first_segment(itinerary)
     arrival_segment = last_segment(itinerary)
@@ -165,7 +176,7 @@ def _recommended_flight_block(item: ScoredItinerary, *, data_source: DataSource)
         "- **Price (EUR):** "
         f"{format_price_eur(itinerary.price_eur)} "
         f"(fare retrieved {itinerary.fare_as_of.isoformat()})",
-        f"- **Booking:** {_booking_field(itinerary, data_source=data_source)}",
+        f"- **Booking:** {_booking_field(itinerary)}",
     ]
     return "\n".join(lines)
 
@@ -557,7 +568,6 @@ def render_markdown_report(
     departure_date: date,
     accepted_count: int,
     generated_at: datetime,
-    data_source: DataSource = "mock",
     task_outcomes: Sequence[TaskOutcome] = (),
     destination_analyses: Sequence[DestinationAnalysis] = (),
     early_stop_evaluations: Mapping[str, EarlyStopEvaluation] = MappingProxyType({}),
@@ -646,7 +656,7 @@ def render_markdown_report(
         "",
         f"# Flight Report — {departure_date.isoformat()}",
         "",
-        _recommended_flight_block(top, data_source=data_source),
+        _recommended_flight_block(top),
         "",
     ]
     if others:
