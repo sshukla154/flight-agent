@@ -101,7 +101,12 @@ radius, and reversal cost in [`DECISIONS.md`](./DECISIONS.md).
 - **Real credentials.** Amadeus/Duffel adapters are interface-complete but
   uncredentialed; `--provider amadeus`/`--provider duffel` raise
   `ProviderNotConfigured` at runtime (D6, by design, not a bug).
-  `.env.example` documents the variable names only.
+  `.env.example` documents the variable names only. **Amadeus's free
+  self-service portal was decommissioned 2026-07-17** — developers.amadeus.com
+  is now Enterprise-API-only, sales-gated (`amadeus.com/en/contact`), so
+  `AMADEUS_CLIENT_ID`/`AMADEUS_CLIENT_SECRET` currently have no free
+  self-signup path at all. Duffel's free sandbox signup (`duffel.com` →
+  Sign up → API tokens) still works as of this writing.
 - **Booking-URL validation at provider-ingestion time.** Still render-time
   only (`markdown.py`/`json_report.py`) — no real adapter exists to call
   it at ingestion (D6), so there's nothing to ingest from yet.
